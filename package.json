@@ -9,11 +9,11 @@
   "scripts": {
     "worker": "tsx --expose-gc src/worker.ts",
     "dev": "tsx --expose-gc src/worker.ts",
-    "build": "esbuild src/worker.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/worker.cjs",
+    "build": "esbuild src/worker.ts --bundle --platform=node --format=esm --packages=external --sourcemap --outfile=dist/worker.js",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
     "test": "tsx tests/cbl-service.test.ts && tsx tests/internal-api.test.ts && tsx tests/scheduler.test.ts",
-    "start": "node dist/worker.cjs",
+    "start": "node dist/worker.js",
     "postinstall": "npm run build"
   },
   "dependencies": {
