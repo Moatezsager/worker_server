@@ -5,7 +5,7 @@ services:
     plan: free
     healthCheckPath: /health
     buildCommand: npm install && npm run build
-    startCommand: node dist/worker.js
+    startCommand: node dist/worker.cjs
     envVars:
       - key: NODE_VERSION
         value: "20.18.0"
