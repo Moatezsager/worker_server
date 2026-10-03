@@ -13,6 +13,9 @@ services:
         value: 3000
       - key: WORKER_INTERNAL_SECRET
         sync: false
+      - key: WEB_SERVER_URL
+        sync: false
+
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY

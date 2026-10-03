@@ -346,6 +346,9 @@ export async function saveToSupabase(
     
     const typeLabel = type === 'parallel' ? 'سوق موازي' : type === 'official' ? 'رسمي' : 'متكامل';
     console.log(`[DB] Successfully saved ${typeLabel} rates to database`);
+    // Notify the Web Server so it can broadcast the changes via Socket.IO
+    await notifyWebServers();
+    
     return true;
   } catch (err) {
     console.error("Supabase unified save error:", err);
@@ -650,3 +653,38 @@ export const cleanupOldData = async (onUserLogsCleanup?: () => void) => {
   }
 };
 
+/**
+ * Notifies the Web Server that rates have been updated in Supabase.
+ * The Web Server will then reload rates and broadcast to Socket.IO clients.
+ */
+export async function notifyWebServers() {
+  const webUrl = process.env.WEB_SERVER_URL;
+  const secret = process.env.WORKER_INTERNAL_SECRET;
+
+  if (!webUrl || !secret) {
+    console.log("[NotifyWebServers] Skipping notification — WEB_SERVER_URL or WORKER_INTERNAL_SECRET not configured.");
+    return;
+  }
+
+  try {
+    const notifyUrl = `${webUrl.replace(/\/$/, '')}/api/internal/notify-rates-updated`;
+    console.log(`[NotifyWebServers] Pinging Web Server at ${notifyUrl} ...`);
+    
+    const res = await fetch(notifyUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-worker-secret": secret
+      },
+      signal: AbortSignal.timeout(5000) // 5 seconds timeout
+    });
+
+    if (res.ok) {
+      console.log(`[NotifyWebServers] ✅ Successfully notified Web Server.`);
+    } else {
+      console.error(`[NotifyWebServers] ⚠️ Web Server responded with status: ${res.status}`);
+    }
+  } catch (err: any) {
+    console.error(`[NotifyWebServers] ❌ Failed to notify Web Server:`, err.message);
+  }
+}
