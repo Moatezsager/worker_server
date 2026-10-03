@@ -4,9 +4,9 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 // Initialize SQLite for local storage
 export const db = new Database('messages.db');
 db.pragma('journal_mode = WAL');
-db.pragma('cache_size = 32000');
+db.pragma('cache_size = -4096'); // 4MB cache limit instead of 125MB
 db.pragma('synchronous = NORMAL');
-db.pragma('temp_store = MEMORY');
+db.pragma('temp_store = FILE'); // Store temporary tables/indices in files instead of RAM
 
 // Initialize SQLite tables
 db.exec(`
