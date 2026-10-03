@@ -229,7 +229,10 @@ export async function initializeRatesFromDB(force = false) {
   }
 }
 
-export async function saveToSupabase(type: 'parallel' | 'official' | 'both' = 'both'): Promise<boolean> {
+export async function saveToSupabase(
+  type: 'parallel' | 'official' | 'both' = 'both',
+  customOfficialRates?: RateMap
+): Promise<boolean> {
   if (!supabase || !supabaseKey || supabaseKey.includes('dummy')) {
     console.warn("[DB] Supabase not initialized or using dummy key. Skipping save.");
     return false; 
@@ -251,12 +254,13 @@ export async function saveToSupabase(type: 'parallel' | 'official' | 'both' = 'b
       }
     }
     
+    const officialToSave = customOfficialRates || rates.official;
     if (type === 'official' || type === 'both') {
-      if (rates.official.USD > 0) {
-        console.log(`[DB] Saving official rates to Supabase (USD: ${rates.official.USD})...`);
+      if (officialToSave.USD > 0) {
+        console.log(`[DB] Saving official rates to Supabase (USD: ${officialToSave.USD})...`);
         results.push(supabase.from('official_rates').insert([{
-          usd: rates.official.USD,
-          rates: rates.official,
+          usd: officialToSave.USD,
+          rates: officialToSave,
           recorded_at: now
         }]));
       }
@@ -284,12 +288,12 @@ export async function saveToSupabase(type: 'parallel' | 'official' | 'both' = 'b
       }
     }
 
-    if (rates.parallel.USD > 0 && rates.official.USD > 0) {
+    if (rates.parallel.USD > 0 && officialToSave.USD > 0) {
       const legacyRecord = { 
         usd_parallel: rates.parallel.USD, 
-        usd_official: rates.official.USD,
+        usd_official: officialToSave.USD,
         rates_parallel: rates.parallel,
-        rates_official: rates.official,
+        rates_official: officialToSave,
         last_changed: rates.lastChanged,
         recorded_at: rates.lastUpdated || now
       };

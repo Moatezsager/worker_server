@@ -3,7 +3,7 @@ import { rates } from "../state";
 import { supabase, supabaseAnonKey } from "../db";
 import { fetchParallelRatesFromTelegram, fetchOfficialRates } from "../services/scraper.service";
 import { saveToSupabase } from "../services/db.service";
-import { broadcastRatesUpdate } from "../socket/socket.service";
+const broadcastRatesUpdate = (_rates?: any) => {};
 import { 
   extractProvidedCronKey, 
   isValidCronSecret, 

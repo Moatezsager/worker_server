@@ -99,29 +99,42 @@ export async function loadBroadcastStateFromStorageAndSupabase() {
       }
     }
     
-    // 2. Merge Supabase into local DB
+    // 2. Populate memory directly from Supabase (source of truth) and mirror into local SQLite cache
     if (supabaseRows.length > 0) {
-      const insertStmt = db.prepare(`
-        INSERT INTO broadcast_state (term_id, last_price, last_broadcast_time)
-        VALUES (?, ?, ?)
-        ON CONFLICT(term_id) DO UPDATE SET
-          last_price = excluded.last_price,
-          last_broadcast_time = excluded.last_broadcast_time
-        WHERE excluded.last_broadcast_time > broadcast_state.last_broadcast_time
-      `);
-      db.transaction(() => {
-        for (const row of supabaseRows) {
-          insertStmt.run(row.term_id, row.last_price, row.last_broadcast_time);
-        }
-      })();
+      for (const row of supabaseRows) {
+        lastBroadcastState[row.term_id] = { price: row.last_price, time: row.last_broadcast_time };
+      }
+      try {
+        const insertStmt = db.prepare(`
+          INSERT INTO broadcast_state (term_id, last_price, last_broadcast_time)
+          VALUES (?, ?, ?)
+          ON CONFLICT(term_id) DO UPDATE SET
+            last_price = excluded.last_price,
+            last_broadcast_time = excluded.last_broadcast_time
+          WHERE excluded.last_broadcast_time >= broadcast_state.last_broadcast_time
+        `);
+        db.transaction(() => {
+          for (const row of supabaseRows) {
+            insertStmt.run(row.term_id, row.last_price, row.last_broadcast_time);
+          }
+        })();
+      } catch (dbErr) {
+        console.warn("[BroadcastState] SQLite merge warning:", dbErr);
+      }
     }
     
-    // 3. Load whatever is in SQLite into memory
-    const finalRows = db.prepare('SELECT term_id, last_price, last_broadcast_time FROM broadcast_state').all() as any[];
-    for (const r of finalRows) {
-      lastBroadcastState[r.term_id] = { price: r.last_price, time: r.last_broadcast_time };
+    // 3. Fallback: Load any additional records from SQLite into memory if not already present
+    try {
+      const finalRows = db.prepare('SELECT term_id, last_price, last_broadcast_time FROM broadcast_state').all() as any[];
+      for (const r of finalRows) {
+        if (!lastBroadcastState[r.term_id] || r.last_broadcast_time > lastBroadcastState[r.term_id].time) {
+          lastBroadcastState[r.term_id] = { price: r.last_price, time: r.last_broadcast_time };
+        }
+      }
+      console.log(`[BroadcastState] Loaded ${Object.keys(lastBroadcastState).length} state records into memory.`);
+    } catch (e) {
+      console.log(`[BroadcastState] Loaded ${Object.keys(lastBroadcastState).length} state records from Supabase.`);
     }
-    console.log(`[BroadcastState] Loaded ${finalRows.length} state records into memory.`);
   } catch (err) {
     console.error("[BroadcastState] Error loading state:", err);
   }

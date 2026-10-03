@@ -1,27 +1,12 @@
 {
+  "extends": "./tsconfig.json",
   "compilerOptions": {
-    "target": "ES2022",
-    "experimentalDecorators": true,
-    "useDefineForClassFields": false,
-    "module": "ESNext",
-    "lib": [
-      "ES2022"
-    ],
-    "skipLibCheck": true,
-    "moduleResolution": "bundler",
-    "isolatedModules": true,
-    "moduleDetection": "force",
-    "allowJs": true,
-    "paths": {
-      "@/*": [
-        "./*"
-      ]
-    },
     "noEmit": true
   },
   "include": [
-    "server.ts",
+    "src/**/*.ts",
     "server/**/*.ts",
-    "telegramClient.ts"
+    "telegramClient.ts",
+    "tests/**/*.ts"
   ]
 }

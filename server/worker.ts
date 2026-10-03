@@ -41,8 +41,6 @@ import {
 import cronRouter from "./routes/cron.routes";
 import systemRouter from "./routes/system.routes";
 import internalRouter from "./routes/internal.routes";
-import { createAdminRouter } from "./routes/admin.routes";
-import { getUserLogs, clearUserLogs } from "./services/maintenance.service";
 
 // ─── Environment Validation on Bootstrap ───
 if (process.env.NODE_ENV === "production") {
@@ -211,24 +209,13 @@ export function createWorkerApp() {
   // Global API Rate Limiter
   app.use("/api/", apiLimiter);
 
-  // Admin Routes (for managing scraping, telegram, whatsapp, AI, and worker state)
-  app.use('/api/admin', createAdminRouter({
-    getPublicApiLimiter: () => publicApiLimiter,
-    getUserLogs: () => getUserLogs(),
-    clearUserLogs: () => { clearUserLogs(); },
-    getOnlineUsers: () => 0,
-    apiStats,
-    broadcastRatesUpdate: () => {}, // Handled via Supabase persistence -> Web Server
-    broadcastConfigUpdate: () => {},
-    broadcastUserLogs: () => {},
-  }));
-
   // Cron triggers & Worker System status routes
   app.use("/api", cronRouter);
   app.use("/api", systemRouter);
 
   // Dedicated Server-to-Server Internal API for Web <-> Worker administrative commands
   app.use("/internal", internalRouter);
+  app.use("/api/internal", internalRouter);
 
   // Catch-all 404 for unmatched routes
   app.use((req: express.Request, res: express.Response) => {

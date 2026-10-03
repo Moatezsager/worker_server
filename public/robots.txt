@@ -1,4 +1,0 @@
-User-agent: *
-Allow: /
-
-Sitemap: https://dollar-price-qp14.onrender.com/sitemap.xml

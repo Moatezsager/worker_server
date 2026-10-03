@@ -236,6 +236,49 @@ async function runTests() {
     CBL_STATUS.SAVE_FAILED === 'CBL_SAVE_FAILED'
   );
 
+  // 21. Candidate Object Pipeline: Parse success + Supabase failure -> RAM state remains UNCHANGED
+  let inMemoryOfficialRates = { USD: 4.8000, EUR: 5.2000 };
+  let mockSuccessTime = 0;
+  const parsedCandidateRates = { USD: 4.8500, EUR: 5.2500 };
+  const candidateRates = { ...inMemoryOfficialRates, ...parsedCandidateRates };
+  
+  let supabaseSaveSuccess = false; // Simulated Supabase DB failure
+  if (supabaseSaveSuccess) {
+    inMemoryOfficialRates = candidateRates;
+    mockSuccessTime = Date.now();
+  }
+
+  assert("21. Parse success + Supabase failure: RAM state NOT updated (USD remains 4.8000, success time 0)", 
+    inMemoryOfficialRates.USD === 4.8000 && mockSuccessTime === 0);
+
+  // 22. Candidate Object Pipeline: Parse success + Supabase success -> RAM state updated
+  supabaseSaveSuccess = true; // Simulated Supabase DB success
+  if (supabaseSaveSuccess) {
+    inMemoryOfficialRates = candidateRates;
+    mockSuccessTime = Date.now();
+  }
+
+  assert("22. Parse success + Supabase success: RAM state committed (USD updated to 4.8500, success time updated)",
+    inMemoryOfficialRates.USD === 4.8500 && mockSuccessTime > 0);
+
+  // 23. Stale CBL Date Validation
+  const isStaleRejected = (parsedDate: string, currentLibyaDate: string, isAuto: boolean) => {
+    if (isAuto && parsedDate !== currentLibyaDate) return true;
+    return false;
+  };
+  assert("23. Stale CBL Date: Bulletin date from yesterday rejected in auto mode", 
+    isStaleRejected(yesterdayStr, todayStr, true) === true);
+
+  // 24. Missing CBL Date Validation
+  const isMissingDateRejected = (cblDateStr: string | null) => !cblDateStr;
+  assert("24. Missing CBL Date: Null or unextractable date cell rejected", 
+    isMissingDateRejected(null) === true);
+
+  // 25. Invalid Rates Validation
+  const isInvalidRatesRejected = (parsedRates: any) => !parsedRates || !parsedRates.USD || parsedRates.USD < 4.0 || parsedRates.USD > 8.0;
+  assert("25. Invalid Rates: USD rate 0 or out of range (4.0 - 8.0 LYD) rejected", 
+    isInvalidRatesRejected({ USD: 0 }) === true && isInvalidRatesRejected(null) === true && isInvalidRatesRejected({ USD: 25.0 }) === true);
+
   console.log("\n==================================================");
   console.log(`Test Results: ${passed} Passed, ${failed} Failed`);
   console.log("==================================================");

@@ -1,12 +1,51 @@
 services:
   - type: web
-    name: lyd-index
+    name: lyd-index-worker
     env: node
     plan: free
+    healthCheckPath: /health
     buildCommand: npm install && npm run build
-    startCommand: npm start
+    startCommand: node dist/worker.cjs
     envVars:
       - key: NODE_ENV
         value: production
       - key: PORT
         value: 3000
+      - key: WORKER_INTERNAL_SECRET
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: VITE_SUPABASE_ANON_KEY
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+      - key: API_HMAC_SECRET
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: TELEGRAM_SESSION
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: FACEBOOK_PAGE_ID
+        sync: false
+      - key: FACEBOOK_ACCESS_TOKEN
+        sync: false
+      - key: WHATSAPP_AUTH
+        sync: false
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        sync: false
+      - key: APP_URL
+        sync: false

@@ -130,15 +130,17 @@ export function isValidCronSecret(providedKey: unknown): boolean {
   }
   const cleanProvided = providedKey.trim();
   const knownKeys = [
-    '706c8ab7-05af-4aa2-a80e-58d5ecf9a39e',
-    process.env.CRON_SECRET
+    process.env.CRON_SECRET,
+    process.env.WORKER_INTERNAL_SECRET,
+    process.env.API_HMAC_SECRET
   ].filter(Boolean) as string[];
+
+  if (knownKeys.length === 0) {
+    return false;
+  }
 
   for (const validKey of knownKeys) {
     if (cleanProvided === validKey) {
-      return true;
-    }
-    if (cleanProvided.startsWith(validKey) && cleanProvided.length <= validKey.length + 2) {
       return true;
     }
     try {

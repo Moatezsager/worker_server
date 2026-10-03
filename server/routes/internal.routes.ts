@@ -6,6 +6,9 @@ import { fetchOfficialRates, fetchParallelRatesFromTelegram } from "../services/
 import { saveToSupabase } from "../services/db.service";
 import { cleanupOldData } from "../services/db.service";
 import { cleanupUserLogs, monitorMemory } from "../services/maintenance.service";
+import { extractRatesWithAI } from "../services/ai.service";
+import { initializeTelegram } from "../../telegramClient";
+import { whatsappManager } from "../services/whatsapp.service";
 
 const internalRouter = Router();
 
@@ -76,7 +79,15 @@ internalRouter.use(internalApiLimiter);
 internalRouter.use(verifyInternalSecret);
 
 // ─── Strict Allowlist of Permitted Jobs ───
-export const ALLOWED_INTERNAL_JOBS = ['cbl', 'telegram', 'refresh', 'maintenance'] as const;
+export const ALLOWED_INTERNAL_JOBS = [
+  'cbl', 
+  'telegram', 
+  'refresh', 
+  'maintenance', 
+  'ai', 
+  'telegram_reconnect', 
+  'whatsapp_reconnect'
+] as const;
 export type AllowedJob = typeof ALLOWED_INTERNAL_JOBS[number];
 
 function isAllowedJob(jobName: string): jobName is AllowedJob {
@@ -88,7 +99,10 @@ const JOB_LOCK_IDS: Record<AllowedJob, string> = {
   cbl: 'official_rates_scraper',
   telegram: 'parallel_rates_scraper',
   refresh: 'rates_auto_refresh',
-  maintenance: 'database_cleanup'
+  maintenance: 'database_cleanup',
+  ai: 'ai_market_analysis',
+  telegram_reconnect: 'telegram_reconnect',
+  whatsapp_reconnect: 'whatsapp_reconnect'
 };
 
 /**
@@ -143,6 +157,24 @@ function triggerJob(jobKey: AllowedJob, res: Response) {
         cleanupUserLogs();
         await cleanupOldData(cleanupUserLogs);
       }, { timeoutMs: 120000 });
+      break;
+
+    case 'ai':
+      runJobSafely(lockId, 'تحليل واستخراج الأسعار الذكي عبر Gemini', async () => {
+        return await extractRatesWithAI("اختبار استخراج الأسعار: $1 = 7.00 د.ل", "internal_api");
+      }, { timeoutMs: 60000 });
+      break;
+
+    case 'telegram_reconnect':
+      runJobSafely(lockId, 'إعادة الاتصال بتيليجرام عبر Internal API', async () => {
+        return await initializeTelegram();
+      }, { timeoutMs: 60000 });
+      break;
+
+    case 'whatsapp_reconnect':
+      runJobSafely(lockId, 'إعادة الاتصال بواتساب عبر Internal API', async () => {
+        return await whatsappManager.initClient();
+      }, { timeoutMs: 60000 });
       break;
   }
 

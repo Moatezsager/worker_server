@@ -44,17 +44,21 @@ export async function loadRecentBroadcastTimestamps(): Promise<void> {
 
     // محاولة Supabase أولاً
     if (supabase) {
+      // Support both integer millisecond and ISO string timestamp schemas in Supabase
       const { data, error } = await supabase
         .from('broadcast_log')
         .select('created_at')
         .eq('status', 'success')
-        .gte('created_at', new Date(oneHourAgo).toISOString())
+        .or(`created_at.gte.${oneHourAgo},created_at.gte.${new Date(oneHourAgo).toISOString()}`)
         .order('created_at', { ascending: true });
 
       if (!error && data && data.length > 0) {
         recentBroadcastTimestamps.length = 0;
         for (const row of data) {
-          recentBroadcastTimestamps.push(new Date(row.created_at).getTime());
+          const t = typeof row.created_at === 'number' ? row.created_at : new Date(row.created_at).getTime();
+          if (!isNaN(t)) {
+            recentBroadcastTimestamps.push(t);
+          }
         }
         console.log(
           `[SmartBroadcast] Loaded ${recentBroadcastTimestamps.length} recent broadcasts from Supabase`
@@ -68,14 +72,16 @@ export async function loadRecentBroadcastTimestamps(): Promise<void> {
       const rows = db
         .prepare(
           `SELECT created_at FROM broadcast_log
-           WHERE status = 'success' AND created_at >= ?
-           ORDER BY created_at ASC`
+           WHERE status = 'success' AND (created_at >= ? OR created_at >= ?)`
         )
-        .all(new Date(oneHourAgo).toISOString()) as { created_at: string }[];
+        .all(oneHourAgo, new Date(oneHourAgo).toISOString()) as { created_at: string | number }[];
 
       recentBroadcastTimestamps.length = 0;
       for (const row of rows) {
-        recentBroadcastTimestamps.push(new Date(row.created_at).getTime());
+        const t = typeof row.created_at === 'number' ? row.created_at : new Date(row.created_at).getTime();
+        if (!isNaN(t)) {
+          recentBroadcastTimestamps.push(t);
+        }
       }
       console.log(
         `[SmartBroadcast] Loaded ${recentBroadcastTimestamps.length} recent broadcasts from SQLite`
@@ -770,7 +776,7 @@ export let lastOfficialBroadcastDate = "";
         console.log(`[Official Broadcast] Loaded lastOfficialBroadcastDate from SQLite: ${row.value}`);
       }
     }
-    if (!lastOfficialBroadcastDate && supabase) {
+    if (supabase) {
       const { data } = await supabase
         .from('server_config')
         .select('value')
@@ -779,6 +785,14 @@ export let lastOfficialBroadcastDate = "";
       if (data?.value) {
         lastOfficialBroadcastDate = data.value;
         console.log(`[Official Broadcast] Loaded lastOfficialBroadcastDate from Supabase: ${data.value}`);
+        if (db) {
+          try {
+            db.prepare(`
+              INSERT INTO server_config (key, value) VALUES ('last_official_broadcast_date', ?)
+              ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            `).run(data.value);
+          } catch {}
+        }
       }
     }
   } catch (e) {

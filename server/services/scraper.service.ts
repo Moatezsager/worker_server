@@ -64,27 +64,33 @@ export async function loadCblStateFromSupabase(): Promise<void> {
     }
 
     if (supabase) {
-      if (!lastOfficialFetchDate) {
-        const { data } = await supabase
-          .from('server_config')
-          .select('value')
-          .eq('key', 'last_official_fetch_date')
-          .single();
-        if (data?.value) {
-          lastOfficialFetchDate = data.value;
-          console.log(`[Official] Loaded lastOfficialFetchDate from Supabase server_config: ${data.value}`);
-        } else {
-          // Fallback: Infer from latest record in official_rates
-          const { data: officialRows } = await supabase
-            .from('official_rates')
-            .select('recorded_at')
-            .order('recorded_at', { ascending: false })
-            .limit(1);
-          if (officialRows && officialRows.length > 0 && officialRows[0].recorded_at) {
-            const recordedDate = officialRows[0].recorded_at.split('T')[0];
-            lastOfficialFetchDate = recordedDate;
-            console.log(`[Official] Inferred lastOfficialFetchDate from official_rates table: ${recordedDate}`);
-          }
+      const { data } = await supabase
+        .from('server_config')
+        .select('value')
+        .eq('key', 'last_official_fetch_date')
+        .single();
+      if (data?.value) {
+        lastOfficialFetchDate = data.value;
+        console.log(`[Official] Loaded lastOfficialFetchDate from Supabase server_config: ${data.value}`);
+        if (db) {
+          try {
+            db.prepare(`
+              INSERT INTO server_config (key, value) VALUES ('last_official_fetch_date', ?)
+              ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            `).run(data.value);
+          } catch {}
+        }
+      } else if (!lastOfficialFetchDate) {
+        // Fallback: Infer from latest record in official_rates
+        const { data: officialRows } = await supabase
+          .from('official_rates')
+          .select('recorded_at')
+          .order('recorded_at', { ascending: false })
+          .limit(1);
+        if (officialRows && officialRows.length > 0 && officialRows[0].recorded_at) {
+          const recordedDate = officialRows[0].recorded_at.split('T')[0];
+          lastOfficialFetchDate = recordedDate;
+          console.log(`[Official] Inferred lastOfficialFetchDate from official_rates table: ${recordedDate}`);
         }
       }
 
@@ -96,6 +102,14 @@ export async function loadCblStateFromSupabase(): Promise<void> {
       if (enabledData?.value !== undefined) {
         isCblFetchEnabled = enabledData.value === 'true';
         console.log(`[Official] Loaded isCblFetchEnabled from Supabase: ${isCblFetchEnabled}`);
+        if (db) {
+          try {
+            db.prepare(`
+              INSERT INTO server_config (key, value) VALUES ('cbl_fetch_enabled', ?)
+              ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            `).run(enabledData.value);
+          } catch {}
+        }
       }
 
       const { data: fetchTimeData } = await supabase
@@ -448,15 +462,26 @@ export async function fetchOfficialRates(force: boolean = false, isManualAdmin: 
     }
   }
 
-  // 1. Fetch from CBL website (Sequential Await)
+  // 1. FETCH from CBL website (Sequential Await)
   const cblResult = await fetchFromCBL();
   if (!cblResult) {
     console.warn(`[CBL] ${CBL_STATUS.FAILED}: HTTP fetch or parsing failed.`);
     return false;
   }
 
+  // 2. PARSE & 3. VALIDATE
   const { cblDate, rates: cblRates } = cblResult;
   console.log(`[CBL] Bulletin date extracted = ${cblDate}`);
+
+  if (!cblDate) {
+    console.warn(`[CBL] ${CBL_STATUS.VALIDATION_FAILED}: Missing bulletin date in CBL response.`);
+    return false;
+  }
+
+  if (!cblRates || !cblRates.USD || cblRates.USD <= 0) {
+    console.warn(`[CBL] ${CBL_STATUS.VALIDATION_FAILED}: Invalid or missing rates in CBL response.`);
+    return false;
+  }
 
   // In automatic mode, verify that CBL data is strictly for today (never publish stale data as today's rates!)
   if (!isManualAdmin && !force && cblDate !== currentLibyaDate) {
@@ -464,19 +489,42 @@ export async function fetchOfficialRates(force: boolean = false, isManualAdmin: 
     return false;
   }
 
-  // Rates are validated for today (or manual admin force)
   console.log(`[CBL] Rates validated successfully for bulletin date: ${cblDate}`);
 
+  // 4. CREATE CANDIDATE DATA (In-memory state remains UNCHANGED at this point!)
+  const candidateOfficialRates: RateMap = { ...rates.official, ...cblRates };
+  const candidatePreviousOfficial: RateMap = { ...rates.previousOfficial };
+  const candidateLastChanged: Record<string, string> = {};
   let anyChanged = false;
+
   Object.entries(cblRates).forEach(([key, val]) => {
     if (isSignificantChange(rates.official[key], val)) {
-      rates.previousOfficial[key] = rates.official[key];
-      rates.lastChanged.official[key] = new Date().toISOString();
+      candidatePreviousOfficial[key] = rates.official[key];
+      candidateLastChanged[key] = new Date().toISOString();
       anyChanged = true;
     }
   });
 
-  rates.official = { ...rates.official, ...cblRates };
+  // 5. SAVE TO SUPABASE (Persistence Check BEFORE modifying in-memory state!)
+  try {
+    const saveSuccess = await saveToSupabase('official', candidateOfficialRates);
+    if (!saveSuccess) {
+      console.error(`[CBL] ${CBL_STATUS.SAVE_FAILED}: saveToSupabase reported database failure. In-memory state and success timestamps NOT updated.`);
+      await logErrorArabic("فشل حفظ أسعار المصرف المركزي في قاعدة البيانات", "مصرف ليبيا المركزي");
+      return false; // Stop immediately if DB save fails! In-memory RAM state remains old!
+    }
+    console.log(`[CBL] Rates successfully persisted to Supabase.`);
+  } catch (dbErr) {
+    console.error(`[CBL] ${CBL_STATUS.SAVE_FAILED}: Failed to persist official rates to database:`, dbErr);
+    await logErrorArabic(`فشل حفظ أسعار المركزي: ${dbErr}`, "مصرف ليبيا المركزي");
+    return false; // Stop immediately if DB save fails! In-memory RAM state remains old!
+  }
+
+  // 6. COMMIT IN-MEMORY STATE (Only after confirmed DB persistence)
+  rates.official = candidateOfficialRates;
+  rates.previousOfficial = { ...rates.previousOfficial, ...candidatePreviousOfficial };
+  rates.lastChanged.official = { ...rates.lastChanged.official, ...candidateLastChanged };
+
   if (rates.official.USD) {
     rates.parallel.OFFICIAL_USD = rates.official.USD;
     rates.lastChanged.parallel.OFFICIAL_USD = new Date().toISOString();
@@ -496,22 +544,25 @@ export async function fetchOfficialRates(force: boolean = false, isManualAdmin: 
     }
   }
 
-  // 2. Database Persistence (Strict Sequential Await - Never fire and forget!)
+  // Update success state ONLY after DB persistence & in-memory commit succeed
+  lastOfficialFetchDate = currentLibyaDate;
+  setLastSuccessfulFetchTime(Date.now());
+
+  await saveWorkerStateToSupabase('last_official_fetch_date', currentLibyaDate);
+  await saveWorkerStateToSupabase('last_successful_fetch_time', String(Date.now()));
+
   try {
-    const saveSuccess = await saveToSupabase('official');
-    if (!saveSuccess) {
-      console.error(`[CBL] ${CBL_STATUS.SAVE_FAILED}: saveToSupabase reported database failure. Day will NOT be marked as completed.`);
-      await logErrorArabic("فشل حفظ أسعار المصرف المركزي في قاعدة البيانات", "مصرف ليبيا المركزي");
-      return false; // Do not mark day as successful if database persistence fails!
+    if (db) {
+      db.prepare(`
+        INSERT INTO server_config (key, value) VALUES ('last_official_fetch_date', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(currentLibyaDate);
     }
-    console.log(`[CBL] Rates successfully persisted to Supabase.`);
   } catch (dbErr) {
-    console.error(`[CBL] ${CBL_STATUS.SAVE_FAILED}: Failed to persist official rates to database:`, dbErr);
-    await logErrorArabic(`فشل حفظ أسعار المركزي: ${dbErr}`, "مصرف ليبيا المركزي");
-    return false; // Do not mark day as successful if database persistence fails!
+    console.error("[Official] Failed to persist lastOfficialFetchDate to SQLite:", dbErr);
   }
 
-  // 3. Social Broadcast
+  // 7. SOCIAL BROADCAST (Only after DB persistence & in-memory commit succeed)
   const isAlreadyBroadcastedToday = (lastOfficialBroadcastDate === currentLibyaDate);
   if (!isAlreadyBroadcastedToday) {
     console.log(`[Official] Broadcasting daily official bulletin for (${cblDate})...`);
@@ -526,25 +577,6 @@ export async function fetchOfficialRates(force: boolean = false, isManualAdmin: 
     }
   } else {
     console.log(`[CBL] Broadcast skipped (already broadcasted today).`);
-  }
-
-  // 4. Mark today's fetch as fully successful ONLY after confirmed DB persistence
-  lastOfficialFetchDate = currentLibyaDate;
-  setLastSuccessfulFetchTime(Date.now());
-
-  // Await saving state to Supabase so it's not fire-and-forget!
-  await saveWorkerStateToSupabase('last_official_fetch_date', currentLibyaDate);
-  await saveWorkerStateToSupabase('last_successful_fetch_time', String(Date.now()));
-
-  try {
-    if (db) {
-      db.prepare(`
-        INSERT INTO server_config (key, value) VALUES ('last_official_fetch_date', ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-      `).run(currentLibyaDate);
-    }
-  } catch (dbErr) {
-    console.error("[Official] Failed to persist lastOfficialFetchDate to SQLite:", dbErr);
   }
 
   console.log(`[CBL] Successfully completed official bulletin fetch and persistence for ${currentLibyaDate}.`);
@@ -861,6 +893,7 @@ export async function fetchParallelRatesFromTelegram(): Promise<boolean | null> 
 
       if (successfulChannels > 0) {
         lastSuccessfulScrape = new Date();
+        setLastSuccessfulFetchTime(Date.now());
         console.log(`[Scraper] Successfully processed ${totalMessagesProcessed} messages from ${successfulChannels} channels.`);
       } else {
         console.warn("[Scraper] Failed to fetch any messages from any channels (They might be empty or blocked).");

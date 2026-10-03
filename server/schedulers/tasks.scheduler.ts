@@ -12,7 +12,7 @@ import { getOrInitTelegramManager } from "../services/social.service";
 import { initializeTelegram, activeClient } from "../../telegramClient";
 import { whatsappManager, hasSavedSession } from "../services/whatsapp.service";
 
-export type JobStatus = 'idle' | 'running' | 'success' | 'failed';
+export type JobStatus = 'idle' | 'running' | 'timed_out' | 'failed' | 'success';
 
 export interface WorkerJob {
   id: string;
@@ -26,6 +26,7 @@ export interface WorkerJob {
   runCount: number;
   consecutiveFailures: number;
   isRunning: boolean;
+  activeController?: AbortController | null;
 }
 
 export const jobRegistry = new Map<string, WorkerJob>();
@@ -67,10 +68,14 @@ export function isJobRunning(jobId: string): boolean {
 
 export let isSchedulerShuttingDown = false;
 
+export type JobFn<T> = (signal: AbortSignal) => Promise<T>;
+
 /**
  * Executes a job safely with:
- * - Mutex lock (Duplicate execution protection)
- * - Timeout enforcement (Prevents hanging jobs)
+ * - Mutex lock & underlying execution lock (Duplicate execution protection)
+ * - AbortSignal/AbortController support for cancellation
+ * - Timeout enforcement (Prevents hanging jobs without releasing lock prematurely)
+ * - Clear job statuses: idle, running, timed_out, failed, success
  * - Error isolation (Never throws to caller)
  * - Metrics & Supabase persistence
  * - Exponential backoff delay on repeated failures
@@ -78,7 +83,7 @@ export let isSchedulerShuttingDown = false;
 export async function runJobSafely<T>(
   jobId: string,
   jobName: string,
-  fn: () => Promise<T>,
+  fn: JobFn<T>,
   options: { timeoutMs?: number; maxConsecutiveFailures?: number } = {}
 ): Promise<T | null> {
   // 0. Shutdown Check (Stop new jobs during shutdown)
@@ -92,7 +97,7 @@ export async function runJobSafely<T>(
 
   // 1. Overlap / Duplicate Execution Protection
   if (job.isRunning) {
-    console.warn(`[WorkerJob] ⏳ Job '${jobName}' (${jobId}) is already running. Skipping overlapping run.`);
+    console.warn(`[WorkerJob] ⏳ Job '${jobName}' (${jobId}) is already running (status: ${job.status}). Skipping overlapping run.`);
     return null;
   }
 
@@ -106,6 +111,8 @@ export async function runJobSafely<T>(
     }
   }
 
+  const controller = new AbortController();
+  job.activeController = controller;
   job.isRunning = true;
   job.status = 'running';
   job.lastRunStartTime = Date.now();
@@ -114,22 +121,39 @@ export async function runJobSafely<T>(
   console.log(`[WorkerJob] ▶️ Starting job: '${jobName}' (#${job.runCount})`);
 
   let timeoutHandle: NodeJS.Timeout | null = null;
-  try {
-    // 3. Timeout race to ensure no job hangs indefinitely
-    const executionPromise = fn();
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      timeoutHandle = setTimeout(() => {
-        reject(new Error(`Job '${jobName}' exceeded maximum timeout of ${timeoutMs}ms`));
-      }, timeoutMs);
-    });
+  let isTimedOut = false;
 
+  // Background tracker: Releases job.isRunning ONLY when the underlying fn() actually resolves or rejects!
+  const executionPromise = (async () => {
+    try {
+      return await fn(controller.signal);
+    } finally {
+      job.isRunning = false;
+      if (job.activeController === controller) {
+        job.activeController = null;
+      }
+    }
+  })();
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      isTimedOut = true;
+      const timeoutErr = new Error(`Job '${jobName}' exceeded maximum timeout of ${timeoutMs}ms`);
+      try {
+        controller.abort(timeoutErr);
+      } catch (e) {}
+      reject(timeoutErr);
+    }, timeoutMs);
+  });
+
+  try {
     const result = await Promise.race([executionPromise, timeoutPromise]);
 
-    // 4. Record Success
+    // Record Success
     const endTime = Date.now();
     job.status = 'success';
     job.lastRunEndTime = endTime;
-    job.lastRunDurationMs = endTime - job.lastRunStartTime;
+    job.lastRunDurationMs = endTime - (job.lastRunStartTime || endTime);
     job.lastSuccessTime = endTime;
     job.lastError = null;
     job.consecutiveFailures = 0;
@@ -137,22 +161,33 @@ export async function runJobSafely<T>(
     console.log(`[WorkerJob] ✅ Completed job: '${jobName}' in ${job.lastRunDurationMs}ms`);
     return result;
   } catch (error: any) {
-    // 5. Record Failure safely
     const endTime = Date.now();
     const errorMsg = error?.message || String(error);
-    job.status = 'failed';
-    job.lastRunEndTime = endTime;
-    job.lastRunDurationMs = endTime - job.lastRunStartTime;
-    job.lastError = errorMsg;
-    job.consecutiveFailures++;
 
-    console.error(`[WorkerJob] ❌ Job failed: '${jobName}' (Attempt failure #${job.consecutiveFailures}):`, errorMsg);
+    if (isTimedOut || controller.signal.aborted) {
+      job.status = 'timed_out';
+      job.lastRunEndTime = endTime;
+      job.lastRunDurationMs = endTime - (job.lastRunStartTime || endTime);
+      job.lastError = errorMsg;
+      job.consecutiveFailures++;
+
+      console.error(`[WorkerJob] ⏱️ Job timed out: '${jobName}' after ${job.lastRunDurationMs}ms (Attempt failure #${job.consecutiveFailures}): ${errorMsg}`);
+    } else {
+      job.status = 'failed';
+      job.lastRunEndTime = endTime;
+      job.lastRunDurationMs = endTime - (job.lastRunStartTime || endTime);
+      job.lastError = errorMsg;
+      job.consecutiveFailures++;
+
+      console.error(`[WorkerJob] ❌ Job failed: '${jobName}' (Attempt failure #${job.consecutiveFailures}):`, errorMsg);
+    }
+
     await logErrorArabic(`فشل المهمة الخلفية [${jobName}]: ${errorMsg}`, "WorkerJob", error?.stack);
-
     return null;
   } finally {
-    if (timeoutHandle) clearTimeout(timeoutHandle);
-    job.isRunning = false;
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
 
     // Persist critical job state to Supabase in background
     saveWorkerStateToSupabase(`job_state_${jobId}`, {
@@ -259,7 +294,6 @@ export function initBackgroundTasks(port: number) {
           if (tgMgr) {
             try {
               await tgMgr.sendMessage('me', `⚠️ *تنبيه للمدير (Watchdog)* ⚠️\n\nيبدو أن هناك مشكلة في الجلب الآلي للسوق الموازي.\nمرت أكثر من 4 ساعات دون أي عملية جلب ناجحة.\n\nرجاءً تحقق من حالة السيرفر أو حساب التليجرام.`);
-              setLastSuccessfulFetchTime(Date.now());
             } catch (e) {
               console.error("[Watchdog] Failed to send alert message:", e);
             }
@@ -336,7 +370,27 @@ export function stopBackgroundTasks() {
     } catch (e) {}
   }
   activeIntervals.length = 0;
+
+  // Abort all active running job controllers
+  for (const job of jobRegistry.values()) {
+    if (job.isRunning && job.activeController) {
+      try {
+        console.log(`[WorkerTasks] Aborting active job '${job.name}' (${job.id}) due to system shutdown.`);
+        job.activeController.abort(new Error('System shutting down'));
+      } catch (e) {}
+    }
+  }
+
   isTasksInitialized = false;
   isMonitoringInitialized = false;
   console.log("[WorkerTasks] All background task intervals cleared.");
+}
+
+/**
+ * Reset scheduler state for testing
+ */
+export function resetSchedulerForTesting() {
+  stopBackgroundTasks();
+  isSchedulerShuttingDown = false;
+  jobRegistry.clear();
 }
