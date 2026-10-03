@@ -13,7 +13,8 @@
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
     "test": "tsx tests/cbl-service.test.ts && tsx tests/internal-api.test.ts && tsx tests/scheduler.test.ts",
-    "start": "node dist/worker.cjs"
+    "start": "node dist/worker.cjs",
+    "postinstall": "npm run build"
   },
   "dependencies": {
     "@google/genai": "^1.45.0",
