@@ -1,4 +1,5 @@
 import { monitorMemory, cleanupUserLogs } from "../services/maintenance.service";
+import { notifyWebServer } from '../utils/notify';
 import { cleanupOldData, saveToSupabase, logErrorArabic, saveWorkerStateToSupabase } from "../services/db.service";
 import { 
   fetchOfficialRates, 
@@ -343,6 +344,7 @@ export function initBackgroundTasks(port: number) {
         console.log("[Auto-Refresh] Changes detected! Persisting to Supabase database...");
         const saveType = (officialChanged && parallelChanged) ? 'both' : (officialChanged ? 'official' : 'parallel');
         await saveToSupabase(saveType);
+        await notifyWebServer(rates);
       }
     }, { timeoutMs: 90000 }); // 90 seconds timeout for full scraper cycle
   }, 10 * 60 * 1000);
