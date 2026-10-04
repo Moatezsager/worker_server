@@ -183,6 +183,8 @@ dashboardRouter.post("/api/dashboard/update-rate", async (req: Request, res: Res
 
   const normalizedCode = String(code).trim();
   rates.parallel[normalizedCode] = numRate;
+  rates.parallel[normalizedCode.toUpperCase()] = numRate;
+  rates.parallel[normalizedCode.toLowerCase()] = numRate;
   rates.lastUpdated = new Date().toISOString();
 
   addLog("success", "تعديل يدوي", `تم تعديل سعر [${normalizedCode}] يدوياً إلى ${numRate} د.ل عبر لوحة التحكم`);

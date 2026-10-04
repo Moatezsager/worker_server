@@ -830,7 +830,9 @@ export function renderDashboardHtml(): string {
         'database_cleanup': 'maintenance',
         'periodic_supabase_sync': 'refresh',
         'memory_cleanup_watchdog': 'gc',
-        'social_tokens_validity': 'telegram_reconnect'
+        'social_tokens_validity': 'telegram_reconnect',
+        'ai_rates_extraction': 'ai',
+        'periodic_auto_broadcast': 'broadcast_test'
       };
       triggerJob(map[jobId] || 'refresh', jobName);
     }
