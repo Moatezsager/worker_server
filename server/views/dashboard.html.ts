@@ -1,4 +1,134 @@
-export function renderDashboardHtml(): string {
+export function renderDashboardHtml(initialState?: any): string {
+  const NAMES: Record<string, string> = {
+    usd: 'الدولار الأمريكي (كاش)',
+    eur: 'اليورو الأوروبي',
+    gbp: 'الجنيه الإسترليني',
+    egp: 'الجنيه المصري',
+    tnd: 'الدينار التونسي',
+    try: 'الليرة التركية',
+    usd_checks: 'دولار الصكوك (طرابلس)',
+    usd_tr: 'دولار حوالات تركيا',
+    usd_ae: 'دولار حوالات دبي',
+    gold: 'ذهب كسر عيار 18',
+    gold_scrap_18: 'ذهب كسر 18',
+    gold_scrap_21: 'ذهب كسر 21',
+    gold_ext_18: 'ذهب خارجي 18',
+    gold_ext_21: 'ذهب خارجي 21',
+    gold_cast_18: 'سبائك عيار 18',
+    gold_cast_21: 'سبائك عيار 21',
+    gold_cast_24: 'سبائك عيار 24',
+    gold_lira_8g: 'ليرة ذهب (8 جرام)',
+    gold_lira_14g: 'ليرة ذهب (14 جرام)',
+    gold_mujara_14g: 'مجرية ذهب (14 جرام)',
+    silver_cast_1000: 'فضة سبائك 1000',
+    silver_scrap: 'فضة كسر (جرام)'
+  };
+
+  const METAL_KEYS = ['GOLD', 'GOLD_EXT_18', 'GOLD_EXT_21', 'GOLD_SCRAP_18', 'GOLD_SCRAP_21', 'GOLD_CAST_18', 'GOLD_CAST_21', 'GOLD_CAST_24', 'GOLD_LIRA_8G', 'GOLD_LIRA_14G', 'GOLD_MUJARA_14G', 'SILVER_CAST_1000', 'SILVER_SCRAP'];
+
+  // Calculate pre-rendered values
+  const usdParallel = Number(initialState?.rates?.parallel?.USD || initialState?.rates?.parallel?.usd || 10.8);
+  const usdCbl = Number(initialState?.rates?.official?.USD?.buy || initialState?.rates?.official?.USD?.rate || initialState?.rates?.official?.USD || 4.85);
+  const uptimeSec = Number(initialState?.uptimeSeconds || 0);
+  const hrs = Math.floor(uptimeSec / 3600);
+  const mins = Math.floor((uptimeSec % 3600) / 60);
+  const secs = uptimeSec % 60;
+  const formattedUptime = `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  const heapMb = Number(initialState?.memory?.heapUsedMb || 55);
+  const tgConnected = Boolean(initialState?.telegramConnected);
+
+  // Pre-render Currencies & Metals cards
+  let preCurrenciesHtml = '';
+  let preMetalsHtml = '';
+  if (initialState?.rates?.parallel) {
+    for (const [code, val] of Object.entries(initialState.rates.parallel)) {
+      const num = Number(val) || 0;
+      if (num <= 0) continue;
+      const isMetal = METAL_KEYS.includes(code) || code.toLowerCase().startsWith('gold') || code.toLowerCase().startsWith('silver');
+      const name = NAMES[code.toLowerCase()] || NAMES[code] || code;
+
+      const card = `
+        <div class="rate-card ${isMetal ? 'gold' : ''}">
+          <div class="rate-header">
+            <span class="rate-name">${name}</span>
+            <span class="rate-code">${code}</span>
+          </div>
+          <div class="rate-price font-num">${num.toFixed(isMetal ? 2 : 3)} <span style="font-size: 11px; font-weight: normal; color: #94a3b8;">د.ل</span></div>
+          <button class="rate-btn-edit" onclick="openRateModal('${code}', '${name}', ${num})">✏️ تعديل السعر</button>
+        </div>
+      `;
+
+      if (isMetal) preMetalsHtml += card;
+      else preCurrenciesHtml += card;
+    }
+  }
+
+  // Pre-render CBL cards
+  let preCblHtml = '';
+  if (initialState?.rates?.official) {
+    for (const [code, item] of Object.entries(initialState.rates.official)) {
+      const buy = typeof item === 'object' ? Number((item as any).buy || (item as any).rate || 0) : Number(item || 0);
+      const sell = typeof item === 'object' ? Number((item as any).sell || (item as any).rate || 0) : Number(item || 0);
+      if (buy <= 0 && sell <= 0) continue;
+      const name = NAMES[code.toLowerCase()] || code;
+
+      preCblHtml += `
+        <div class="rate-card">
+          <div class="rate-header">
+            <span class="rate-name">${name} (رسمي)</span>
+            <span class="rate-code">${code}</span>
+          </div>
+          <div class="rate-price font-num" style="color: #38bdf8;">${buy.toFixed(4)} <span style="font-size: 11px; font-weight: normal; color: #94a3b8;">د.ل</span></div>
+          <div style="font-size: 10px; color: #94a3b8; display: flex; justify-content: space-between;">
+            <span>شراء: ${buy.toFixed(2)}</span>
+            <span>بيع: ${sell > 0 ? sell.toFixed(2) : buy.toFixed(2)}</span>
+          </div>
+        </div>
+      `;
+    }
+  }
+
+  // Pre-render Jobs
+  let preJobsHtml = '';
+  if (initialState?.activeJobs && Array.isArray(initialState.activeJobs)) {
+    for (const job of initialState.activeJobs) {
+      const badge = job.isRunning ? '⏳ قيد التشغيل' :
+        job.status === 'success' ? '✅ ناجحة' :
+        job.status === 'failed' ? '❌ فشلت' : 'خامل';
+      preJobsHtml += `
+        <div class="job-card">
+          <div class="job-info">
+            <div class="job-name">${job.name}</div>
+            <div class="job-meta">
+              <span>الحالة: <strong>${badge}</strong></span>
+              <span>المدة: ${job.lastRunDurationMs ? job.lastRunDurationMs + 'ms' : '--'}</span>
+              <span>مرات التشغيل: #${job.runCount || 0}</span>
+            </div>
+          </div>
+          <button class="btn btn-secondary btn-sm" onclick="triggerJobById('${job.id}', '${job.name}')">تشغيل</button>
+        </div>
+      `;
+    }
+  }
+
+  // Pre-render Logs
+  let preLogsHtml = '';
+  if (initialState?.recentLogs && Array.isArray(initialState.recentLogs)) {
+    for (const log of initialState.recentLogs) {
+      const time = new Date(log.timestamp).toLocaleTimeString('ar-LY');
+      const cls = log.level === 'error' ? 'log-error' :
+        log.level === 'warn' ? 'log-warn' :
+        log.level === 'success' ? 'log-success' : 'log-info';
+      preLogsHtml += `
+        <div class="log-row">
+          <span style="color: #64748b;">${time}</span>
+          <span class="${cls}">[${log.category}]:</span>
+          <span>${log.message}</span>
+        </div>
+      `;
+    }
+  }
+
   return `<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
@@ -16,11 +146,11 @@ export function renderDashboardHtml(): string {
     
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans Arabic", "Cairo", sans-serif;
-      background-color: #0f172a;
+      background-color: #0b1120;
       color: #f1f5f9;
       font-size: 14px;
       line-height: 1.5;
-      padding-bottom: 30px;
+      padding-bottom: 40px;
     }
 
     .font-num {
@@ -124,14 +254,15 @@ export function renderDashboardHtml(): string {
       font-size: 13px;
       width: 100%;
       text-align: center;
+      border-radius: 8px;
     }
     .btn-action:hover {
       background: #334155;
       border-color: #475569;
     }
     .btn-sm {
-      padding: 4px 8px;
-      font-size: 11px;
+      padding: 5px 10px;
+      font-size: 12px;
     }
 
     /* ─── QUICK STATUS CARDS ─── */
@@ -158,7 +289,7 @@ export function renderDashboardHtml(): string {
       margin-bottom: 4px;
     }
     .kpi-val {
-      font-size: 16px;
+      font-size: 17px;
       font-weight: 700;
       color: #ffffff;
     }
@@ -204,6 +335,7 @@ export function renderDashboardHtml(): string {
       padding-bottom: 6px;
       margin-bottom: 12px;
       border-bottom: 1px solid #334155;
+      -webkit-overflow-scrolling: touch;
     }
     .tab-item {
       padding: 8px 12px;
@@ -274,7 +406,7 @@ export function renderDashboardHtml(): string {
     }
     .rate-btn-edit {
       font-size: 11px;
-      padding: 4px;
+      padding: 5px;
       background: #334155;
       color: #cbd5e1;
       border-radius: 6px;
@@ -282,6 +414,11 @@ export function renderDashboardHtml(): string {
       width: 100%;
       text-align: center;
       margin-top: 4px;
+      cursor: pointer;
+    }
+    .rate-btn-edit:hover {
+      background: #475569;
+      color: #ffffff;
     }
 
     /* ─── JOBS LIST ─── */
@@ -424,6 +561,11 @@ export function renderDashboardHtml(): string {
 </head>
 <body>
 
+  <!-- EMBEDDED INITIAL STATE FOR INSTANT RENDERING -->
+  <script id="initial-dashboard-state" type="application/json">
+    ${JSON.stringify(initialState || {})}
+  </script>
+
   <!-- HEADER -->
   <header class="header">
     <div class="header-content">
@@ -446,29 +588,29 @@ export function renderDashboardHtml(): string {
   <!-- MAIN CONTAINER -->
   <div class="container">
 
-    <!-- KPI STATUS STRIP -->
+    <!-- KPI STATUS STRIP (PRE-RENDERED WITH INITIAL VALUES) -->
     <div class="kpi-grid">
       <div class="kpi-card">
         <div class="kpi-title">💵 الدولار الموازي</div>
-        <div class="kpi-val font-num" id="kpi-usd">-- د.ل</div>
-        <div class="kpi-sub">المركزي: <span class="font-num" id="kpi-cbl">4.85</span></div>
+        <div class="kpi-val font-num" id="kpi-usd">${usdParallel.toFixed(2)} د.ل</div>
+        <div class="kpi-sub">المركزي: <span class="font-num" id="kpi-cbl">${usdCbl.toFixed(2)}</span></div>
       </div>
 
       <div class="kpi-card">
         <div class="kpi-title">⏱️ وقت التشغيل (Uptime)</div>
-        <div class="kpi-val font-num" id="kpi-uptime">00:00:00</div>
-        <div class="kpi-sub" id="kpi-date">اليوم</div>
+        <div class="kpi-val font-num" id="kpi-uptime">${formattedUptime}</div>
+        <div class="kpi-sub" id="kpi-date">نشط</div>
       </div>
 
       <div class="kpi-card">
         <div class="kpi-title">📱 اتصال تيليجرام</div>
-        <div class="kpi-val" id="kpi-tg">جاري الفحص..</div>
+        <div class="kpi-val" id="kpi-tg">${tgConnected ? '🟢 متصل' : '⚠️ غير متصل'}</div>
         <div class="kpi-sub">مراقبة القنوات</div>
       </div>
 
       <div class="kpi-card">
         <div class="kpi-title">🧠 استهلاك الذاكرة</div>
-        <div class="kpi-val font-num" id="kpi-mem">-- MB</div>
+        <div class="kpi-val font-num" id="kpi-mem">${heapMb} MB</div>
         <div class="kpi-sub">Heap Memory</div>
       </div>
     </div>
@@ -515,7 +657,7 @@ export function renderDashboardHtml(): string {
           💵 أسعار السوق الموازي (الكاش)
         </div>
         <div class="rates-grid" id="grid-currencies">
-          <div style="color: #94a3b8; font-size: 12px;">جاري تحميل الأسعار...</div>
+          ${preCurrenciesHtml || '<div style="color: #94a3b8; font-size: 12px;">جاري تحميل الأسعار...</div>'}
         </div>
       </div>
 
@@ -525,7 +667,7 @@ export function renderDashboardHtml(): string {
           🪙 أسعار الذهب والفضة
         </div>
         <div class="rates-grid" id="grid-metals">
-          <div style="color: #94a3b8; font-size: 12px;">جاري تحميل أسعار الذهب...</div>
+          ${preMetalsHtml || '<div style="color: #94a3b8; font-size: 12px;">جاري تحميل أسعار الذهب...</div>'}
         </div>
       </div>
 
@@ -535,7 +677,7 @@ export function renderDashboardHtml(): string {
           🏦 أسعار مصرف ليبيا المركزي الرسمية (CBL)
         </div>
         <div class="rates-grid" id="grid-cbl">
-          <div style="color: #94a3b8; font-size: 12px;">جاري تحميل أسعار المصرف...</div>
+          ${preCblHtml || '<div style="color: #94a3b8; font-size: 12px;">جاري تحميل أسعار المصرف...</div>'}
         </div>
       </div>
 
@@ -547,7 +689,7 @@ export function renderDashboardHtml(): string {
         ⚙️ جميع مهام الخادم التلقائية
       </div>
       <div id="jobs-list-container">
-        <!-- Rendered by JS -->
+        ${preJobsHtml || '<div style="color: #94a3b8; font-size: 12px;">جاري تحميل المهام...</div>'}
       </div>
     </div>
 
@@ -589,7 +731,7 @@ export function renderDashboardHtml(): string {
         </button>
       </div>
       <div class="logs-container" id="logs-feed">
-        <div style="color: #64748b;">جاري تحميل السجلات...</div>
+        ${preLogsHtml || '<div style="color: #64748b;">جاري تحميل السجلات...</div>'}
       </div>
     </div>
 
@@ -616,27 +758,35 @@ export function renderDashboardHtml(): string {
   <!-- TOAST NOTIFICATION -->
   <div id="toast" class="toast-box hidden"></div>
 
-  <!-- SCRIPT -->
+  <!-- CLIENT SCRIPTS -->
   <script>
     let pollInterval = 5000;
     let pollTimer = null;
     let currentRates = null;
 
     const NAMES = {
-      usd: 'الدولار الأمريكي',
+      usd: 'الدولار الأمريكي (كاش)',
       eur: 'اليورو الأوروبي',
       gbp: 'الجنيه الإسترليني',
       egp: 'الجنيه المصري',
       tnd: 'الدينار التونسي',
       try: 'الليرة التركية',
+      usd_checks: 'دولار الصكوك (طرابلس)',
+      usd_tr: 'دولار حوالات تركيا',
+      usd_ae: 'دولار حوالات دبي',
       gold: 'ذهب كسر عيار 18',
       gold_scrap_18: 'ذهب كسر 18',
       gold_scrap_21: 'ذهب كسر 21',
+      gold_ext_18: 'ذهب خارجي 18',
+      gold_ext_21: 'ذهب خارجي 21',
+      gold_cast_18: 'سبائك عيار 18',
+      gold_cast_21: 'سبائك عيار 21',
       gold_cast_24: 'سبائك عيار 24',
       gold_lira_8g: 'ليرة ذهب (8غ)',
       gold_lira_14g: 'ليرة ذهب (14غ)',
-      silver_cast_1000: 'فضة سبائك',
-      silver_scrap: 'فضة كسر'
+      gold_mujara_14g: 'مجرية ذهب (14غ)',
+      silver_cast_1000: 'فضة سبائك 1000',
+      silver_scrap: 'فضة كسر (جرام)'
     };
 
     function switchTab(tabId) {
@@ -651,6 +801,7 @@ export function renderDashboardHtml(): string {
 
     function showToast(msg, isError = false) {
       const toast = document.getElementById('toast');
+      if (!toast) return;
       toast.textContent = (isError ? '❌ ' : '✅ ') + msg;
       toast.style.borderColor = isError ? '#ef4444' : '#10b981';
       toast.classList.remove('hidden');
@@ -671,31 +822,40 @@ export function renderDashboardHtml(): string {
     }
 
     function renderUI(data) {
+      if (!data) return;
+
       // 1. KPIs
-      if (data.rates?.parallel) {
+      if (data.rates && data.rates.parallel) {
         const usd = data.rates.parallel.USD || data.rates.parallel.usd || 0;
-        document.getElementById('kpi-usd').textContent = Number(usd).toFixed(2) + ' د.ل';
+        const usdEl = document.getElementById('kpi-usd');
+        if (usdEl && Number(usd) > 0) usdEl.textContent = Number(usd).toFixed(2) + ' د.ل';
       }
-      if (data.rates?.official?.USD) {
-        const cbl = data.rates.official.USD.buy || data.rates.official.USD.rate || 4.85;
-        document.getElementById('kpi-cbl').textContent = Number(cbl).toFixed(2);
+      if (data.rates && data.rates.official) {
+        const cblItem = data.rates.official.USD;
+        const cbl = typeof cblItem === 'object' ? (cblItem.buy || cblItem.rate || 4.85) : (cblItem || 4.85);
+        const cblEl = document.getElementById('kpi-cbl');
+        if (cblEl) cblEl.textContent = Number(cbl).toFixed(2);
       }
       if (typeof data.uptimeSeconds === 'number') {
         const h = Math.floor(data.uptimeSeconds / 3600);
         const m = Math.floor((data.uptimeSeconds % 3600) / 60);
         const s = data.uptimeSeconds % 60;
-        document.getElementById('kpi-uptime').textContent = 
-          String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+        const upEl = document.getElementById('kpi-uptime');
+        if (upEl) {
+          upEl.textContent = String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+        }
       }
       if (data.memory) {
-        document.getElementById('kpi-mem').textContent = data.memory.heapUsedMb + ' MB';
+        const memEl = document.getElementById('kpi-mem');
+        if (memEl) memEl.textContent = data.memory.heapUsedMb + ' MB';
       }
       if (typeof data.telegramConnected === 'boolean') {
-        document.getElementById('kpi-tg').textContent = data.telegramConnected ? '🟢 متصل' : '⚠️ غير متصل';
+        const tgEl = document.getElementById('kpi-tg');
+        if (tgEl) tgEl.textContent = data.telegramConnected ? '🟢 متصل' : '⚠️ غير متصل';
       }
 
       // 2. Currencies Grid & Metals Grid
-      if (data.rates?.parallel) {
+      if (data.rates && data.rates.parallel) {
         const cGrid = document.getElementById('grid-currencies');
         const mGrid = document.getElementById('grid-metals');
         let cHtml = '';
@@ -724,17 +884,17 @@ export function renderDashboardHtml(): string {
           else cHtml += card;
         }
 
-        cGrid.innerHTML = cHtml || '<div style="color: #64748b;">لا توجد أسعار</div>';
-        mGrid.innerHTML = mHtml || '<div style="color: #64748b;">لا توجد أسعار معادن</div>';
+        if (cGrid && cHtml) cGrid.innerHTML = cHtml;
+        if (mGrid && mHtml) mGrid.innerHTML = mHtml;
       }
 
       // 3. Official CBL Grid
-      if (data.rates?.official) {
+      if (data.rates && data.rates.official) {
         const cblGrid = document.getElementById('grid-cbl');
         let cblHtml = '';
         for (const [code, item] of Object.entries(data.rates.official)) {
-          const buy = Number(item.buy || item.rate || 0);
-          const sell = Number(item.sell || item.rate || 0);
+          const buy = typeof item === 'object' ? Number(item.buy || item.rate || 0) : Number(item || 0);
+          const sell = typeof item === 'object' ? Number(item.sell || item.rate || 0) : Number(item || 0);
           if (buy <= 0 && sell <= 0) continue;
           const name = NAMES[code.toLowerCase()] || code;
 
@@ -747,12 +907,12 @@ export function renderDashboardHtml(): string {
               <div class="rate-price font-num" style="color: #38bdf8;">\${buy.toFixed(4)} <span style="font-size: 11px; font-weight: normal; color: #94a3b8;">د.ل</span></div>
               <div style="font-size: 10px; color: #94a3b8; display: flex; justify-content: space-between;">
                 <span>شراء: \${buy.toFixed(2)}</span>
-                <span>بيع: \${sell.toFixed(2)}</span>
+                <span>بيع: \${sell > 0 ? sell.toFixed(2) : buy.toFixed(2)}</span>
               </div>
             </div>
           \`;
         }
-        cblGrid.innerHTML = cblHtml;
+        if (cblGrid && cblHtml) cblGrid.innerHTML = cblHtml;
       }
 
       // 4. Jobs List
@@ -778,7 +938,7 @@ export function renderDashboardHtml(): string {
             </div>
           \`;
         }
-        jContainer.innerHTML = jHtml;
+        if (jContainer && jHtml) jContainer.innerHTML = jHtml;
       }
 
       // 5. Live Logs
@@ -799,7 +959,7 @@ export function renderDashboardHtml(): string {
             </div>
           \`;
         }
-        lFeed.innerHTML = lHtml || '<div style="color: #64748b;">لا توجد سجلات</div>';
+        if (lFeed && lHtml) lFeed.innerHTML = lHtml;
       }
     }
 
@@ -813,7 +973,7 @@ export function renderDashboardHtml(): string {
         });
         const data = await res.json();
         if (data.success) {
-          showToast('اكتمل: ' + label);
+          showToast('اكتمل بنجاح: ' + label);
           fetchDashboardData();
         } else {
           showToast('فشل: ' + (data.error || 'خطأ'), true);
@@ -838,26 +998,31 @@ export function renderDashboardHtml(): string {
     }
 
     function openRateModal(code, name, rate) {
-      document.getElementById('modal-code').value = code;
-      document.getElementById('modal-title').textContent = name + ' (' + code + ')';
-      document.getElementById('modal-input').value = rate;
-      document.getElementById('rate-modal').classList.remove('hidden');
+      const modal = document.getElementById('rate-modal');
+      const input = document.getElementById('modal-input');
+      const codeInput = document.getElementById('modal-code');
+      const title = document.getElementById('modal-title');
+      if (codeInput) codeInput.value = code;
+      if (title) title.textContent = name + ' (' + code + ')';
+      if (input) input.value = rate;
+      if (modal) modal.classList.remove('hidden');
     }
 
     function closeRateModal() {
-      document.getElementById('rate-modal').classList.add('hidden');
+      const modal = document.getElementById('rate-modal');
+      if (modal) modal.classList.add('hidden');
     }
 
     async function saveRateModal() {
-      const code = document.getElementById('modal-code').value;
-      const rate = parseFloat(document.getElementById('modal-input').value);
+      const code = document.getElementById('modal-code')?.value;
+      const rate = parseFloat(document.getElementById('modal-input')?.value || '0');
 
       if (!code || isNaN(rate) || rate <= 0) {
-        showToast('يرجى كتابة سعر صحيح', true);
+        showToast('يرجى كتابة سعر صحيح وموجب', true);
         return;
       }
 
-      showToast('جاري حفظ السعر...');
+      showToast('جاري حفظ السعر ومزامنته...');
       try {
         const res = await fetch('/api/dashboard/update-rate', {
           method: 'POST',
@@ -879,21 +1044,24 @@ export function renderDashboardHtml(): string {
 
     function setBroadcastText(type) {
       const input = document.getElementById('broadcast-input');
-      const usd = currentRates?.parallel?.USD || currentRates?.parallel?.usd || 7.15;
-      const eur = currentRates?.parallel?.EUR || currentRates?.parallel?.eur || 7.65;
-      const gold = currentRates?.parallel?.GOLD || currentRates?.parallel?.GOLD_SCRAP_18 || 385;
+      if (!input) return;
+      const usd = currentRates?.parallel?.USD || currentRates?.parallel?.usd || 10.8;
+      const eur = currentRates?.parallel?.EUR || currentRates?.parallel?.eur || 12.17;
+      const gold = currentRates?.parallel?.GOLD || currentRates?.parallel?.GOLD_SCRAP_18 || 485;
       const time = new Date().toLocaleTimeString('ar-LY', { hour: '2-digit', minute: '2-digit' });
 
       if (type === 'rates') {
-        input.value = \`📢 نشرة أسعار الصرف في طرابلس:\n💵 الدولار: \${Number(usd).toFixed(2)} د.ل\n💶 اليورو: \${Number(eur).toFixed(2)} د.ل\n🕒 التوقيت: \${time}\`;
+        input.value = '📢 نشرة أسعار الصرف في طرابلس:\\n💵 الدولار: ' + Number(usd).toFixed(2) + ' د.ل\\n💶 اليورو: ' + Number(eur).toFixed(2) + ' د.ل\\n🕒 التوقيت: ' + time;
       } else if (type === 'gold') {
-        input.value = \`🪙 أسعار الذهب:\n🥇 كسر 18: \${Number(gold).toFixed(2)} د.ل\n🕒 التوقيت: \${time}\`;
+        input.value = '🪙 أسعار الذهب:\\n🥇 كسر 18: ' + Number(gold).toFixed(2) + ' د.ل\\n🕒 التوقيت: ' + time;
       }
     }
 
     async function submitBroadcast() {
-      const message = document.getElementById('broadcast-input').value.trim();
-      const isTest = document.getElementById('broadcast-test-check').checked;
+      const input = document.getElementById('broadcast-input');
+      const message = input ? input.value.trim() : '';
+      const check = document.getElementById('broadcast-test-check');
+      const isTest = check ? check.checked : false;
 
       if (!message) {
         showToast('اكتب نص الرسالة أولاً', true);
@@ -921,12 +1089,27 @@ export function renderDashboardHtml(): string {
     async function clearLiveLogs() {
       try {
         await fetch('/api/dashboard/clear-logs', { method: 'POST' });
-        document.getElementById('logs-feed').innerHTML = '<div style="color: #64748b;">تم مسح السجلات</div>';
+        const feed = document.getElementById('logs-feed');
+        if (feed) feed.innerHTML = '<div style="color: #64748b;">تم مسح السجلات</div>';
         showToast('تم مسح السجلات');
       } catch (e) {}
     }
 
-    // Initialize
+    // Load initial state if present
+    try {
+      const stateEl = document.getElementById('initial-dashboard-state');
+      if (stateEl && stateEl.textContent) {
+        const parsed = JSON.parse(stateEl.textContent.trim());
+        if (parsed && parsed.rates) {
+          currentRates = parsed.rates;
+          renderUI(parsed);
+        }
+      }
+    } catch (e) {
+      console.warn('Initial state parse error:', e);
+    }
+
+    // Background fetch & polling
     fetchDashboardData();
     pollTimer = setInterval(fetchDashboardData, pollInterval);
   </script>

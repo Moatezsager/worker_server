@@ -35,8 +35,32 @@ dashboardRouter.get(["/", "/dashboard", "/admin"], (req: Request, res: Response)
     });
   }
 
+  const mem = process.memoryUsage();
+  const uptimeSeconds = Math.floor((Date.now() - serverStartTime.getTime()) / 1000);
+  const initialState = {
+    status: "online",
+    role: "worker_server",
+    timestamp: new Date().toISOString(),
+    uptimeSeconds,
+    buildSignature: getAppBuildSignature(),
+    memory: {
+      rssMb: Math.round(mem.rss / (1024 * 1024)),
+      heapUsedMb: Math.round(mem.heapUsed / (1024 * 1024)),
+      heapTotalMb: Math.round(mem.heapTotal / (1024 * 1024)),
+    },
+    telegramConnected: !!(activeClient && activeClient.connected),
+    whatsappStatus: whatsappManager.getStatus().status,
+    rates: {
+      parallel: rates.parallel,
+      official: rates.official,
+      lastUpdated: rates.lastUpdated,
+    },
+    activeJobs: getWorkerJobsStatus(),
+    recentLogs: getRecentLogs(60),
+  };
+
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(renderDashboardHtml());
+  res.send(renderDashboardHtml(initialState));
 });
 
 // ─── 2. Dedicated Dashboard Live Telemetry API ───
