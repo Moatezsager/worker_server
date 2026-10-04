@@ -172,8 +172,8 @@ export function createWorkerApp() {
   app.use(helmetMiddleware);
   app.use(permissionsPolicyMiddleware);
 
-  // Root health probes for Render / Cloud Run health checks
-  app.get(["/health", "/ping", "/api/health"], (req: express.Request, res: express.Response) => {
+  // Root health probes and keep-alive endpoints for console.cron-job.org / Render / UptimeRobot
+  app.all(["/health", "/ping", "/keep-alive", "/cron-job", "/api/health", "/api/ping", "/api/keep-alive"], (req: express.Request, res: express.Response) => {
     if (isShuttingDown) {
       return res.status(503).json({
         status: "shutting_down",
@@ -182,9 +182,14 @@ export function createWorkerApp() {
       });
     }
 
+    if (req.method === 'HEAD') {
+      res.setHeader('Content-Type', 'application/json');
+      return res.status(200).end();
+    }
+
     res.status(200).json({
       status: "online",
-      role: "worker_server",
+      service: "lyd-index-worker",
       timestamp: new Date().toISOString(),
       uptimeSeconds: Math.floor(process.uptime()),
       memory: {

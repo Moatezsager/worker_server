@@ -3,6 +3,7 @@ import { rates } from '../state';
 import { appConfig } from '../config';
 import { supabase, supabaseAnonKey } from '../db';
 import { broadcastToSocialMedia, getOrInitTelegramManager } from './social.service';
+import { getPublicAppUrl } from '../utils/helpers';
 
 export const dailyStats: Record<string, CurrencyStat> = {};
 export const weeklyStats: Record<string, CurrencyStat> = {};
@@ -79,7 +80,7 @@ export async function broadcastDailyReport() {
   }
   
   const reportRandomCode = Math.floor(100000 + Math.random() * 900000);
-  message += `━━━━━━━━━━━━━━━━━\n📡 *مؤشر الدينار | الدقة والسرعة*\n🔗 https://dollar-price-qp14.onrender.com/?r=${reportRandomCode}`;
+  message += `━━━━━━━━━━━━━━━━━\n📡 *مؤشر الدينار | الدقة والسرعة*\n🔗 ${getPublicAppUrl()}/?r=${reportRandomCode}`;
   
   try {
     await broadcastToSocialMedia(message, false);

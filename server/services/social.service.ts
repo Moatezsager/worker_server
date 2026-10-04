@@ -3,7 +3,7 @@ import { appConfig, telegramManager, setTelegramManager } from '../config';
 import { rates } from '../state';
 import { db, supabase, supabaseKey } from '../db';
 import { addBroadcastLog } from './broadcastLog.service';
-import { delay } from '../utils/helpers';
+import { delay, getPublicAppUrl } from '../utils/helpers';
 
 interface FacebookApiResponse {
   error?: {
@@ -563,9 +563,10 @@ export async function broadcastToSocialMedia(message: string, isTest: boolean = 
       // تجهيز رسالة تيليجرام: إزالة أي روابط مختصرة تماماً واستبدالها برابط الموقع المباشر مع رقم عشوائي
       let tgMessage = message;
       const tgRandomNum = Math.floor(100000 + Math.random() * 900000);
-      const dynamicTgUrl = `https://dollar-price-qp14.onrender.com/?r=${tgRandomNum}`;
+      const publicBase = getPublicAppUrl();
+      const dynamicTgUrl = `${publicBase}/?r=${tgRandomNum}`;
       tgMessage = tgMessage.replace(/https:\/\/tinyurl\.com\/2j7667u2/g, dynamicTgUrl);
-      tgMessage = tgMessage.replace(/https:\/\/dollar-price-qp14\.onrender\.com(?:\/[^\s]*)?/g, dynamicTgUrl);
+      tgMessage = tgMessage.replace(/https?:\/\/[a-zA-Z0-9.-]+\.onrender\.com(?:\/[^\s]*)?/g, dynamicTgUrl);
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
@@ -891,7 +892,7 @@ export async function broadcastOfficialRates(
 
   message += `\n━━━━━━━━━━━━━━━━━━━\n`;
   const officialRandomCode = Math.floor(100000 + Math.random() * 900000);
-  message += `🔗 *لمزيد من التفاصيل والبيانات الحية:*\n🌐 https://dollar-price-qp14.onrender.com/?r=${officialRandomCode}\n`;
+  message += `🔗 *لمزيد من التفاصيل والبيانات الحية:*\n🌐 ${getPublicAppUrl()}/?r=${officialRandomCode}\n`;
   message += `📱 *المصدر:* مصرف ليبيا المركزي`;
 
   try {
@@ -1355,7 +1356,7 @@ export function formatSmartBroadcastMessage(updates: { id?: string; name: string
   message += `━━━━━━━━━━━━━━━━━━━\n`;
   message += `📈 *الرسوم البيانية والمتابعة الحية لحظة بلحظة:*\n`;
   const broadcastRandomNum = Math.floor(100000 + Math.random() * 900000);
-  message += `🌐 https://dollar-price-qp14.onrender.com/?r=${broadcastRandomNum}\n`;
+  message += `🌐 ${getPublicAppUrl()}/?r=${broadcastRandomNum}\n`;
   message += `📱 *المصدر:* شبكة مؤشر الدينار | طرابلس`;
 
   return message;

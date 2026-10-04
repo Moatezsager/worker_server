@@ -59,7 +59,9 @@ export const suspiciousActivityMiddleware = (req: express.Request, res: express.
 };
 
 export const userAgentMiddleware = (req: express.Request, res: express.Response, next: express.NextFunction) => {
-  if (req.path.startsWith('/api/')) {
+  const isHealthPath = req.path === '/health' || req.path === '/ping' || req.path === '/keep-alive' || req.path === '/cron-job' ||
+    req.path === '/api/health' || req.path === '/api/ping' || req.path === '/api/keep-alive';
+  if (req.path.startsWith('/api/') && !isHealthPath) {
     const ua = req.headers['user-agent'];
     if (!ua || ua.trim() === '' || ua.length < 5) {
       res.status(403).json({ success: false, error: "Valid User-Agent header is required." });
@@ -170,7 +172,10 @@ export const apiLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   skip: (req) => {
-    if (req.path === '/health' || req.path === '/ping' || req.path === '/version') return true;
+    const isHealthPath = req.path === '/health' || req.path === '/ping' || req.path === '/version' ||
+      req.path === '/keep-alive' || req.path === '/cron-job' ||
+      req.path === '/api/health' || req.path === '/api/ping' || req.path === '/api/keep-alive';
+    if (isHealthPath) return true;
     if (req.path.startsWith('/refresh-') || req.path === '/cleanup-db') {
       const key = extractProvidedCronKey(req);
       return isValidCronSecret(key);

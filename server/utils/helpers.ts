@@ -11,6 +11,14 @@ import crypto from 'crypto';
 export const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
+ * Returns the public external URL of the server (e.g. https://worker-server-89vz.onrender.com)
+ */
+export function getPublicAppUrl(): string {
+  const url = process.env.PUBLIC_APP_URL || process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || 'https://worker-server-89vz.onrender.com';
+  return url.replace(/\/$/, '');
+}
+
+/**
  * Common Metal / Gold & Silver identifier set
  */
 export const METAL_IDS = [
