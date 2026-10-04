@@ -207,5 +207,11 @@ export function recordIngestion(entry: Omit<IngestedMessageRecord, 'id'>): Inges
  * Get recent ingested messages.
  */
 export function getRecentIngestedRecords(limit: number = 30): IngestedMessageRecord[] {
-  return memoryBuffer.slice(0, limit);
+  return [...memoryBuffer]
+    .sort((a, b) => {
+      const timeA = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+      const timeB = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+      return timeB - timeA;
+    })
+    .slice(0, limit);
 }

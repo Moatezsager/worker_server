@@ -2110,7 +2110,10 @@ export function renderDashboardHtml(initialState?: any): string {
 
           let html = '';
           for (const msg of data.messages) {
-            const time = new Date(msg.timestamp).toLocaleTimeString('ar-LY');
+            const dateObj = new Date(msg.timestamp);
+            const dateStr = dateObj.toLocaleDateString('ar-LY', { month: 'numeric', day: 'numeric' });
+            const timeStr = dateObj.toLocaleTimeString('ar-LY', { hour: '2-digit', minute: '2-digit' });
+            const time = dateStr + ' ' + timeStr;
             const isExtracted = msg.status === 'extracted';
             const badge = isExtracted 
               ? '<span class="status-badge" style="color:#10b981; background:rgba(16,185,129,0.15);">✅ تم استخراج أسعار</span>'
