@@ -408,6 +408,212 @@ dashboardRouter.post("/api/dashboard/broadcast/settings/save", async (req: Reque
   });
 });
 
+// ─── 5c. Sources & Channels Management Endpoints ───
+dashboardRouter.get("/api/dashboard/sources", async (req: Request, res: Response) => {
+  try {
+    const telegramChannels = appConfig.channels || [];
+    const whatsappSources = appConfig.whatsappSources || [];
+    const reachableChats = await whatsappManager.getReachableChats().catch(() => []);
+    
+    res.json({
+      success: true,
+      telegramChannels,
+      whatsappSources,
+      whatsappStatus: whatsappManager.getStatus().status,
+      whatsappReachableChats: reachableChats
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || String(err) });
+  }
+});
+
+dashboardRouter.post("/api/dashboard/sources/telegram/add", async (req: Request, res: Response) => {
+  try {
+    const { channel } = req.body || {};
+    if (!channel || typeof channel !== 'string') {
+      return res.status(400).json({ success: false, error: "يرجى أدخال معرف القناة بشكل صحيح" });
+    }
+    const cleanChannel = channel.replace(/^@/, '').trim();
+    if (!cleanChannel) {
+      return res.status(400).json({ success: false, error: "اسم القناة غير صالح" });
+    }
+    if (appConfig.channels.includes(cleanChannel)) {
+      return res.status(400).json({ success: false, error: "القناة موجودة بالفعل في قائمة المراقبة" });
+    }
+
+    appConfig.channels.push(cleanChannel);
+    addLog("info", "إدارة المصادر", `تم إضافة قناة تيليجرام جديدة: @${cleanChannel}`);
+    await saveConfigToSupabase(appConfig);
+
+    res.json({
+      success: true,
+      message: `تم إضافة القناة @${cleanChannel} بنجاح!`,
+      channels: appConfig.channels
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || String(err) });
+  }
+});
+
+dashboardRouter.post("/api/dashboard/sources/telegram/edit", async (req: Request, res: Response) => {
+  try {
+    const { oldChannel, newChannel } = req.body || {};
+    if (!oldChannel || !newChannel) {
+      return res.status(400).json({ success: false, error: "بيانات التعديل غير مكتملة" });
+    }
+    const cleanOld = oldChannel.replace(/^@/, '').trim();
+    const cleanNew = newChannel.replace(/^@/, '').trim();
+
+    const idx = appConfig.channels.indexOf(cleanOld);
+    if (idx === -1) {
+      return res.status(404).json({ success: false, error: "القناة المراد تعديلها غير موجودة" });
+    }
+
+    appConfig.channels[idx] = cleanNew;
+    addLog("info", "إدارة المصادر", `تم تعديل اسم قناة تيليجرام من @${cleanOld} إلى @${cleanNew}`);
+    await saveConfigToSupabase(appConfig);
+
+    res.json({
+      success: true,
+      message: "تم تعديل اسم القناة بنجاح",
+      channels: appConfig.channels
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || String(err) });
+  }
+});
+
+dashboardRouter.post("/api/dashboard/sources/telegram/delete", async (req: Request, res: Response) => {
+  try {
+    const { channel } = req.body || {};
+    if (!channel) {
+      return res.status(400).json({ success: false, error: "لم يتم تحديد القناة المراد حذفها" });
+    }
+    const cleanChannel = channel.replace(/^@/, '').trim();
+    const idx = appConfig.channels.indexOf(cleanChannel);
+    if (idx !== -1) {
+      appConfig.channels.splice(idx, 1);
+      addLog("info", "إدارة المصادر", `تم حذف قناة تيليجرام: @${cleanChannel}`);
+      await saveConfigToSupabase(appConfig);
+    }
+
+    res.json({
+      success: true,
+      message: `تم حذف القناة @${cleanChannel} بنجاح`,
+      channels: appConfig.channels
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || String(err) });
+  }
+});
+
+dashboardRouter.post("/api/dashboard/sources/whatsapp/refresh", async (req: Request, res: Response) => {
+  try {
+    const chats = await whatsappManager.getReachableChats();
+    if (!appConfig.whatsappSources) {
+      appConfig.whatsappSources = [];
+    }
+
+    let addedCount = 0;
+    for (const chat of chats) {
+      const existing = appConfig.whatsappSources.find(s => s.jid === chat.id);
+      if (!existing) {
+        appConfig.whatsappSources.push({
+          jid: chat.id,
+          name: chat.name,
+          enabled: true,
+          type: chat.type
+        });
+        addedCount++;
+      } else {
+        existing.name = chat.name || existing.name;
+        existing.type = chat.type || existing.type;
+      }
+    }
+
+    if (addedCount > 0 || chats.length > 0) {
+      addLog("info", "إدارة المصادر", `تم اكتشاف ومزامنة ${chats.length} مجموعة/قناة من حساب واتساب`);
+      await saveConfigToSupabase(appConfig);
+    }
+
+    res.json({
+      success: true,
+      message: `تم جلب ومزامنة ${chats.length} مجموعة وقناة من حساب واتساب المنضم إليها`,
+      whatsappSources: appConfig.whatsappSources,
+      chats
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || String(err) });
+  }
+});
+
+dashboardRouter.post("/api/dashboard/sources/whatsapp/toggle", async (req: Request, res: Response) => {
+  try {
+    const { jid, enabled } = req.body || {};
+    if (!jid) return res.status(400).json({ success: false, error: "معرف المصدر مفقود" });
+
+    if (!appConfig.whatsappSources) appConfig.whatsappSources = [];
+    let item = appConfig.whatsappSources.find(s => s.jid === jid);
+    if (!item) {
+      item = { jid, name: jid, enabled: Boolean(enabled) };
+      appConfig.whatsappSources.push(item);
+    } else {
+      item.enabled = Boolean(enabled);
+    }
+
+    addLog("info", "إدارة المصادر", `تم ${item.enabled ? 'تفعيل' : 'تعطيل'} استخراج الأسعار من مصدر واتساب: ${item.name}`);
+    await saveConfigToSupabase(appConfig);
+
+    res.json({ success: true, item, whatsappSources: appConfig.whatsappSources });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || String(err) });
+  }
+});
+
+dashboardRouter.post("/api/dashboard/sources/whatsapp/add", async (req: Request, res: Response) => {
+  try {
+    const { jid, name, type = 'group' } = req.body || {};
+    if (!jid || !name) return res.status(400).json({ success: false, error: "الرجاء إدخال اسم المصدر ومعرفه (JID)" });
+
+    if (!appConfig.whatsappSources) appConfig.whatsappSources = [];
+    const cleanJid = jid.trim();
+    if (appConfig.whatsappSources.some(s => s.jid === cleanJid)) {
+      return res.status(400).json({ success: false, error: "المصدر موجود بالفعل" });
+    }
+
+    appConfig.whatsappSources.push({
+      jid: cleanJid,
+      name: name.trim(),
+      enabled: true,
+      type
+    });
+
+    addLog("info", "إدارة المصادر", `تم إضافة مصدر واتساب جديد يدوياً: ${name}`);
+    await saveConfigToSupabase(appConfig);
+
+    res.json({ success: true, message: "تم إضافة مصدر واتساب بنجاح", whatsappSources: appConfig.whatsappSources });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || String(err) });
+  }
+});
+
+dashboardRouter.post("/api/dashboard/sources/whatsapp/delete", async (req: Request, res: Response) => {
+  try {
+    const { jid } = req.body || {};
+    if (!jid) return res.status(400).json({ success: false, error: "معرف المصدر مفقود" });
+
+    if (appConfig.whatsappSources) {
+      appConfig.whatsappSources = appConfig.whatsappSources.filter(s => s.jid !== jid);
+      addLog("info", "إدارة المصادر", `تم حذف مصدر واتساب: ${jid}`);
+      await saveConfigToSupabase(appConfig);
+    }
+
+    res.json({ success: true, message: "تم حذف المصدر بنجاح", whatsappSources: appConfig.whatsappSources });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || String(err) });
+  }
+});
+
 // ─── 6. Clear In-Memory Live Logs ───
 dashboardRouter.post("/api/dashboard/clear-logs", (req: Request, res: Response) => {
   clearLogs();

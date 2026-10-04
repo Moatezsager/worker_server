@@ -26,8 +26,16 @@ export interface HistoryPoint {
   ratesOfficial?: RateMap;
 }
 
+export interface WhatsAppSourceConfig {
+  jid: string;
+  name: string;
+  enabled: boolean;
+  type?: 'channel' | 'group' | 'chat';
+}
+
 export interface AppConfig {
   channels: string[];
+  whatsappSources?: WhatsAppSourceConfig[];
   terms: {
     id: string;
     name: string;

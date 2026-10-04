@@ -730,6 +730,7 @@ export function renderDashboardHtml(initialState?: any): string {
     <div class="tabs-nav">
       <button class="tab-item active" onclick="switchTab('rates')" id="tab-btn-rates">📊 الأسعار</button>
       <button class="tab-item" onclick="switchTab('settings')" id="tab-btn-settings">⚙️ إعدادات العملات والشروط</button>
+      <button class="tab-item" onclick="switchTab('sources')" id="tab-btn-sources">📡 مصادر القنوات والواتساب</button>
       <button class="tab-item" onclick="switchTab('accounts')" id="tab-btn-accounts">🔗 الحسابات والربط</button>
       <button class="tab-item" onclick="switchTab('ingested')" id="tab-btn-ingested">📥 الرسائل الملتقطة</button>
       <button class="tab-item" onclick="switchTab('jobs')" id="tab-btn-jobs">⚡ المهام (8)</button>
@@ -818,6 +819,75 @@ export function renderDashboardHtml(initialState?: any): string {
       <!-- Currency Cards Grid -->
       <div class="terms-grid" id="terms-cards-container">
         <!-- Rendered dynamically -->
+      </div>
+    </div>
+
+    <!-- TAB: SOURCES & CHANNELS MANAGEMENT -->
+    <div id="tab-content-sources" class="hidden">
+      <!-- Section Intro Header -->
+      <div class="section-card" style="margin-bottom:12px;">
+        <div class="section-header">
+          <div>
+            <div class="section-title">📡 إدارة مصادر الأسعار والقنوات (تيليجرام وواتساب)</div>
+            <div style="font-size:11px; color:#94a3b8; margin-top:3px; max-width:700px; line-height:1.5;">
+              إدارة القنوات والمجموعات المراقبة لاستخراج أسعار الصرف. يمكنك إضافة قنوات تيليجرام جديدة أو تعديلها وحذفها، بالإضافة لمزامنة كافة مجموعات وقنوات واتساب المنضم إليها حسابك مع إمكانية التفعيل أو التعطيل لكل مصدر.
+            </div>
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="loadSourcesData()">
+            🔄 تحديث قائمة المصادر
+          </button>
+        </div>
+      </div>
+
+      <!-- Grid for Telegram Channels & WhatsApp Sources -->
+      <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap:12px;">
+        
+        <!-- CARD 1: TELEGRAM CHANNELS -->
+        <div class="card" style="background:#0f172a; border:1px solid #1e293b; border-radius:10px; padding:14px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; border-bottom:1px solid #1e293b; padding-bottom:8px;">
+            <div style="font-size:13px; font-weight:700; color:#38bdf8; display:flex; align-items:center; gap:6px;">
+              <span>✈️ قنوات تيليجرام المراقبة</span>
+              <span id="tg-channels-count" class="badge" style="background:rgba(56,189,248,0.2); color:#38bdf8; font-size:10px;">0</span>
+            </div>
+          </div>
+
+          <!-- Add Tg Channel Inline Bar -->
+          <div style="display:flex; gap:6px; margin-bottom:12px;">
+            <input type="text" id="add-tg-input" class="form-input" placeholder="اسم القناة (مثال: dollar_ly أو @dollarr_ly)" style="font-size:11px; padding:6px 10px;">
+            <button class="btn btn-primary btn-sm" onclick="addTgChannel()" style="white-space:nowrap;">إضافة</button>
+          </div>
+
+          <!-- List Container -->
+          <div id="tg-channels-list-container" style="display:flex; flex-direction:column; gap:6px; max-height:400px; overflow-y:auto;">
+            <div style="color:#64748b; font-size:11px; text-align:center; padding:15px;">جاري تحميل قنوات تيليجرام...</div>
+          </div>
+        </div>
+
+        <!-- CARD 2: WHATSAPP SOURCES & JOINED GROUPS -->
+        <div class="card" style="background:#0f172a; border:1px solid #1e293b; border-radius:10px; padding:14px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; border-bottom:1px solid #1e293b; padding-bottom:8px;">
+            <div style="font-size:13px; font-weight:700; color:#22c55e; display:flex; align-items:center; gap:6px;">
+              <span>💬 مجموعات وقنوات واتساب المنضم إليها</span>
+              <span id="wa-sources-count" class="badge" style="background:rgba(34,197,94,0.2); color:#22c55e; font-size:10px;">0</span>
+            </div>
+            <button class="btn btn-secondary btn-sm" onclick="refreshWhatsAppChats()" style="font-size:11px; padding:4px 8px;">
+              🔄 مزامنة المجموعات
+            </button>
+          </div>
+
+          <!-- Add Manual WhatsApp Source Inline Bar -->
+          <div style="display:flex; gap:6px; margin-bottom:12px;">
+            <input type="text" id="add-wa-name-input" class="form-input" placeholder="اسم المصدر/المجموعة" style="font-size:11px; padding:6px 8px; flex:1;">
+            <input type="text" id="add-wa-jid-input" class="form-input" placeholder="معرف JID (اختياري)" style="font-size:11px; padding:6px 8px; flex:1;">
+            <button class="btn btn-primary btn-sm" onclick="addWhatsAppSourceManual()" style="white-space:nowrap;">إضافة</button>
+          </div>
+
+          <!-- WhatsApp Sources List -->
+          <div id="wa-sources-list-container" style="display:flex; flex-direction:column; gap:6px; max-height:400px; overflow-y:auto;">
+            <div style="color:#64748b; font-size:11px; text-align:center; padding:15px;">جاري تحميل مصادر واتساب...</div>
+          </div>
+        </div>
+
       </div>
     </div>
 
@@ -1379,6 +1449,247 @@ export function renderDashboardHtml(initialState?: any): string {
       }
       if (tabId === 'settings') {
         renderTermsCards(currentTerms);
+      }
+      if (tabId === 'sources') {
+        loadSourcesData();
+      }
+    }
+
+    async function loadSourcesData() {
+      try {
+        const res = await fetch('/api/dashboard/sources');
+        const data = await res.json();
+        if (data.success) {
+          renderTgChannels(data.telegramChannels || []);
+          renderWaSources(data.whatsappSources || [], data.whatsappReachableChats || []);
+        } else {
+          showToast(data.error || 'فشل جلب المصادر', true);
+        }
+      } catch (e) {
+        console.error('loadSourcesData error:', e);
+      }
+    }
+
+    function renderTgChannels(channels) {
+      const list = document.getElementById('tg-channels-list-container');
+      const countBadge = document.getElementById('tg-channels-count');
+      if (countBadge) countBadge.textContent = channels.length;
+      if (!list) return;
+
+      if (!channels || channels.length === 0) {
+        list.innerHTML = '<div style="color: #64748b; font-size: 11px; text-align: center; padding: 15px;">لا توجد قنوات تيليجرام مضافة حالياً</div>';
+        return;
+      }
+
+      list.innerHTML = channels.map(function(ch) {
+        return '<div style="display:flex; justify-content:space-between; align-items:center; background:#1e293b; border:1px solid #334155; border-radius:6px; padding:8px 12px;">' +
+          '<div style="display:flex; align-items:center; gap:8px;">' +
+            '<span style="font-size:14px;">✈️</span>' +
+            '<div>' +
+              '<div style="font-size:12px; font-weight:700; color:#e2e8f0;">@' + ch + '</div>' +
+              '<div style="font-size:10px; color:#94a3b8;">قناة تيليجرام جلب تلقائي</div>' +
+            '</div>' +
+          '</div>' +
+          '<div style="display:flex; gap:4px;">' +
+            '<button class="btn btn-secondary btn-sm" onclick="editTgChannel(\'' + ch + '\')" style="padding:2px 8px; font-size:10px;">✏️ تعديل</button>' +
+            '<button class="btn btn-danger btn-sm" onclick="deleteTgChannel(\'' + ch + '\')" style="padding:2px 8px; font-size:10px;">🗑️ حذف</button>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+    }
+
+    async function addTgChannel() {
+      const input = document.getElementById('add-tg-input');
+      if (!input || !input.value.trim()) {
+        showToast('يرجى أدخال اسم القناة أولاً', true);
+        return;
+      }
+      try {
+        const res = await fetch('/api/dashboard/sources/telegram/add', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ channel: input.value.trim() })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast(data.message);
+          input.value = '';
+          renderTgChannels(data.channels);
+        } else {
+          showToast(data.error || 'فشل إضافة القناة', true);
+        }
+      } catch (e) {
+        showToast('خطأ بالاتصال أثناء إضافة القناة', true);
+      }
+    }
+
+    async function editTgChannel(oldChannel) {
+      const newChannel = prompt('تعديل معرف القناة (@' + oldChannel + '):', oldChannel);
+      if (!newChannel || !newChannel.trim() || newChannel.trim() === oldChannel) return;
+
+      try {
+        const res = await fetch('/api/dashboard/sources/telegram/edit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ oldChannel, newChannel: newChannel.trim() })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast(data.message);
+          renderTgChannels(data.channels);
+        } else {
+          showToast(data.error || 'فشل تعديل القناة', true);
+        }
+      } catch (e) {
+        showToast('خطأ بالاتصال أثناء تعديل القناة', true);
+      }
+    }
+
+    async function deleteTgChannel(channel) {
+      if (!confirm('هل تريد حذف القناة @' + channel + ' من قائمة المراقبة؟')) return;
+
+      try {
+        const res = await fetch('/api/dashboard/sources/telegram/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ channel })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast(data.message);
+          renderTgChannels(data.channels);
+        } else {
+          showToast(data.error || 'فشل حذف القناة', true);
+        }
+      } catch (e) {
+        showToast('خطأ بالاتصال أثناء حذف القناة', true);
+      }
+    }
+
+    function renderWaSources(sources, reachableChats) {
+      const list = document.getElementById('wa-sources-list-container');
+      const countBadge = document.getElementById('wa-sources-count');
+      
+      const mergedMap = new Map();
+      (sources || []).forEach(s => mergedMap.set(s.jid, s));
+      (reachableChats || []).forEach(c => {
+        if (!mergedMap.has(c.id)) {
+          mergedMap.set(c.id, { jid: c.id, name: c.name, enabled: true, type: c.type });
+        }
+      });
+
+      const allItems = Array.from(mergedMap.values());
+      if (countBadge) countBadge.textContent = allItems.length;
+      if (!list) return;
+
+      if (allItems.length === 0) {
+        list.innerHTML = '<div style="color: #64748b; font-size: 11px; text-align: center; padding: 15px;">لا توجد مجموعات أو مصادر واتساب. اضغط على "مزامنة المجموعات" للبحث عن المجموعات المنضم إليها الحساب.</div>';
+        return;
+      }
+
+      list.innerHTML = allItems.map(function(item) {
+        var isEnabled = item.enabled !== false;
+        var icon = item.type === 'channel' ? '📢' : item.type === 'group' ? '👥' : '💬';
+        return '<div style="display:flex; justify-content:space-between; align-items:center; background:#1e293b; border:1px solid #334155; border-radius:6px; padding:8px 12px; gap:8px;">' +
+          '<div style="display:flex; align-items:center; gap:8px; flex:1; min-width:0;">' +
+            '<span style="font-size:16px;">' + icon + '</span>' +
+            '<div style="min-width:0; flex:1;">' +
+              '<div style="font-size:12px; font-weight:700; color:#e2e8f0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">' + (item.name || item.jid) + '</div>' +
+              '<div style="font-size:10px; color:#94a3b8; font-family:monospace;">' + item.jid + '</div>' +
+            '</div>' +
+          '</div>' +
+          '<div style="display:flex; align-items:center; gap:8px;">' +
+            '<label class="switch" style="transform:scale(0.85);" title="' + (isEnabled ? 'تعطيل الاستخراج' : 'تفعيل الاستخراج') + '">' +
+              '<input type="checkbox" onchange="toggleWhatsAppSource(\'' + item.jid + '\', this.checked)" ' + (isEnabled ? 'checked' : '') + '>' +
+              '<span class="slider"></span>' +
+            '</label>' +
+            '<button class="btn btn-danger btn-sm" onclick="deleteWhatsAppSource(\'' + item.jid + '\')" style="padding:2px 6px; font-size:10px;" title="حذف المصدر">🗑️</button>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+    }
+
+    async function refreshWhatsAppChats() {
+      showToast('جاري مزامنة كافة المجموعات والقنوات من حساب واتساب...');
+      try {
+        const res = await fetch('/api/dashboard/sources/whatsapp/refresh', { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+          showToast(data.message);
+          renderWaSources(data.whatsappSources, data.chats);
+        } else {
+          showToast(data.error || 'فشل المزامنة. تأكد من إتصال حساب واتساب أولاً', true);
+        }
+      } catch (e) {
+        showToast('خطأ بالاتصال أثناء المزامنة', true);
+      }
+    }
+
+    async function toggleWhatsAppSource(jid, enabled) {
+      try {
+        const res = await fetch('/api/dashboard/sources/whatsapp/toggle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jid, enabled })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast(enabled ? 'تم تفعيل مصدر الواتساب' : 'تم تعطيل مصدر الواتساب');
+        } else {
+          showToast(data.error || 'فشل تفعيل/تعطيل المصدر', true);
+        }
+      } catch (e) {
+        showToast('خطأ بالاتصال أثناء التعديل', true);
+      }
+    }
+
+    async function addWhatsAppSourceManual() {
+      const nameInput = document.getElementById('add-wa-name-input');
+      const jidInput = document.getElementById('add-wa-jid-input');
+      if (!nameInput || !nameInput.value.trim()) {
+        showToast('يرجى كتابة اسم المصدر/المجموعة', true);
+        return;
+      }
+      const name = nameInput.value.trim();
+      const jid = (jidInput && jidInput.value && jidInput.value.trim()) ? jidInput.value.trim() : ('manual_' + Date.now() + '@g.us');
+
+      try {
+        const res = await fetch('/api/dashboard/sources/whatsapp/add', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jid, name })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast(data.message);
+          nameInput.value = '';
+          if (jidInput) jidInput.value = '';
+          renderWaSources(data.whatsappSources, []);
+        } else {
+          showToast(data.error || 'فشل إضافة المصدر', true);
+        }
+      } catch (e) {
+        showToast('خطأ بالاتصال أثناء إضافة المصدر', true);
+      }
+    }
+
+    async function deleteWhatsAppSource(jid) {
+      if (!confirm('هل تريد حذف هذا المصدر من القائمة؟')) return;
+      try {
+        const res = await fetch('/api/dashboard/sources/whatsapp/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jid })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast(data.message);
+          renderWaSources(data.whatsappSources, []);
+        } else {
+          showToast(data.error || 'فشل حذف المصدر', true);
+        }
+      } catch (e) {
+        showToast('خطأ بالاتصال أثناء حذف المصدر', true);
       }
     }
 
