@@ -688,30 +688,91 @@ export function renderDashboardHtml(initialState?: any): string {
       <div class="section-card">
         <div class="section-header">
           <div class="section-title">
-            <span>📱 حساب تيليجرام (Telegram Session)</span>
+            <span>📱 تسجيل دخول وربط حساب تيليجرام (Telegram Client)</span>
           </div>
           <span class="status-badge" id="acc-tg-badge">
             ${tgConnected ? '🟢 متصل' : '⚠️ غير متصل'}
           </span>
         </div>
 
-        <div class="form-group">
-          <label class="form-label">قناة النشر التلقائي (@channel):</label>
-          <input type="text" id="tg-post-channel-input" class="form-input" value="${initialState?.accounts?.telegram?.channel || 'lydollar'}">
+        <div style="font-size:12px; color:#94a3b8; margin-bottom:12px;">
+          قم بربط حسابك عبر رقم الهاتف وتأكيد الرمز وكلمة المرور الثنائية (2FA) لتوليد الجلسة وحفظها تلقائياً.
         </div>
 
-        <div class="form-group">
-          <label class="form-label">جلسة تيليجرام (Session String):</label>
-          <input type="password" id="tg-session-input" class="form-input" placeholder="ألصق كود الجلسة المشفرة هنا...">
-          <div style="font-size: 10px; color: #64748b; margin-top: 3px;">الجلسة تحفظ وتزامن تلقائياً في السحابة</div>
+        <!-- Configuration Inputs -->
+        <div style="display:grid; grid-template-columns: repeat(2, 1fr); gap:8px; margin-bottom:8px;">
+          <div class="form-group" style="margin-bottom:4px;">
+            <label class="form-label">App api_id:</label>
+            <input type="text" id="tg-api-id" class="form-input font-num" value="37876956">
+          </div>
+          <div class="form-group" style="margin-bottom:4px;">
+            <label class="form-label">App api_hash:</label>
+            <input type="text" id="tg-api-hash" class="form-input font-num" value="0e9d1601dd10c87ca3b3b6886cb53cb2">
+          </div>
         </div>
 
-        <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:8px;">
-          <button class="btn btn-primary btn-sm" onclick="saveTelegramSettings()">
-            💾 حفظ والاتصال
+        <!-- STEP 1: Phone Number -->
+        <div id="tg-login-step-1" style="background:#0f172a; padding:10px; border-radius:8px; border:1px solid #334155; margin-bottom:10px;">
+          <div style="font-size:12px; font-weight:700; color:#38bdf8; margin-bottom:6px;">الخطوة 1: أدخل رقم الهاتف</div>
+          <div class="form-group">
+            <label class="form-label">رقم الهاتف الدولي (مع رمز الدولة، مثال: 21891XXXXXXX+):</label>
+            <input type="tel" id="tg-phone-input" class="form-input font-num" placeholder="+21891XXXXXXX أو +21892XXXXXXX">
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="sendTelegramCode()" id="btn-send-code" style="width:100%;">
+            📩 إرسال كود التحقق (Send Code)
           </button>
+        </div>
+
+        <!-- STEP 2: Code Verification (Initially Hidden) -->
+        <div id="tg-login-step-2" class="hidden" style="background:#0f172a; padding:10px; border-radius:8px; border:1px solid #38bdf8; margin-bottom:10px;">
+          <div style="font-size:12px; font-weight:700; color:#38bdf8; margin-bottom:6px;">الخطوة 2: كود التحقق المستلم (OTP)</div>
+          <div style="font-size:11px; color:#cbd5e1; margin-bottom:6px;">تم إرسال الكود إلى تطبيق تيليجرام الخاص بك. أدخله هنا:</div>
+          <div class="form-group">
+            <input type="text" id="tg-otp-input" class="form-input font-num" placeholder="12345" style="letter-spacing:4px; font-size:16px; text-align:center;">
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="verifyTelegramCode()" id="btn-verify-code" style="width:100%;">
+            ✅ تأكيد الكود
+          </button>
+        </div>
+
+        <!-- STEP 3: 2FA Password (Initially Hidden) -->
+        <div id="tg-login-step-3" class="hidden" style="background:#0f172a; padding:10px; border-radius:8px; border:1px solid #f59e0b; margin-bottom:10px;">
+          <div style="font-size:12px; font-weight:700; color:#f59e0b; margin-bottom:4px;">الخطوة 3: كلمة المرور الثنائية (2FA Password)</div>
+          <div style="font-size:11px; color:#cbd5e1; margin-bottom:6px;">حسابك محمي بالتحقق بخطوتين. أدخل كلمة المرور لإتمام الربط وحفظ الجلسة:</div>
+          <div class="form-group">
+            <input type="password" id="tg-2fa-input" class="form-input" placeholder="كلمة المرور الثنائية الخاصة بحسابك...">
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="verifyTelegram2FA()" id="btn-verify-2fa" style="width:100%; background:#f59e0b; border-color:#d97706;">
+            🔓 تأكيد كلمة المرور وحفظ الجلسة الدائمة
+          </button>
+        </div>
+
+        <!-- Advanced or Direct Session String -->
+        <details style="margin-top:10px; font-size:12px; color:#94a3b8; background:#0f172a; border-radius:8px; padding:8px; border:1px solid #334155;">
+          <summary style="cursor:pointer; font-weight:600; color:#cbd5e1;">خيارات متقدمة (قناة النشر / كود جلسة جاهز / Bot Token)</summary>
+          <div style="margin-top:8px;">
+            <div class="form-group">
+              <label class="form-label">قناة النشر التلقائي (@channel):</label>
+              <input type="text" id="tg-post-channel-input" class="form-input" value="${initialState?.accounts?.telegram?.channel || 'lydollar'}">
+            </div>
+            <div class="form-group">
+              <label class="form-label">جلسة جاهزة (Session String):</label>
+              <input type="password" id="tg-session-input" class="form-input" placeholder="ألصق كود الجلسة المشفرة مباشرة هنا إذا كان متوفراً لديك...">
+            </div>
+            <div class="form-group">
+              <label class="form-label">أو توكن بوت تيليجرام (Bot Token):</label>
+              <input type="password" id="tg-bot-token-input" class="form-input font-num" placeholder="123456789:ABCdef...">
+            </div>
+            <button class="btn btn-secondary btn-sm" onclick="saveTelegramSettings()" style="width:100%;">
+              💾 حفظ الإعدادات المتقدمة
+            </button>
+          </div>
+        </details>
+
+        <!-- Quick Action Buttons -->
+        <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:10px;">
           <button class="btn btn-secondary btn-sm" onclick="reconnectTelegram()">
-            🔄 إعادة الاتصال
+            🔄 فحص وإعادة الاتصال
           </button>
           <button class="btn btn-danger btn-sm" onclick="disconnectTelegram()">
             ❌ قطع الاتصال
@@ -1124,6 +1185,114 @@ export function renderDashboardHtml(initialState?: any): string {
           \`;
         }
         if (lFeed && lHtml) lFeed.innerHTML = lHtml;
+      }
+    }
+
+    // Interactive Telegram Authentication
+    async function sendTelegramCode() {
+      const phone = document.getElementById('tg-phone-input')?.value.trim();
+      const apiId = document.getElementById('tg-api-id')?.value.trim() || '37876956';
+      const apiHash = document.getElementById('tg-api-hash')?.value.trim() || '0e9d1601dd10c87ca3b3b6886cb53cb2';
+
+      if (!phone) {
+        showToast('يرجى إدخال رقم الهاتف مع رمز الدولة (مثال: +21891XXXXXXX)', true);
+        return;
+      }
+
+      const btn = document.getElementById('btn-send-code');
+      if (btn) btn.disabled = true;
+      showToast('جاري إرسال كود التحقق من سيرفرات تيليجرام...');
+
+      try {
+        const res = await fetch('/api/dashboard/accounts/telegram/send-code', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phoneNumber: phone, apiId, apiHash })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast(data.message);
+          document.getElementById('tg-login-step-2')?.classList.remove('hidden');
+          document.getElementById('tg-otp-input')?.focus();
+        } else {
+          showToast('فشل إرسال الكود: ' + data.error, true);
+        }
+      } catch (err) {
+        showToast('خطأ بالاتصال: ' + err.message, true);
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    }
+
+    async function verifyTelegramCode() {
+      const code = document.getElementById('tg-otp-input')?.value.trim();
+      if (!code) {
+        showToast('أدخل كود التحقق أولاً', true);
+        return;
+      }
+
+      const btn = document.getElementById('btn-verify-code');
+      if (btn) btn.disabled = true;
+      showToast('جاري التحقق من الكود وتوليد الجلسة...');
+
+      try {
+        const res = await fetch('/api/dashboard/accounts/telegram/verify-code', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phoneCode: code })
+        });
+        const data = await res.json();
+        if (data.success) {
+          if (data.requires2FA) {
+            showToast(data.message, false);
+            document.getElementById('tg-login-step-3')?.classList.remove('hidden');
+            document.getElementById('tg-2fa-input')?.focus();
+          } else {
+            showToast(data.message);
+            document.getElementById('tg-login-step-2')?.classList.add('hidden');
+            document.getElementById('tg-login-step-3')?.classList.add('hidden');
+            fetchDashboardData();
+          }
+        } else {
+          showToast('فشل التحقق: ' + data.error, true);
+        }
+      } catch (err) {
+        showToast('خطأ: ' + err.message, true);
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    }
+
+    async function verifyTelegram2FA() {
+      const password = document.getElementById('tg-2fa-input')?.value.trim();
+      if (!password) {
+        showToast('يرجى إدخال كلمة المرور الثنائية (2FA)', true);
+        return;
+      }
+
+      const btn = document.getElementById('btn-verify-2fa');
+      if (btn) btn.disabled = true;
+      showToast('جاري التحقق من كلمة المرور الثنائية وحفظ الجلسة...');
+
+      try {
+        const res = await fetch('/api/dashboard/accounts/telegram/verify-2fa', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast(data.message);
+          document.getElementById('tg-login-step-2')?.classList.add('hidden');
+          document.getElementById('tg-login-step-3')?.classList.add('hidden');
+          fetchDashboardData();
+        } else {
+          showToast('خطأ: ' + data.error, true);
+        }
+      } catch (err) {
+        showToast('خطأ: ' + err.message, true);
+      } finally {
+        if (btn) btn.disabled = false;
       }
     }
 

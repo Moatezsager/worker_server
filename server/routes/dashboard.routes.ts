@@ -332,6 +332,14 @@ dashboardRouter.get("/api/dashboard/accounts", (req: Request, res: Response) => 
   });
 });
 
+import { 
+  sendTelegramLoginCode, 
+  verifyTelegramLoginCode, 
+  verifyTelegram2FAPassword,
+  DEFAULT_TELEGRAM_API_ID,
+  DEFAULT_TELEGRAM_API_HASH
+} from "../services/telegramAuth.service";
+
 // Save Telegram Session or Token
 dashboardRouter.post("/api/dashboard/accounts/telegram/save", async (req: Request, res: Response) => {
   const { sessionString, botToken, postChannel } = req.body || {};
@@ -364,6 +372,68 @@ dashboardRouter.post("/api/dashboard/accounts/telegram/save", async (req: Reques
       message: `تم حفظ الإعدادات (جاري الاتصال: ${err?.message || err})`,
       connected: false
     });
+  }
+});
+
+// Interactive Telegram Login Step 1: Send OTP Code
+dashboardRouter.post("/api/dashboard/accounts/telegram/send-code", async (req: Request, res: Response) => {
+  const { phoneNumber, apiId, apiHash } = req.body || {};
+
+  if (!phoneNumber) {
+    return res.status(400).json({ success: false, error: "رقم الهاتف مطلوب" });
+  }
+
+  try {
+    const result = await sendTelegramLoginCode({
+      phoneNumber,
+      apiId: apiId ? Number(apiId) : DEFAULT_TELEGRAM_API_ID,
+      apiHash: apiHash || DEFAULT_TELEGRAM_API_HASH
+    });
+
+    return res.json({
+      success: true,
+      message: result.isCodeViaApp 
+        ? "تم إرسال كود التحقق إلى تطبيق تيليجرام الخاص بك" 
+        : "تم إرسال كود التحقق عبر رسالة SMS",
+      phoneCodeHash: result.phoneCodeHash
+    });
+  } catch (err: any) {
+    addLog("error", "تسجيل دخول تيليجرام", `فشل إرسال كود التحقق: ${err?.message || err}`);
+    return res.status(500).json({ success: false, error: err?.message || String(err) });
+  }
+});
+
+// Interactive Telegram Login Step 2: Verify Code
+dashboardRouter.post("/api/dashboard/accounts/telegram/verify-code", async (req: Request, res: Response) => {
+  const { phoneCode } = req.body || {};
+
+  if (!phoneCode) {
+    return res.status(400).json({ success: false, error: "كود التحقق مطلوب" });
+  }
+
+  try {
+    const result = await verifyTelegramLoginCode(phoneCode);
+    return res.json(result);
+  } catch (err: any) {
+    addLog("error", "تسجيل دخول تيليجرام", `فشل التحقق من الكود: ${err?.message || err}`);
+    return res.status(500).json({ success: false, error: err?.message || String(err) });
+  }
+});
+
+// Interactive Telegram Login Step 3: Verify 2FA Password
+dashboardRouter.post("/api/dashboard/accounts/telegram/verify-2fa", async (req: Request, res: Response) => {
+  const { password } = req.body || {};
+
+  if (!password) {
+    return res.status(400).json({ success: false, error: "كلمة المرور الثنائية مطلوبة" });
+  }
+
+  try {
+    const result = await verifyTelegram2FAPassword(password);
+    return res.json(result);
+  } catch (err: any) {
+    addLog("error", "تسجيل دخول تيليجرام", `فشل التحقق من كلمة المرور الثنائية: ${err?.message || err}`);
+    return res.status(500).json({ success: false, error: err?.message || String(err) });
   }
 });
 
