@@ -50,6 +50,11 @@ export interface AppConfig {
   facebookAccessToken?: string;
   facebookAutoPost?: boolean;
   whatsappAuth?: Record<string, string>;
+  minBroadcastIntervalMinutes?: number;
+  minPriceChangeThreshold?: number;
+  aggregationWindowSeconds?: number;
+  smartConsolidatedPost?: boolean;
+  hourlyPostLimit?: number;
   apiConfig?: {
     enabled: boolean;
     rateLimitWindowMs: number;

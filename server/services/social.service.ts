@@ -202,16 +202,17 @@ function filterEligibleUpdates(
       const diffFromLastBroadcast = Math.abs(u.newVal - lastPrice);
       const effectiveDiff = Math.max(diffFromOld, diffFromLastBroadcast);
 
-      // ── شرط 1: حجم التغيير كبير بمفرده ──────────────────────────────────
+      // ── شرط 1: حجم التغيير كبير بما يكفي بمفرده ──────────────────────────────────
       let isLargeChange = false;
+      const minThreshold = appConfig.minPriceChangeThreshold ?? MIN_PRICE_CHANGE;
       if (isPreciousMetal(u.id)) {
-        // للمعادن: نسبة مئوية (0.5%) لأن سعرها في المئات أو الآلاف
+        // للمعادن: نسبة مئوية (0.5%) أو فارق مطلق 1 د.ل
         const baseVal = lastPrice > 0 ? lastPrice : (u.oldVal > 0 ? u.oldVal : 1);
         const pct = effectiveDiff / baseVal;
-        isLargeChange = pct >= MIN_PRICE_CHANGE_PCT_PRECIOUS;
+        isLargeChange = pct >= MIN_PRICE_CHANGE_PCT_PRECIOUS || effectiveDiff >= 1.0;
       } else {
-        // للعملات العادية: فارق مطلق (0.02 د.ل)
-        isLargeChange = effectiveDiff >= MIN_PRICE_CHANGE;
+        // للعملات العادية: فارق مطلق من الإعدادات
+        isLargeChange = effectiveDiff >= minThreshold;
       }
 
       if (isLargeChange) {
@@ -245,17 +246,18 @@ function filterEligibleUpdates(
 function canBroadcastNow(): boolean {
   const now = Date.now();
   const oneHourAgo = now - 60 * 60 * 1000;
+  const limit = appConfig.hourlyPostLimit ?? BROADCAST_HOURLY_LIMIT;
 
   // إزالة الطوابع الأقدم من ساعة
   while (recentBroadcastTimestamps.length > 0 && recentBroadcastTimestamps[0] < oneHourAgo) {
     recentBroadcastTimestamps.shift();
   }
 
-  if (recentBroadcastTimestamps.length >= BROADCAST_HOURLY_LIMIT) {
+  if (recentBroadcastTimestamps.length >= limit) {
     const oldestMs = recentBroadcastTimestamps[0];
     const resetInMin = Math.ceil((oldestMs + 60 * 60 * 1000 - now) / 60000);
     console.log(
-      `[SmartBroadcast] 🚫 Hourly limit reached (${recentBroadcastTimestamps.length}/${BROADCAST_HOURLY_LIMIT}). Next slot in ~${resetInMin}m`
+      `[SmartBroadcast] 🚫 Hourly limit reached (${recentBroadcastTimestamps.length}/${limit}). Next slot in ~${resetInMin}m`
     );
     return false;
   }
@@ -1000,15 +1002,154 @@ export function sanitizeBroadcastUpdates(
   return result;
 }
 
+// ─── Smart Broadcast Queue State & Interface ─────────────────────────────────
+export interface QueuedRateUpdate {
+  id: string;
+  name: string;
+  oldVal: number;
+  newVal: number;
+  flag: string;
+  firstSeenAt: number;
+  lastSeenAt: number;
+  updateCount: number;
+}
+
+export let smartBroadcastQueue: Map<string, QueuedRateUpdate> = new Map();
+export let smartBroadcastAggregationTimer: NodeJS.Timeout | null = null;
+export let smartBroadcastWatchdogInterval: NodeJS.Timeout | null = null;
+
+export function getBroadcastQueueStatus() {
+  const now = Date.now();
+  const minIntervalMs = Math.max(1, appConfig.minBroadcastIntervalMinutes ?? 20) * 60 * 1000;
+  const timeSinceLast = lastSocialBroadcastTime ? (now - lastSocialBroadcastTime) : 999999999;
+  const isCooldownActive = timeSinceLast < minIntervalMs;
+  const cooldownRemainingMs = isCooldownActive ? (minIntervalMs - timeSinceLast) : 0;
+
+  const items = Array.from(smartBroadcastQueue.values()).map(item => ({
+    id: item.id,
+    name: item.name,
+    oldVal: item.oldVal,
+    newVal: item.newVal,
+    diff: Number((item.newVal - item.oldVal).toFixed(3)),
+    flag: item.flag,
+    ageSeconds: Math.floor((now - item.firstSeenAt) / 1000),
+    updateCount: item.updateCount
+  }));
+
+  return {
+    queueSize: smartBroadcastQueue.size,
+    items,
+    lastSocialBroadcastTime,
+    isCooldownActive,
+    cooldownRemainingMs,
+    cooldownRemainingMinutes: Math.ceil(cooldownRemainingMs / 60000),
+    minIntervalMinutes: appConfig.minBroadcastIntervalMinutes ?? 20,
+    minPriceChangeThreshold: appConfig.minPriceChangeThreshold ?? 0.015,
+    aggregationWindowSeconds: appConfig.aggregationWindowSeconds ?? 45,
+    hourlyPostLimit: appConfig.hourlyPostLimit ?? 4,
+    recentPostsThisHour: recentBroadcastTimestamps.filter(t => t > now - 3600000).length
+  };
+}
+
+export function clearBroadcastQueue(): number {
+  if (smartBroadcastAggregationTimer) {
+    clearTimeout(smartBroadcastAggregationTimer);
+    smartBroadcastAggregationTimer = null;
+  }
+  const count = smartBroadcastQueue.size;
+  smartBroadcastQueue.clear();
+  return count;
+}
+
+export async function flushBroadcastQueueImmediately(target?: 'all' | 'telegram' | 'facebook', isManual = true) {
+  if (smartBroadcastAggregationTimer) {
+    clearTimeout(smartBroadcastAggregationTimer);
+    smartBroadcastAggregationTimer = null;
+  }
+  const updates = Array.from(smartBroadcastQueue.values()).map(item => ({
+    id: item.id,
+    name: item.name,
+    oldVal: item.oldVal,
+    newVal: item.newVal,
+    flag: item.flag
+  }));
+  smartBroadcastQueue.clear();
+
+  if (updates.length === 0) {
+    return { success: true, count: 0, message: "طابور التحديثات فارغ حالياً." };
+  }
+
+  const resolvedTarget = target || ((appConfig.telegramAutoPost && appConfig.facebookAutoPost) ? 'all' : appConfig.telegramAutoPost ? 'telegram' : 'facebook');
+  await executeBroadcast(updates, false, resolvedTarget, true, isManual);
+  return { success: true, count: updates.length, message: `تم تفريغ الطابور ونشر ${updates.length} عملة بنجاح!` };
+}
+
+export async function processSmartBroadcastQueue(): Promise<boolean> {
+  if (smartBroadcastQueue.size === 0) return false;
+  if (!appConfig.telegramAutoPost && !appConfig.facebookAutoPost) return false;
+
+  const now = Date.now();
+  const minIntervalMs = Math.max(1, appConfig.minBroadcastIntervalMinutes ?? 20) * 60 * 1000;
+  const timeSinceLast = lastSocialBroadcastTime ? (now - lastSocialBroadcastTime) : 999999999;
+
+  if (timeSinceLast < minIntervalMs) {
+    const remainingMin = Math.ceil((minIntervalMs - timeSinceLast) / 60000);
+    console.log(`[SmartBroadcastQueue] ⏳ Cooldown active (${Math.floor(timeSinceLast/60000)}m elapsed / ${appConfig.minBroadcastIntervalMinutes ?? 20}m required). Retaining ${smartBroadcastQueue.size} items in queue (next slot in ~${remainingMin}m).`);
+    return false;
+  }
+
+  if (!canBroadcastNow()) {
+    console.log(`[SmartBroadcastQueue] 🚫 Hourly post cap reached. Retaining ${smartBroadcastQueue.size} items in queue.`);
+    return false;
+  }
+
+  const rawQueuedItems = Array.from(smartBroadcastQueue.values()).map(item => ({
+    id: item.id,
+    name: item.name,
+    oldVal: item.oldVal,
+    newVal: item.newVal,
+    flag: item.flag
+  }));
+
+  const eligibleUpdates = filterEligibleUpdates(rawQueuedItems);
+
+  if (eligibleUpdates.length === 0) {
+    console.log(`[SmartBroadcastQueue] ⏭ None of the ${rawQueuedItems.length} queued items reached threshold. Retaining buffer.`);
+    return false;
+  }
+
+  let toBroadcast = eligibleUpdates;
+  if (appConfig.smartConsolidatedPost !== false) {
+    toBroadcast = rawQueuedItems;
+  }
+
+  console.log(`[SmartBroadcastQueue] 🚀 Cooldown clear! Dispatching consolidated bulletin for ${toBroadcast.length} currencies...`);
+  smartBroadcastQueue.clear();
+
+  const resolvedTarget: 'all' | 'telegram' | 'facebook' =
+    (appConfig.telegramAutoPost && appConfig.facebookAutoPost) ? 'all'
+    : appConfig.telegramAutoPost ? 'telegram'
+    : 'facebook';
+
+  await executeBroadcast(toBroadcast, false, resolvedTarget, true, false);
+  return true;
+}
+
+// Queue watchdog timer running every 30 seconds
+if (!smartBroadcastWatchdogInterval) {
+  smartBroadcastWatchdogInterval = setInterval(() => {
+    if (smartBroadcastQueue.size > 0 && !smartBroadcastAggregationTimer) {
+      processSmartBroadcastQueue().catch(e => console.error("[SmartBroadcastQueue] Watchdog cycle error:", e));
+    }
+  }, 30000);
+}
+
 export async function broadcastRateChanges(
   updates: {id?: string, name: string, oldVal: number, newVal: number, flag: string}[], 
   isTest: boolean = false, 
   target: 'all' | 'telegram' | 'facebook' = 'all',
   isManual: boolean = false
 ) {
-  // NOTE: sanitizeBroadcastUpdates is intentionally NOT called here.
-  // executeBroadcast() (the single final dispatch point) handles sanitization
-  // to avoid double-processing regardless of the call path (direct / pending queue / retry engine).
   if (!isTest && !isManual && !appConfig.telegramAutoPost && !appConfig.facebookAutoPost) {
     return;
   }
@@ -1016,58 +1157,51 @@ export async function broadcastRateChanges(
     return;
   }
 
-  // إذا كان التحديث يدوياً من المشرف (لوحة التحكم / مستخرج النصوص) أو وضع اختبار:
-  // يتم استثناء كل الشروط (بدون انتظار، بدون مؤقت تجميع 60 ثانية، وبدون فلاتر الفوارق أو حد الساعة)
   if (isTest || isManual) {
-    console.log(`[SocialBroadcast] ⚡ Executing IMMEDIATE broadcast for ${updates.length} items (isManual=${isManual}, bypassing all restrictions)`);
+    console.log(`[SmartBroadcast] ⚡ Executing IMMEDIATE broadcast for ${updates.length} items (isManual=${isManual}, bypassing cooldowns)`);
     await executeBroadcast(updates, isTest, target, true, isManual);
     return;
   }
 
-  // If live broadcast from scraper, use Smart Debounce Buffer (25s) to aggregate rapid updates and prevent spam/flooding
+  const now = Date.now();
   for (const u of updates) {
-    const key = u.id || u.name;
-    const existing = broadcastQueue.get(key);
+    const key = (u.id || u.name).toUpperCase();
+    const existing = smartBroadcastQueue.get(key);
     if (existing) {
-      // Keep initial oldVal to track cumulative shift
-      broadcastQueue.set(key, { ...u, oldVal: existing.oldVal });
+      smartBroadcastQueue.set(key, {
+        ...existing,
+        name: u.name || existing.name,
+        newVal: u.newVal,
+        flag: u.flag || existing.flag,
+        lastSeenAt: now,
+        updateCount: existing.updateCount + 1
+      });
     } else {
-      broadcastQueue.set(key, { ...u });
+      smartBroadcastQueue.set(key, {
+        id: u.id || key,
+        name: u.name,
+        oldVal: u.oldVal,
+        newVal: u.newVal,
+        flag: u.flag,
+        firstSeenAt: now,
+        lastSeenAt: now,
+        updateCount: 1
+      });
     }
   }
 
-  // Throttle timer: Do not reset if already running to guarantee timely dispatch (25s max wait)
-  if (!broadcastQueueTimer) {
-    broadcastQueueTimer = setTimeout(() => {
-      broadcastQueueTimer = null;
-      const batchedUpdates = Array.from(broadcastQueue.values());
-      broadcastQueue.clear();
-      if (batchedUpdates.length > 0) {
-        // ✅ FIX: derive the merged target from ALL pending updates, not just the current call's `target`
-        // This prevents a race where two calls with different targets cause one to be lost
-        const resolvedTarget: 'all' | 'telegram' | 'facebook' =
-          (appConfig.telegramAutoPost && appConfig.facebookAutoPost) ? 'all'
-          : appConfig.telegramAutoPost ? 'telegram'
-          : 'facebook';
-        executeBroadcast(batchedUpdates, false, resolvedTarget).catch(e => console.error("[Smart Queue] Broadcast error:", e));
-      }
-    }, 25000); // 25-second aggregation buffer
+  console.log(`[SmartBroadcastQueue] 📥 Buffered ${updates.length} items. Current queue size: ${smartBroadcastQueue.size} items.`);
+
+  const aggWindowMs = Math.max(10, appConfig.aggregationWindowSeconds ?? 45) * 1000;
+  if (!smartBroadcastAggregationTimer) {
+    smartBroadcastAggregationTimer = setTimeout(() => {
+      smartBroadcastAggregationTimer = null;
+      processSmartBroadcastQueue().catch(e => console.error("[SmartBroadcastQueue] Queue processing error:", e));
+    }, aggWindowMs);
   }
 }
 
 // ─── ترتيب مخصص لعرض العملات في نص الرسالة المنشورة ───────────────────────
-/**
- * الترتيب الثابت والمخصص لعرض العملات في نص الرسالة المنشورة:
- * 1. الدولار الأمريكي (كاش) - USD العادي
- * 2. الدولار الأمريكي (صكوك)
- * 3. اليورو
- * 4. الجنيه الإسترليني
- * 5. الدينار التونسي
- * 6. الجنيه المصري
- * 7. الدينار الأردني
- * 8. الحوالات مجمّعة مع بعض بالترتيب: حوالات تركيا، حوالات دبي، حوالات الصين
- * أي عملات أخرى تضاف في النهاية بترتيبها الأصلي دون حذف.
- */
 const BROADCAST_DISPLAY_ORDER: string[] = [
   'USD',          // 1. الدولار الأمريكي (كاش)
   'USD_CHECKS',   // 2. الدولار الأمريكي (صكوك)
@@ -1081,14 +1215,10 @@ const BROADCAST_DISPLAY_ORDER: string[] = [
   'USD_CN',       // حوالات الصين
 ];
 
-/**
- * تحديد رتبة العنصر لعرضه في الرسالة فقط دون المساس بقرارات النشر أو الفلترة
- */
 function getBroadcastDisplayRank(u: { id?: string; name?: string }): number {
   const id = (u.id || '').toUpperCase();
   const name = u.name || '';
 
-  // 1. الدولار الأمريكي (كاش)
   if (
     id === 'USD' || 
     (name.includes('دولار') && !name.includes('صك') && !name.includes('شيك') && !name.includes('رسمي') && !name.includes('حوال') && !id.includes('OFFICIAL') && !id.includes('TR') && !id.includes('AE') && !id.includes('CN'))
@@ -1096,7 +1226,6 @@ function getBroadcastDisplayRank(u: { id?: string; name?: string }): number {
     return 10;
   }
 
-  // 2. الدولار الأمريكي (صكوك) - توحيد الصكوك على رتبة 20 فقط
   if (
     id === 'USD_CHECKS' ||
     id === 'USD_SUKUK' ||
@@ -1107,117 +1236,37 @@ function getBroadcastDisplayRank(u: { id?: string; name?: string }): number {
     return 20;
   }
 
-  // 3. اليورو
-  if (id === 'EUR' || name.includes('يورو')) {
-    return 30;
-  }
+  if (id === 'EUR' || name.includes('يورو')) return 30;
+  if (id === 'GBP' || name.includes('إسترليني') || name.includes('استرليني') || name.includes('باوند')) return 40;
+  if (id === 'TND' || name.includes('تونسي')) return 50;
+  if (id === 'EGP' || name.includes('مصري')) return 60;
+  if (id === 'JOD' || name.includes('أردني') || name.includes('اردني')) return 70;
 
-  // 4. الجنيه الإسترليني
-  if (id === 'GBP' || name.includes('إسترليني') || name.includes('استرليني') || name.includes('باوند')) {
-    return 40;
-  }
+  if (id === 'USD_TR' || (name.includes('حوال') && (name.includes('تركيا') || name.includes('تركي')))) return 81;
+  if (id === 'USD_AE' || (name.includes('حوال') && (name.includes('دبي') || name.includes('امارات') || name.includes('إمارات')))) return 82;
+  if (id === 'USD_CN' || (name.includes('حوال') && (name.includes('صين') || name.includes('الصين')))) return 83;
 
-  // 5. الدينار التونسي
-  if (id === 'TND' || name.includes('تونسي')) {
-    return 50;
-  }
+  if (id === 'GOLD_CAST_18') return 901;
+  if (id === 'GOLD_EXT_18') return 902;
+  if (id === 'GOLD_EXT_21') return 903;
+  if (id === 'GOLD_SCRAP_18') return 904;
+  if (id === 'GOLD_SCRAP_21') return 905;
+  if (id === 'GOLD_CAST_24') return 906;
+  if (id === 'GOLD_LIRA_8G') return 907;
+  if (id === 'GOLD_LIRA_14G') return 908;
+  if (id === 'GOLD_MUJARA_14G') return 909;
+  if (id === 'SILVER_CAST_1000' || id.startsWith('SILVER')) return 910;
 
-  // 6. الجنيه المصري
-  if (id === 'EGP' || name.includes('مصري')) {
-    return 60;
-  }
-
-  // 7. الدينار الأردني
-  if (id === 'JOD' || name.includes('أردني') || name.includes('اردني')) {
-    return 70;
-  }
-
-  // 8. الحوالات مجمّعة مع بعض بالترتيب:
-  // 8.1 حوالات تركيا
-  if (id === 'USD_TR' || (name.includes('حوال') && (name.includes('تركيا') || name.includes('تركي')))) {
-    return 81;
-  }
-  // 8.2 حوالات دبي
-  if (id === 'USD_AE' || (name.includes('حوال') && (name.includes('دبي') || name.includes('امارات') || name.includes('إمارات')))) {
-    return 82;
-  }
-  // 8.3 حوالات الصين
-  if (id === 'USD_CN' || (name.includes('حوال') && (name.includes('صين') || name.includes('الصين')))) {
-    return 83;
-  }
-
-  // 9. المعادن والذهب بالترتيب المطلوب بدقة:
-  if (id === 'GOLD_CAST_18') return 901; // ذهب مسبوك 18
-  if (id === 'GOLD_EXT_18') return 902;  // ذهب خارجي 18
-  if (id === 'GOLD_EXT_21') return 903;  // ذهب خارجي 21
-  if (id === 'GOLD_SCRAP_18') return 904; // ذهب كسر 18
-  if (id === 'GOLD_SCRAP_21') return 905; // ذهب كسر 21
-  if (id === 'GOLD_CAST_24') return 906;  // ذهب مسبوك 24
-  if (id === 'GOLD_LIRA_8G') return 907;  // ليرة ذهب 8 جرام
-  if (id === 'GOLD_LIRA_14G') return 908; // ليرة ذهب 14 جرام
-  if (id === 'GOLD_MUJARA_14G') return 909; // مجارة ذهب 14
-  if (id === 'SILVER_CAST_1000' || id.startsWith('SILVER')) return 910; // مسبوك فضة
-
-  // أي عملة أخرى تأتي في النهاية
   return 9999;
 }
 
-export async function executeBroadcast(
-  updates: {id?: string, name: string, oldVal: number, newVal: number, flag: string}[], 
-  isTest: boolean = false, 
-  target: 'all' | 'telegram' | 'facebook' = 'all',
-  skipFilters: boolean = false,
-  isManual: boolean = false
-) {
-  // ← BUG FIX: sanitizeBroadcastUpdates was called here AND in broadcastRateChanges(),
-  //   causing double-processing on every automated scraper broadcast.
-  //   It is only needed here for direct callers (pendingWatchdog, retryEngine, manual routes)
-  //   that bypass broadcastRateChanges(). Safe to keep here as the single source of truth.
-  updates = sanitizeBroadcastUpdates(updates);
-
-  // 🛡️ Ultimate Deduplication: Guarantee absolutely no duplicate currencies in the same broadcast.
-  const uniqueUpdatesMap = new Map<string, typeof updates[0]>();
-  for (const u of updates) {
-    const key = u.id || u.name;
-    const existing = uniqueUpdatesMap.get(key);
-    if (existing) {
-      uniqueUpdatesMap.set(key, { ...u, oldVal: existing.oldVal }); // Keep the oldest oldVal
-    } else {
-      uniqueUpdatesMap.set(key, { ...u });
-    }
-  }
-  updates = Array.from(uniqueUpdatesMap.values());
-
-  if (updates.length === 0) return;
-
-  // ─── Smart Broadcast Filters (للوضع الحي التلقائي فقط، يتم استثناؤها تماماً في التحديث اليدوي والاختبار) ─────
-  if (!isTest && !skipFilters && !isManual) {
-    // الشرط 1 + 2: فلترة العملات غير المؤهلة (تغيير صغير أو وقت مبكر)
-    const eligible = filterEligibleUpdates(updates);
-    if (eligible.length === 0) {
-      console.log('[SmartBroadcast] ⏭ All updates filtered out. No broadcast needed.');
-      return;
-    }
-    // الشرط 3: حد الساعة المنشورات/ساعة
-    // ← BUG FIX: Check if pending queue is NOT empty. If there are pending items, 
-    // we must queue this new update too to maintain order and avoid bypassing the queue
-    // which could result in double-posting concurrently.
-    if (pendingBroadcastQueue.length > 0 || !canBroadcastNow()) {
-      addToPendingQueue(eligible, target);
-      return;
-    }
-    // استبدال قائمة التحديثات بالمؤهلة فقط (مرتبة بالأولوية)
-    updates = eligible;
-  }
-  // ───────────────────────────────────────────────────────────────────────────
-
+export function formatSmartBroadcastMessage(updates: { id?: string; name: string; oldVal: number; newVal: number; flag: string }[]): string {
   const now = new Date();
-
   const dateStr = now.toLocaleDateString('ar-LY', { timeZone: 'Africa/Tripoli' });
   const timeStr = now.toLocaleTimeString('ar-LY', { timeZone: 'Africa/Tripoli', hour: '2-digit', minute: '2-digit' });
 
   const dayNames = ["الأحد", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"];
-  let dayName = "الخميس";
+  let dayName = "اليوم";
   try {
     const dayIndex = new Date(now.toLocaleString('en-US', { timeZone: 'Africa/Tripoli' })).getDay();
     dayName = dayNames[dayIndex];
@@ -1230,48 +1279,125 @@ export async function executeBroadcast(
     'gold': '✨', 'silver': '🪙'
   };
 
-  let message = `📊 *مؤشر الدينار | تحديث السوق الموازي*\n`;
-  message += `━━━━━━━━━━━━━━━━━━━\n`;
-  message += `📅 ${dayName}، ${dateStr} | ⏰ ${timeStr}\n\n`;
+  const sorted = [...updates].sort((a, b) => getBroadcastDisplayRank(a) - getBroadcastDisplayRank(b));
 
-  // ترتيب مخصص لعرض العملات في نص الرسالة فقط دون التأثير على معالجة التحديثات الأخرى
-  const displayUpdates = [...updates].sort((a, b) => getBroadcastDisplayRank(a) - getBroadcastDisplayRank(b));
+  const cashAndCurrencies: typeof sorted = [];
+  const remittances: typeof sorted = [];
+  const metals: typeof sorted = [];
+  const others: typeof sorted = [];
 
-  for (const u of displayUpdates) {
+  for (const u of sorted) {
+    const id = (u.id || '').toUpperCase();
+    const rank = getBroadcastDisplayRank(u);
+    if (rank >= 80 && rank <= 89) {
+      remittances.push(u);
+    } else if ((rank >= 900 && rank <= 950) || id.startsWith('GOLD') || id.startsWith('SILVER')) {
+      metals.push(u);
+    } else if (rank < 80) {
+      cashAndCurrencies.push(u);
+    } else {
+      others.push(u);
+    }
+  }
+
+  const formatItemLine = (u: typeof sorted[0]) => {
     const isUp = u.newVal > u.oldVal;
     const isDown = u.newVal < u.oldVal;
     const diff = Math.abs(u.newVal - u.oldVal);
+
     let fe = flagMap[u.flag] || '💰';
     if (u.id === 'USD') fe = '💵';
     if (u.id === 'USD_CHECKS') fe = '🏦';
     if (u.id?.startsWith('GOLD')) fe = '✨';
     if (u.id?.startsWith('SILVER')) fe = '🪙';
-    
+
     let displayName = u.name;
     if (u.id === 'USD' && !displayName.includes('كاش')) {
       displayName = 'دولار أمريكي (كاش)';
     } else if (u.id === 'USD_CHECKS' && !displayName.includes('صكوك')) {
-      displayName = 'دولار أمريكي (صكوك مصرفية)';
+      displayName = 'دولار أمريكي (صكوك)';
     }
 
-    let changeText = '➖ استقرار';
-    if (isUp) changeText = `🔺 ارتفاع بمقدار ${diff.toFixed(3)}`;
-    if (isDown) changeText = `🔻 انخفاض بمقدار ${diff.toFixed(3)}`;
+    const isMetal = u.id?.startsWith('GOLD') || u.id?.startsWith('SILVER');
+    const decimals = isMetal ? 2 : 3;
 
-    message += `${fe} *${displayName}*\n`;
-    message += `💵 السعر: *${u.newVal.toFixed(3)} د.ل*\n`;
-    if (isUp || isDown) {
-      message += `📊 التغير: ${changeText} (كان ${u.oldVal.toFixed(3)})\n\n`;
-    } else {
-      message += `📊 التغير: ${changeText}\n\n`;
-    }
+    let changeText = '🟢 استقرار';
+    if (isUp) changeText = `🔺 +${diff.toFixed(decimals)} (كان ${u.oldVal.toFixed(decimals)})`;
+    if (isDown) changeText = `🔻 -${diff.toFixed(decimals)} (كان ${u.oldVal.toFixed(decimals)})`;
+
+    return `${fe} *${displayName}*: *${u.newVal.toFixed(decimals)} د.ل* | ${changeText}`;
+  };
+
+  let message = `📊 *مؤشر الدينار | النشرة الموحدة لأسعار السوق الموازي*\n`;
+  message += `━━━━━━━━━━━━━━━━━━━\n`;
+  message += `📅 ${dayName}، ${dateStr} | ⏰ ${timeStr}\n\n`;
+
+  if (cashAndCurrencies.length > 0) {
+    message += `💵 *العملات النقدية (كاش وصكوك):*\n`;
+    message += cashAndCurrencies.map(formatItemLine).join('\n') + `\n\n`;
+  }
+
+  if (remittances.length > 0) {
+    message += `✈️ *أسعار الحوالات المالية الخارجية:*\n`;
+    message += remittances.map(formatItemLine).join('\n') + `\n\n`;
+  }
+
+  if (metals.length > 0) {
+    message += `✨ *سوق الذهب والفضة (مسبوك وكسر):*\n`;
+    message += metals.map(formatItemLine).join('\n') + `\n\n`;
+  }
+
+  if (others.length > 0) {
+    message += `🌐 *أسعار وعملات أخرى:*\n`;
+    message += others.map(formatItemLine).join('\n') + `\n\n`;
   }
 
   message += `━━━━━━━━━━━━━━━━━━━\n`;
-  message += `🔗 *المتابعة الحية والرسوم البيانية:*\n`;
+  message += `📈 *الرسوم البيانية والمتابعة الحية لحظة بلحظة:*\n`;
   const broadcastRandomNum = Math.floor(100000 + Math.random() * 900000);
   message += `🌐 https://dollar-price-qp14.onrender.com/?r=${broadcastRandomNum}\n`;
-  message += `📱 *المصدر:* شبكة مؤشر الدينار`;
+  message += `📱 *المصدر:* شبكة مؤشر الدينار | طرابلس`;
+
+  return message;
+}
+
+export async function executeBroadcast(
+  updates: {id?: string, name: string, oldVal: number, newVal: number, flag: string}[], 
+  isTest: boolean = false, 
+  target: 'all' | 'telegram' | 'facebook' = 'all',
+  skipFilters: boolean = false,
+  isManual: boolean = false
+) {
+  updates = sanitizeBroadcastUpdates(updates);
+
+  const uniqueUpdatesMap = new Map<string, typeof updates[0]>();
+  for (const u of updates) {
+    const key = u.id || u.name;
+    const existing = uniqueUpdatesMap.get(key);
+    if (existing) {
+      uniqueUpdatesMap.set(key, { ...u, oldVal: existing.oldVal });
+    } else {
+      uniqueUpdatesMap.set(key, { ...u });
+    }
+  }
+  updates = Array.from(uniqueUpdatesMap.values());
+
+  if (updates.length === 0) return;
+
+  if (!isTest && !skipFilters && !isManual) {
+    const eligible = filterEligibleUpdates(updates);
+    if (eligible.length === 0) {
+      console.log('[SmartBroadcast] ⏭ All updates filtered out. No broadcast needed.');
+      return;
+    }
+    if (pendingBroadcastQueue.length > 0 || !canBroadcastNow()) {
+      addToPendingQueue(eligible, target);
+      return;
+    }
+    updates = eligible;
+  }
+
+  const message = formatSmartBroadcastMessage(updates);
 
   const startTime = Date.now();
   const platform = target === 'all' ? 'both' : target;
@@ -1314,9 +1440,7 @@ export async function executeBroadcast(
   } else {
     broadcastToSocialMedia(message, isTest, target, isManual)
       .then(() => {
-        // تسجيل وقت النشر في متتبعات الحد الأقصى (بعد الإرسال الناجح)
         recordBroadcast(updates);
-        // Outcome 1: succeeds on the first try
         try {
           addBroadcastLog({
             platform,
@@ -1333,11 +1457,9 @@ export async function executeBroadcast(
       })
       .catch(e => {
         console.error("[Background Broadcast] Error:", e);
-        // إضافة المهام لقائمة إعادة المحاولة
         scheduleRetry(message, target, updates, 1, startTime, e.message || String(e));
       });
   }
-
 
   // SEND PUSH NOTIFICATION
   if (!isTest) {

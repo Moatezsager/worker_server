@@ -11,6 +11,11 @@ export let appConfig: AppConfig = {
   telegramTemplateStyle: "classic",
   enableHttpScraper: true,
   enableUserTracking: true,
+  minBroadcastIntervalMinutes: 20,
+  minPriceChangeThreshold: 0.015,
+  aggregationWindowSeconds: 45,
+  smartConsolidatedPost: true,
+  hourlyPostLimit: 4,
   apiConfig: {
     enabled: true,
     rateLimitWindowMs: 60000,
@@ -140,6 +145,21 @@ export function applyLoadedConfig(loadedConfig: AppConfig, source: string) {
   }
   if (!loadedConfig.telegramTemplateStyle) {
     loadedConfig.telegramTemplateStyle = "classic";
+  }
+  if (loadedConfig.minBroadcastIntervalMinutes === undefined || isNaN(loadedConfig.minBroadcastIntervalMinutes)) {
+    loadedConfig.minBroadcastIntervalMinutes = 20;
+  }
+  if (loadedConfig.minPriceChangeThreshold === undefined || isNaN(loadedConfig.minPriceChangeThreshold)) {
+    loadedConfig.minPriceChangeThreshold = 0.015;
+  }
+  if (loadedConfig.aggregationWindowSeconds === undefined || isNaN(loadedConfig.aggregationWindowSeconds)) {
+    loadedConfig.aggregationWindowSeconds = 45;
+  }
+  if (loadedConfig.smartConsolidatedPost === undefined) {
+    loadedConfig.smartConsolidatedPost = true;
+  }
+  if (loadedConfig.hourlyPostLimit === undefined || isNaN(loadedConfig.hourlyPostLimit)) {
+    loadedConfig.hourlyPostLimit = 4;
   }
   if (!loadedConfig.apiConfig) {
     loadedConfig.apiConfig = {

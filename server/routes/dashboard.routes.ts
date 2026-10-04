@@ -13,7 +13,12 @@ import {
 import { cleanupOldData, saveToSupabase } from "../services/db.service";
 import { cleanupUserLogs, monitorMemory } from "../services/maintenance.service";
 import { extractRatesWithAI } from "../services/ai.service";
-import { broadcastToSocialMedia } from "../services/social.service";
+import { 
+  broadcastToSocialMedia, 
+  getBroadcastQueueStatus, 
+  flushBroadcastQueueImmediately, 
+  clearBroadcastQueue 
+} from "../services/social.service";
 import { activeClient, initializeTelegram } from "../../telegramClient";
 import { whatsappManager } from "../services/whatsapp.service";
 import { addLog, getRecentLogs, clearLogs } from "../utils/logger";
@@ -86,6 +91,16 @@ dashboardRouter.get(["/", "/dashboard", "/admin"], (req: Request, res: Response)
       telegramAutoPost: !!appConfig.telegramAutoPost,
       facebookAutoPost: !!appConfig.facebookAutoPost
     },
+    broadcastConfig: {
+      minBroadcastIntervalMinutes: appConfig.minBroadcastIntervalMinutes ?? 20,
+      minPriceChangeThreshold: appConfig.minPriceChangeThreshold ?? 0.015,
+      aggregationWindowSeconds: appConfig.aggregationWindowSeconds ?? 45,
+      smartConsolidatedPost: appConfig.smartConsolidatedPost ?? true,
+      hourlyPostLimit: appConfig.hourlyPostLimit ?? 4,
+      telegramAutoPost: !!appConfig.telegramAutoPost,
+      facebookAutoPost: !!appConfig.facebookAutoPost
+    },
+    broadcastQueue: getBroadcastQueueStatus(),
     terms: appConfig.terms,
     ingestedMessages: getRecentIngestedRecords(30)
   };
@@ -141,6 +156,16 @@ dashboardRouter.get("/api/dashboard/stats", (req: Request, res: Response) => {
       telegramAutoPost: !!appConfig.telegramAutoPost,
       facebookAutoPost: !!appConfig.facebookAutoPost
     },
+    broadcastConfig: {
+      minBroadcastIntervalMinutes: appConfig.minBroadcastIntervalMinutes ?? 20,
+      minPriceChangeThreshold: appConfig.minPriceChangeThreshold ?? 0.015,
+      aggregationWindowSeconds: appConfig.aggregationWindowSeconds ?? 45,
+      smartConsolidatedPost: appConfig.smartConsolidatedPost ?? true,
+      hourlyPostLimit: appConfig.hourlyPostLimit ?? 4,
+      telegramAutoPost: !!appConfig.telegramAutoPost,
+      facebookAutoPost: !!appConfig.facebookAutoPost
+    },
+    broadcastQueue: getBroadcastQueueStatus(),
     terms: appConfig.terms,
     ingestedMessages: getRecentIngestedRecords(30)
   });
@@ -304,6 +329,83 @@ dashboardRouter.post("/api/dashboard/broadcast-custom", async (req: Request, res
     addLog("error", "البث والنشر", `فشل إرسال المنشور: ${err?.message || err}`);
     return res.status(500).json({ success: false, error: err?.message || String(err) });
   }
+});
+
+// ─── 5b. Smart Broadcast Queue Telemetry & Management ───
+dashboardRouter.get("/api/dashboard/broadcast/queue", (req: Request, res: Response) => {
+  res.json({
+    success: true,
+    queue: getBroadcastQueueStatus()
+  });
+});
+
+dashboardRouter.post("/api/dashboard/broadcast/queue/flush", async (req: Request, res: Response) => {
+  const { target = "all" } = req.body || {};
+  addLog("info", "البث والنشر", "طلب المشرف تفريغ طابور التحديثات ونشره فوراً");
+  try {
+    const result = await flushBroadcastQueueImmediately(target as any, true);
+    return res.json(result);
+  } catch (err: any) {
+    addLog("error", "البث والنشر", `فشل تفريغ طابور التحديثات: ${err?.message || err}`);
+    return res.status(500).json({ success: false, error: err?.message || String(err) });
+  }
+});
+
+dashboardRouter.post("/api/dashboard/broadcast/queue/clear", (req: Request, res: Response) => {
+  const clearedCount = clearBroadcastQueue();
+  addLog("info", "البث والنشر", `تم مسح ${clearedCount} عنصر من طابور التحديثات`);
+  res.json({ success: true, count: clearedCount, message: `تم مسح ${clearedCount} عنصر من الطابور` });
+});
+
+dashboardRouter.post("/api/dashboard/broadcast/settings/save", async (req: Request, res: Response) => {
+  const { 
+    minBroadcastIntervalMinutes, 
+    minPriceChangeThreshold, 
+    aggregationWindowSeconds, 
+    hourlyPostLimit,
+    smartConsolidatedPost,
+    telegramAutoPost,
+    facebookAutoPost
+  } = req.body || {};
+
+  if (minBroadcastIntervalMinutes !== undefined && !isNaN(Number(minBroadcastIntervalMinutes))) {
+    appConfig.minBroadcastIntervalMinutes = Math.max(1, Number(minBroadcastIntervalMinutes));
+  }
+  if (minPriceChangeThreshold !== undefined && !isNaN(Number(minPriceChangeThreshold))) {
+    appConfig.minPriceChangeThreshold = Math.max(0.001, Number(minPriceChangeThreshold));
+  }
+  if (aggregationWindowSeconds !== undefined && !isNaN(Number(aggregationWindowSeconds))) {
+    appConfig.aggregationWindowSeconds = Math.max(10, Number(aggregationWindowSeconds));
+  }
+  if (hourlyPostLimit !== undefined && !isNaN(Number(hourlyPostLimit))) {
+    appConfig.hourlyPostLimit = Math.max(1, Number(hourlyPostLimit));
+  }
+  if (smartConsolidatedPost !== undefined) {
+    appConfig.smartConsolidatedPost = Boolean(smartConsolidatedPost);
+  }
+  if (telegramAutoPost !== undefined) {
+    appConfig.telegramAutoPost = Boolean(telegramAutoPost);
+  }
+  if (facebookAutoPost !== undefined) {
+    appConfig.facebookAutoPost = Boolean(facebookAutoPost);
+  }
+
+  addLog("info", "إعدادات النشر", `تم تحديث شروط النشر التلقائي: فاصل ${appConfig.minBroadcastIntervalMinutes}د | فارق ${appConfig.minPriceChangeThreshold}د.ل | تجميع ${appConfig.aggregationWindowSeconds}ث`);
+  await saveConfigToSupabase(appConfig);
+
+  res.json({
+    success: true,
+    message: "تم حفظ إعدادات وشروط النشر التلقائي بنجاح",
+    config: {
+      minBroadcastIntervalMinutes: appConfig.minBroadcastIntervalMinutes,
+      minPriceChangeThreshold: appConfig.minPriceChangeThreshold,
+      aggregationWindowSeconds: appConfig.aggregationWindowSeconds,
+      hourlyPostLimit: appConfig.hourlyPostLimit,
+      smartConsolidatedPost: appConfig.smartConsolidatedPost,
+      telegramAutoPost: appConfig.telegramAutoPost,
+      facebookAutoPost: appConfig.facebookAutoPost
+    }
+  });
 });
 
 // ─── 6. Clear In-Memory Live Logs ───

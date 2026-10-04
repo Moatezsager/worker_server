@@ -1061,11 +1061,74 @@ export function renderDashboardHtml(initialState?: any): string {
       </div>
     </div>
 
-    <!-- TAB 5: BROADCAST STUDIO -->
+    <!-- TAB 5: BROADCAST STUDIO & SMART QUEUE -->
     <div id="tab-content-broadcast" class="hidden">
+      
+      <!-- SMART QUEUE & ANTI-SPAM CONTROL CARD -->
+      <div class="section-card" style="margin-bottom:12px; background:#1e293b; border:1px solid #334155;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; flex-wrap:wrap; gap:6px;">
+          <div>
+            <div style="font-size:14px; font-weight:700; color:#38bdf8;">📥 طابور التحديثات المجمعة وشروط منع الإزعاج</div>
+            <div style="font-size:11px; color:#94a3b8;">تجميع التحديثات السريعة ودمجها في منشور موحد لمنع تكرار الإشعارات المزعجة للمتابعين</div>
+          </div>
+          <div style="display:flex; gap:6px; align-items:center;">
+            <span id="queue-status-badge" class="status-badge" style="background:rgba(56,189,248,0.15); color:#38bdf8; font-size:11px; font-weight:700;">
+              جاري الفحص...
+            </span>
+            <button class="btn btn-primary btn-sm" onclick="flushBroadcastQueue()">🚀 نشر الطابور فوراً</button>
+            <button class="btn btn-secondary btn-sm" onclick="clearBroadcastQueueClient()">🗑️ مسح</button>
+          </div>
+        </div>
+
+        <!-- QUEUE ITEMS DISPLAY -->
+        <div id="queue-items-container" style="background:#0f172a; border:1px solid #334155; border-radius:8px; padding:10px; margin-bottom:12px; min-height:50px;">
+          <div style="color:#64748b; font-size:12px; text-align:center;">طابور التحديثات فارغ حالياً (لا توجد عملات بانتظار النشر)</div>
+        </div>
+
+        <!-- SETTINGS FORM -->
+        <div style="border-top:1px solid #334155; padding-top:10px; margin-top:10px;">
+          <div style="font-size:12px; font-weight:700; color:#cbd5e1; margin-bottom:8px;">⚙️ إعدادات شروط وفواصل النشر التلقائي:</div>
+          
+          <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:10px; margin-bottom:10px;">
+            <div class="form-group" style="margin-bottom:0;">
+              <label class="form-label" style="font-size:11px;">الفاصل الزمني الأدنى بين المنشورات (بالدقائق):</label>
+              <input type="number" id="setting-broadcast-interval" class="form-input font-num" min="1" max="180" placeholder="20">
+              <div style="font-size:10px; color:#64748b; margin-top:2px;">الحد الأدنى للانتظار بين منشورين متتاليين للقناة</div>
+            </div>
+
+            <div class="form-group" style="margin-bottom:0;">
+              <label class="form-label" style="font-size:11px;">فارق التغير الأدنى للعملات (د.ل):</label>
+              <input type="number" id="setting-price-threshold" class="form-input font-num" step="0.005" min="0.001" placeholder="0.015">
+              <div style="font-size:10px; color:#64748b; margin-top:2px;">استبعاد تغيرات القرش الهامشية لحين تراكم الفارق</div>
+            </div>
+
+            <div class="form-group" style="margin-bottom:0;">
+              <label class="form-label" style="font-size:11px;">نافذة تجميع التحديثات في الطابور (بالثواني):</label>
+              <input type="number" id="setting-agg-window" class="form-input font-num" min="10" max="300" placeholder="45">
+              <div style="font-size:10px; color:#64748b; margin-top:2px;">زمن انتظار وصول باقي العملات قبل دمجها</div>
+            </div>
+
+            <div class="form-group" style="margin-bottom:0;">
+              <label class="form-label" style="font-size:11px;">الحد الأقصى للمنشورات في الساعة:</label>
+              <input type="number" id="setting-hourly-cap" class="form-input font-num" min="1" max="20" placeholder="4">
+              <div style="font-size:10px; color:#64748b; margin-top:2px;">سقف المنشورات التلقائية لكل ساعة حماية للقناة</div>
+            </div>
+          </div>
+
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+            <label style="font-size:12px; color:#38bdf8; display:flex; align-items:center; gap:6px; cursor:pointer;">
+              <input type="checkbox" id="setting-smart-consolidated" checked>
+              <span>تفعيل الدمج التلقائي الذكي في منشور موحد وأنيق</span>
+            </label>
+
+            <button class="btn btn-primary btn-sm" onclick="saveBroadcastSettings()">💾 حفظ شروط وإعدادات النشر</button>
+          </div>
+        </div>
+      </div>
+
       <div class="section-card">
         <div style="font-size: 13px; font-weight: 700; color: #38bdf8; margin-bottom: 8px;">
-          📢 إرسال ونشر رسالة في القنوات
+          📢 إرسال ونشر رسالة مخصصة
         </div>
         
         <div style="display: flex; gap: 6px; margin-bottom: 8px;">
@@ -1435,6 +1498,25 @@ export function renderDashboardHtml(initialState?: any): string {
           '</div>';
         }
         if (lFeed && lHtml) lFeed.innerHTML = lHtml;
+      }
+
+      // Populate Broadcast Queue and Settings
+      if (data.broadcastConfig) {
+        const intervalEl = document.getElementById('setting-broadcast-interval');
+        const threshEl = document.getElementById('setting-price-threshold');
+        const aggEl = document.getElementById('setting-agg-window');
+        const capEl = document.getElementById('setting-hourly-cap');
+        const checkEl = document.getElementById('setting-smart-consolidated');
+
+        if (intervalEl) intervalEl.value = data.broadcastConfig.minBroadcastIntervalMinutes || 20;
+        if (threshEl) threshEl.value = data.broadcastConfig.minPriceChangeThreshold || 0.015;
+        if (aggEl) aggEl.value = data.broadcastConfig.aggregationWindowSeconds || 45;
+        if (capEl) capEl.value = data.broadcastConfig.hourlyPostLimit || 4;
+        if (checkEl) checkEl.checked = Boolean(data.broadcastConfig.smartConsolidatedPost !== false);
+      }
+
+      if (data.broadcastQueue) {
+        renderQueueUI(data.broadcastQueue);
       }
     }
 
@@ -1810,6 +1892,124 @@ export function renderDashboardHtml(initialState?: any): string {
         }
       } catch (err) {
         showToast('خطأ: ' + err.message, true);
+      }
+    }
+
+    function renderQueueUI(q) {
+      const badge = document.getElementById('queue-status-badge');
+      const container = document.getElementById('queue-items-container');
+
+      if (badge) {
+        if (q.isCooldownActive) {
+          badge.style.background = 'rgba(245, 158, 11, 0.15)';
+          badge.style.color = '#fbbf24';
+          badge.textContent = '⏳ فترة انتظار (' + q.cooldownRemainingMinutes + ' دقيقة متبقية)';
+        } else if (q.queueSize > 0) {
+          badge.style.background = 'rgba(16, 185, 129, 0.15)';
+          badge.style.color = '#34d399';
+          badge.textContent = '🟢 جاهز للنشر (' + q.queueSize + ' عملة بالانتظار)';
+        } else {
+          badge.style.background = 'rgba(56, 189, 248, 0.15)';
+          badge.style.color = '#38bdf8';
+          badge.textContent = '🟢 خامل (0 بالانتظار)';
+        }
+      }
+
+      if (container) {
+        if (!q.items || q.items.length === 0) {
+          container.innerHTML = '<div style="color:#64748b; font-size:12px; text-align:center;">طابور التحديثات فارغ حالياً (لا توجد عملات بانتظار النشر)</div>';
+        } else {
+          let html = '<div style="display:flex; flex-wrap:wrap; gap:8px;">';
+          for (const item of q.items) {
+            const isUp = item.diff > 0;
+            const isDown = item.diff < 0;
+            const color = isUp ? '#34d399' : isDown ? '#f87171' : '#cbd5e1';
+            const sign = isUp ? '+' : '';
+            html += '<div style="background:#1e293b; border:1px solid #334155; border-radius:6px; padding:6px 10px; font-size:11px; display:flex; align-items:center; gap:6px;">' +
+              '<span style="font-weight:700; color:#f1f5f9;">' + item.name + '</span>' +
+              '<span class="font-num" style="color:#cbd5e1;">' + Number(item.newVal).toFixed(2) + '</span>' +
+              '<span class="font-num" style="color:' + color + '; font-weight:700;">(' + sign + item.diff + ')</span>' +
+              '<span style="color:#64748b; font-size:10px;">(' + item.ageSeconds + 'ث)</span>' +
+            '</div>';
+          }
+          html += '</div>';
+          container.innerHTML = html;
+        }
+      }
+    }
+
+    async function fetchBroadcastQueue() {
+      try {
+        const res = await fetch('/api/dashboard/broadcast/queue');
+        const data = await res.json();
+        if (data.success && data.queue) {
+          renderQueueUI(data.queue);
+        }
+      } catch (err) {}
+    }
+
+    async function flushBroadcastQueue() {
+      showToast('جاري تفريغ الطابور والنشر الموحد في القنوات...');
+      try {
+        const res = await fetch('/api/dashboard/broadcast/queue/flush', { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+          showToast(data.message || 'تم نشر الطابور بنجاح');
+          fetchDashboardData();
+        } else {
+          showToast('فشل النشر: ' + (data.error || 'خطأ'), true);
+        }
+      } catch (err) {
+        showToast('خطأ بالاتصال: ' + err.message, true);
+      }
+    }
+
+    async function clearBroadcastQueueClient() {
+      if (!confirm('هل أنت متأكد من مسح جميع العملات المنتظرة في الطابور دون نشرها؟')) return;
+      showToast('جاري مسح الطابور...');
+      try {
+        const res = await fetch('/api/dashboard/broadcast/queue/clear', { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+          showToast(data.message || 'تم مسح الطابور');
+          fetchDashboardData();
+        } else {
+          showToast('فشل المسح: ' + data.error, true);
+        }
+      } catch (err) {
+        showToast('خطأ بالاتصال: ' + err.message, true);
+      }
+    }
+
+    async function saveBroadcastSettings() {
+      const minBroadcastIntervalMinutes = parseInt(document.getElementById('setting-broadcast-interval')?.value || '20');
+      const minPriceChangeThreshold = parseFloat(document.getElementById('setting-price-threshold')?.value || '0.015');
+      const aggregationWindowSeconds = parseInt(document.getElementById('setting-agg-window')?.value || '45');
+      const hourlyPostLimit = parseInt(document.getElementById('setting-hourly-cap')?.value || '4');
+      const smartConsolidatedPost = Boolean(document.getElementById('setting-smart-consolidated')?.checked);
+
+      showToast('جاري حفظ شروط وإعدادات النشر التلقائي...');
+      try {
+        const res = await fetch('/api/dashboard/broadcast/settings/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            minBroadcastIntervalMinutes,
+            minPriceChangeThreshold,
+            aggregationWindowSeconds,
+            hourlyPostLimit,
+            smartConsolidatedPost
+          })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast(data.message || 'تم حفظ الإعدادات بنجاح');
+          fetchDashboardData();
+        } else {
+          showToast('فشل الحفظ: ' + data.error, true);
+        }
+      } catch (err) {
+        showToast('خطأ بالاتصال: ' + err.message, true);
       }
     }
 
