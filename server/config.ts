@@ -74,6 +74,20 @@ export function updateAppConfig(newConfig: Partial<AppConfig>) {
   if (!appConfig.telegramBotToken && preservedTelegramBotToken) appConfig.telegramBotToken = preservedTelegramBotToken;
   if (!appConfig.facebookAccessToken && preservedFbToken) appConfig.facebookAccessToken = preservedFbToken;
   if (!appConfig.whatsappAuth && preservedWhatsappAuth) appConfig.whatsappAuth = preservedWhatsappAuth;
+
+  // Sync to process.env if not set by environment
+  if (appConfig.telegramSessionString && !process.env.TELEGRAM_SESSION) {
+    process.env.TELEGRAM_SESSION = appConfig.telegramSessionString;
+  }
+  if (appConfig.telegramApiId && !process.env.TELEGRAM_API_ID) {
+    process.env.TELEGRAM_API_ID = String(appConfig.telegramApiId);
+  }
+  if (appConfig.telegramApiHash && !process.env.TELEGRAM_API_HASH) {
+    process.env.TELEGRAM_API_HASH = appConfig.telegramApiHash;
+  }
+  if (appConfig.telegramBotToken && !process.env.TELEGRAM_BOT_TOKEN) {
+    process.env.TELEGRAM_BOT_TOKEN = appConfig.telegramBotToken;
+  }
 }
 
 export let telegramManager: TelegramManager | null = null;
@@ -140,6 +154,32 @@ export function applyLoadedConfig(loadedConfig: AppConfig, source: string) {
   console.log(`[Config] Config loaded & applied successfully from ${source}`);
 }
 
+export function syncTermsToDatabase(terms: AppConfig['terms']) {
+  try {
+    const stmt = db.prepare(`
+      INSERT INTO currency_terms (id, name, regex, min, max, is_inverse, flag, is_active, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+      ON CONFLICT(id) DO UPDATE SET
+        name = excluded.name,
+        regex = excluded.regex,
+        min = excluded.min,
+        max = excluded.max,
+        is_inverse = excluded.is_inverse,
+        flag = excluded.flag,
+        is_active = excluded.is_active,
+        updated_at = CURRENT_TIMESTAMP
+    `);
+    const tx = db.transaction((items: AppConfig['terms']) => {
+      for (const t of items) {
+        stmt.run(t.id, t.name, t.regex, t.min, t.max, t.isInverse ? 1 : 0, t.flag || 'ly');
+      }
+    });
+    tx(terms);
+  } catch (err) {
+    console.error("[Storage] Failed to sync terms to SQLite currency_terms table:", err);
+  }
+}
+
 export function loadConfigFromStorage() {
   try {
     const stored = db.prepare('SELECT value FROM server_config WHERE key = ?').get('app_config') as any;
@@ -147,6 +187,33 @@ export function loadConfigFromStorage() {
       const parsedConfig = JSON.parse(stored.value) as AppConfig;
       if (parsedConfig && Array.isArray(parsedConfig.terms) && Array.isArray(parsedConfig.channels)) {
         applyLoadedConfig(parsedConfig, "SQLite");
+      }
+    }
+
+    // Check if currency_terms table has records and seed or load
+    const countRow = db.prepare('SELECT count(*) as count FROM currency_terms').get() as any;
+    if (!countRow || countRow.count === 0) {
+      syncTermsToDatabase(appConfig.terms);
+    } else {
+      const rows = db.prepare('SELECT * FROM currency_terms WHERE is_active = 1').all() as any[];
+      if (rows && rows.length > 0) {
+        for (const row of rows) {
+          const idx = appConfig.terms.findIndex(t => t.id === row.id);
+          const termItem = {
+            id: row.id,
+            name: row.name,
+            regex: row.regex,
+            min: Number(row.min),
+            max: Number(row.max),
+            isInverse: Boolean(row.is_inverse),
+            flag: row.flag || 'ly'
+          };
+          if (idx >= 0) {
+            appConfig.terms[idx] = termItem;
+          } else {
+            appConfig.terms.push(termItem);
+          }
+        }
       }
     }
   } catch (e) {
@@ -199,6 +266,34 @@ export async function loadConfigFromSupabase() {
         console.error("[Storage] Failed to sync Supabase config to SQLite:", e);
       }
     }
+
+    // Try loading directly from currency_terms table in Supabase if exists
+    try {
+      const { data: dbTerms } = await supabase.from('currency_terms').select('*');
+      if (dbTerms && Array.isArray(dbTerms) && dbTerms.length > 0) {
+        console.log(`[Config] Syncing ${dbTerms.length} currency terms from Supabase currency_terms table...`);
+        for (const row of dbTerms) {
+          const idx = appConfig.terms.findIndex(t => t.id === row.id);
+          const termObj = {
+            id: row.id,
+            name: row.name,
+            regex: row.regex,
+            min: Number(row.min),
+            max: Number(row.max),
+            isInverse: Boolean(row.is_inverse || row.isInverse),
+            flag: row.flag || 'ly'
+          };
+          if (idx >= 0) {
+            appConfig.terms[idx] = termObj;
+          } else {
+            appConfig.terms.push(termObj);
+          }
+        }
+        syncTermsToDatabase(appConfig.terms);
+      }
+    } catch (termsErr) {
+      // Supabase currency_terms table might not exist yet
+    }
   } catch (err) {
     console.error("Failed to load/repair config from Supabase", err);
   }
@@ -213,6 +308,7 @@ export async function saveConfigToSupabase(newConfig: AppConfig) {
       INSERT INTO server_config (key, value) VALUES ('app_config', ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
     `).run(JSON.stringify(newConfig));
+    syncTermsToDatabase(newConfig.terms);
   } catch (e) {
     console.error("[Storage] Failed to save config to SQLite:", e);
   }
@@ -225,9 +321,26 @@ export async function saveConfigToSupabase(newConfig: AppConfig) {
       
     if (error) {
       console.error("Error saving config to Supabase:", error);
-      return false;
     }
-    return true;
+
+    // Also upsert into currency_terms table in Supabase if it exists
+    try {
+      await supabase.from('currency_terms').upsert(
+        newConfig.terms.map(t => ({
+          id: t.id,
+          name: t.name,
+          regex: t.regex,
+          min: t.min,
+          max: t.max,
+          is_inverse: t.isInverse ? 1 : 0,
+          flag: t.flag
+        }))
+      );
+    } catch (e) {
+      // Ignored if table schema is slightly different or table does not exist
+    }
+
+    return !error;
   } catch (err) {
     console.error("Failed to save config to Supabase", err);
     return false;

@@ -1,6 +1,7 @@
 import { Router, Request, Response } from "express";
 import { rates } from "../state";
-import { appConfig, saveConfigToSupabase } from "../config";
+import { appConfig, saveConfigToSupabase, loadConfigFromSupabase } from "../config";
+import { db } from "../db";
 import { serverStartTime, getAppBuildSignature } from "../utils/version";
 import { getWorkerJobsStatus, runJobSafely } from "../schedulers/tasks.scheduler";
 import { 
@@ -68,6 +69,8 @@ dashboardRouter.get(["/", "/dashboard", "/admin"], (req: Request, res: Response)
         connected: !!(activeClient && activeClient.connected),
         channel: appConfig.telegramPostChannel || 'lydollar',
         hasSession: !!(process.env.TELEGRAM_SESSION || appConfig.telegramSessionString),
+        apiId: process.env.TELEGRAM_API_ID || appConfig.telegramApiId || '',
+        hasApiHash: !!(process.env.TELEGRAM_API_HASH || appConfig.telegramApiHash)
       },
       whatsapp: whatsappManager.getStatus(),
       facebook: {
@@ -83,6 +86,7 @@ dashboardRouter.get(["/", "/dashboard", "/admin"], (req: Request, res: Response)
       telegramAutoPost: !!appConfig.telegramAutoPost,
       facebookAutoPost: !!appConfig.facebookAutoPost
     },
+    terms: appConfig.terms,
     ingestedMessages: getRecentIngestedRecords(30)
   };
 
@@ -120,6 +124,8 @@ dashboardRouter.get("/api/dashboard/stats", (req: Request, res: Response) => {
         connected: !!(activeClient && activeClient.connected),
         channel: appConfig.telegramPostChannel || 'lydollar',
         hasSession: !!(process.env.TELEGRAM_SESSION || appConfig.telegramSessionString),
+        apiId: process.env.TELEGRAM_API_ID || appConfig.telegramApiId || '',
+        hasApiHash: !!(process.env.TELEGRAM_API_HASH || appConfig.telegramApiHash)
       },
       whatsapp: whatsappManager.getStatus(),
       facebook: {
@@ -135,6 +141,7 @@ dashboardRouter.get("/api/dashboard/stats", (req: Request, res: Response) => {
       telegramAutoPost: !!appConfig.telegramAutoPost,
       facebookAutoPost: !!appConfig.facebookAutoPost
     },
+    terms: appConfig.terms,
     ingestedMessages: getRecentIngestedRecords(30)
   });
 });
@@ -335,9 +342,7 @@ dashboardRouter.get("/api/dashboard/accounts", (req: Request, res: Response) => 
 import { 
   sendTelegramLoginCode, 
   verifyTelegramLoginCode, 
-  verifyTelegram2FAPassword,
-  DEFAULT_TELEGRAM_API_ID,
-  DEFAULT_TELEGRAM_API_HASH
+  verifyTelegram2FAPassword
 } from "../services/telegramAuth.service";
 
 // Save Telegram Session or Token
@@ -386,8 +391,8 @@ dashboardRouter.post("/api/dashboard/accounts/telegram/send-code", async (req: R
   try {
     const result = await sendTelegramLoginCode({
       phoneNumber,
-      apiId: apiId ? Number(apiId) : DEFAULT_TELEGRAM_API_ID,
-      apiHash: apiHash || DEFAULT_TELEGRAM_API_HASH
+      apiId: apiId ? Number(apiId) : undefined,
+      apiHash: apiHash ? String(apiHash).trim() : undefined
     });
 
     return res.json({
@@ -572,6 +577,164 @@ dashboardRouter.get("/api/dashboard/ingested-messages", (req: Request, res: Resp
     success: true,
     messages: records
   });
+});
+
+// ─── 10. Currency Terms & Extraction Settings ───
+dashboardRouter.get("/api/dashboard/settings/terms", (req: Request, res: Response) => {
+  res.json({
+    success: true,
+    terms: appConfig.terms
+  });
+});
+
+dashboardRouter.post("/api/dashboard/settings/terms/save", async (req: Request, res: Response) => {
+  const { id, name, regex, min, max, flag, isInverse } = req.body || {};
+
+  if (!id || typeof id !== 'string' || !id.trim()) {
+    return res.status(400).json({ success: false, error: "كود العملة (ID) مطلوب" });
+  }
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return res.status(400).json({ success: false, error: "اسم العملة مطلوب" });
+  }
+  if (!regex || typeof regex !== 'string' || !regex.trim()) {
+    return res.status(400).json({ success: false, error: "نمط المطابقة (Regex) مطلوب" });
+  }
+
+  // Validate regex syntax
+  try {
+    new RegExp(regex.trim(), 'i');
+  } catch (err: any) {
+    return res.status(400).json({ success: false, error: `نمط Regex غير صالح: ${err?.message || err}` });
+  }
+
+  const numMin = parseFloat(String(min));
+  const numMax = parseFloat(String(max));
+
+  if (isNaN(numMin) || isNaN(numMax)) {
+    return res.status(400).json({ success: false, error: "الحد الأدنى والأقصى يجب أن يكونا أرقاماً صالحة" });
+  }
+  if (numMin > numMax) {
+    return res.status(400).json({ success: false, error: "الحد الأدنى لا يمكن أن يكون أكبر من الحد الأقصى" });
+  }
+
+  const termId = id.trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_');
+  const termName = name.trim();
+  const termRegex = regex.trim();
+  const termFlag = (flag && String(flag).trim().toLowerCase()) || 'ly';
+  const termInverse = Boolean(isInverse);
+
+  const newTerm = {
+    id: termId,
+    name: termName,
+    regex: termRegex,
+    min: numMin,
+    max: numMax,
+    isInverse: termInverse,
+    flag: termFlag
+  };
+
+  const existingIdx = appConfig.terms.findIndex(t => t.id === termId);
+  if (existingIdx >= 0) {
+    appConfig.terms[existingIdx] = newTerm;
+  } else {
+    appConfig.terms.unshift(newTerm);
+  }
+
+  addLog("info", "إعدادات العملات", `تم حفظ شروط العملة [${termName} (${termId})] بنطاق [${numMin} - ${numMax}]`);
+
+  // Persist to database
+  await saveConfigToSupabase(appConfig);
+
+  return res.json({
+    success: true,
+    message: `تم حفظ العملة [${termName}] وشروط الاستخراج في قاعدة البيانات بنجاح`,
+    terms: appConfig.terms,
+    term: newTerm
+  });
+});
+
+dashboardRouter.post("/api/dashboard/settings/terms/delete", async (req: Request, res: Response) => {
+  const { id } = req.body || {};
+  if (!id) {
+    return res.status(400).json({ success: false, error: "معرف العملة مطلوب للحذف" });
+  }
+
+  const existingIdx = appConfig.terms.findIndex(t => t.id === id);
+  if (existingIdx === -1) {
+    return res.status(404).json({ success: false, error: "العملة غير موجودة" });
+  }
+
+  const deletedTerm = appConfig.terms.splice(existingIdx, 1)[0];
+
+  try {
+    db.prepare('DELETE FROM currency_terms WHERE id = ?').run(id);
+  } catch (e) {}
+
+  addLog("warn", "إعدادات العملات", `تم حذف العملة [${deletedTerm.name} (${deletedTerm.id})] من شروط الاستخراج`);
+
+  await saveConfigToSupabase(appConfig);
+
+  return res.json({
+    success: true,
+    message: `تم حذف العملة [${deletedTerm.name}] بنجاح`,
+    terms: appConfig.terms
+  });
+});
+
+dashboardRouter.post("/api/dashboard/settings/terms/sync-db", async (req: Request, res: Response) => {
+  addLog("info", "إعدادات العملات", "طلب مزامنة شروط العملات من جدول قاعدة البيانات");
+  await loadConfigFromSupabase();
+  return res.json({
+    success: true,
+    message: "تمت مزامنة العملات من قاعدة البيانات بنجاح",
+    terms: appConfig.terms
+  });
+});
+
+dashboardRouter.post("/api/dashboard/settings/terms/test", (req: Request, res: Response) => {
+  const { regex, min, max, isInverse, text } = req.body || {};
+  if (!regex || !text) {
+    return res.status(400).json({ success: false, error: "النمط والنص مطلوبان للاختبار" });
+  }
+
+  try {
+    const rx = new RegExp(regex, 'i');
+    const match = text.match(rx);
+    if (!match) {
+      return res.json({
+        success: true,
+        matched: false,
+        message: "لم يتم العثور على مطابقة في النص"
+      });
+    }
+
+    const capturedNums = match.slice(1).filter(Boolean);
+    let val: number | null = null;
+
+    if (capturedNums.length > 0) {
+      const rawStr = capturedNums[0].replace(/,/g, '.');
+      val = parseFloat(rawStr);
+      if (isInverse && val > 0) val = 1 / val;
+    }
+
+    const numMin = typeof min === 'number' ? min : parseFloat(min || '0');
+    const numMax = typeof max === 'number' ? max : parseFloat(max || '999999');
+
+    const withinRange = val !== null && !isNaN(val) && val >= numMin && val <= numMax;
+
+    return res.json({
+      success: true,
+      matched: true,
+      fullMatch: match[0],
+      capturedValue: val,
+      withinRange,
+      message: withinRange 
+        ? `✅ تطابق ناجح! تم استخراج القيمة ${val} وهي تقع ضمن النطاق المطلوب [${numMin} - ${numMax}]`
+        : `⚠️ تم التطابق واستخراج القيمة ${val} ولكنها تقع خارج النطاق المشروط [${numMin} - ${numMax}]`
+    });
+  } catch (err: any) {
+    return res.status(400).json({ success: false, error: `خطأ في النمط: ${err?.message || err}` });
+  }
 });
 
 export default dashboardRouter;

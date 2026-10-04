@@ -16,9 +16,14 @@ interface PendingLoginSession {
 
 let pendingSession: PendingLoginSession | null = null;
 
-// Default API credentials provided by user
-export const DEFAULT_TELEGRAM_API_ID = 37876956;
-export const DEFAULT_TELEGRAM_API_HASH = "0e9d1601dd10c87ca3b3b6886cb53cb2";
+// Helper functions to retrieve Telegram API credentials from environment or config
+export const getEnvTelegramApiId = (): number => {
+  return Number(process.env.TELEGRAM_API_ID || process.env.VITE_TELEGRAM_API_ID || appConfig.telegramApiId) || 0;
+};
+
+export const getEnvTelegramApiHash = (): string => {
+  return (process.env.TELEGRAM_API_HASH || process.env.VITE_TELEGRAM_API_HASH || appConfig.telegramApiHash || "").trim();
+};
 
 /**
  * Step 1: Send Telegram authentication code (OTP) to phone number.
@@ -28,9 +33,13 @@ export async function sendTelegramLoginCode(params: {
   apiHash?: string;
   phoneNumber: string;
 }): Promise<{ phoneCodeHash: string; isCodeViaApp: boolean }> {
-  const apiId = Number(params.apiId) || DEFAULT_TELEGRAM_API_ID;
-  const apiHash = (params.apiHash && params.apiHash.trim()) || DEFAULT_TELEGRAM_API_HASH;
+  const apiId = Number(params.apiId) || getEnvTelegramApiId();
+  const apiHash = (params.apiHash && params.apiHash.trim()) || getEnvTelegramApiHash();
   const phoneNumber = params.phoneNumber.trim().replace(/\s+/g, '');
+
+  if (!apiId || !apiHash) {
+    throw new Error("يرجى إدخال App api_id و App api_hash أو تعيينهما في متغيرات البيئة (TELEGRAM_API_ID و TELEGRAM_API_HASH)");
+  }
 
   if (!phoneNumber) {
     throw new Error("رقم الهاتف مطلوب للاتصال بحساب تيليجرام");

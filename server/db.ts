@@ -45,6 +45,18 @@ db.exec(`
     last_broadcast_time INTEGER NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS currency_terms (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    regex TEXT NOT NULL,
+    min REAL NOT NULL,
+    max REAL NOT NULL,
+    is_inverse INTEGER DEFAULT 0,
+    flag TEXT DEFAULT 'ly',
+    is_active INTEGER DEFAULT 1,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
   CREATE TABLE IF NOT EXISTS analytics_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     visitor_id TEXT NOT NULL,
