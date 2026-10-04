@@ -1,9 +1,14 @@
 import { Router, Request, Response } from "express";
 import { rates } from "../state";
-import { appConfig } from "../config";
+import { appConfig, saveConfigToSupabase } from "../config";
 import { serverStartTime, getAppBuildSignature } from "../utils/version";
 import { getWorkerJobsStatus, runJobSafely } from "../schedulers/tasks.scheduler";
-import { fetchOfficialRates, fetchParallelRatesFromTelegram } from "../services/scraper.service";
+import { 
+  fetchOfficialRates, fetchParallelRatesFromTelegram, 
+  isCblFetchEnabled, setCblFetchEnabled, 
+  isTelegramFetchEnabled, setTelegramFetchEnabled, 
+  isWhatsAppFetchEnabled, setWhatsAppFetchEnabled 
+} from "../services/scraper.service";
 import { cleanupOldData, saveToSupabase } from "../services/db.service";
 import { cleanupUserLogs, monitorMemory } from "../services/maintenance.service";
 import { extractRatesWithAI } from "../services/ai.service";
@@ -12,6 +17,7 @@ import { activeClient, initializeTelegram } from "../../telegramClient";
 import { whatsappManager } from "../services/whatsapp.service";
 import { addLog, getRecentLogs, clearLogs } from "../utils/logger";
 import { renderDashboardHtml } from "../views/dashboard.html";
+import { getRecentIngestedRecords } from "../services/ingestion.service";
 
 const dashboardRouter = Router();
 
@@ -57,6 +63,27 @@ dashboardRouter.get(["/", "/dashboard", "/admin"], (req: Request, res: Response)
     },
     activeJobs: getWorkerJobsStatus(),
     recentLogs: getRecentLogs(60),
+    accounts: {
+      telegram: {
+        connected: !!(activeClient && activeClient.connected),
+        channel: appConfig.telegramPostChannel || 'lydollar',
+        hasSession: !!(process.env.TELEGRAM_SESSION || appConfig.telegramSessionString),
+      },
+      whatsapp: whatsappManager.getStatus(),
+      facebook: {
+        pageId: appConfig.facebookPageId || '',
+        hasToken: !!appConfig.facebookAccessToken,
+        autoPost: !!appConfig.facebookAutoPost
+      }
+    },
+    toggles: {
+      cblFetchEnabled: isCblFetchEnabled,
+      telegramFetchEnabled: isTelegramFetchEnabled,
+      whatsappFetchEnabled: isWhatsAppFetchEnabled,
+      telegramAutoPost: !!appConfig.telegramAutoPost,
+      facebookAutoPost: !!appConfig.facebookAutoPost
+    },
+    ingestedMessages: getRecentIngestedRecords(30)
   };
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -88,6 +115,27 @@ dashboardRouter.get("/api/dashboard/stats", (req: Request, res: Response) => {
     },
     activeJobs: getWorkerJobsStatus(),
     recentLogs: getRecentLogs(60),
+    accounts: {
+      telegram: {
+        connected: !!(activeClient && activeClient.connected),
+        channel: appConfig.telegramPostChannel || 'lydollar',
+        hasSession: !!(process.env.TELEGRAM_SESSION || appConfig.telegramSessionString),
+      },
+      whatsapp: whatsappManager.getStatus(),
+      facebook: {
+        pageId: appConfig.facebookPageId || '',
+        hasToken: !!appConfig.facebookAccessToken,
+        autoPost: !!appConfig.facebookAutoPost
+      }
+    },
+    toggles: {
+      cblFetchEnabled: isCblFetchEnabled,
+      telegramFetchEnabled: isTelegramFetchEnabled,
+      whatsappFetchEnabled: isWhatsAppFetchEnabled,
+      telegramAutoPost: !!appConfig.telegramAutoPost,
+      facebookAutoPost: !!appConfig.facebookAutoPost
+    },
+    ingestedMessages: getRecentIngestedRecords(30)
   });
 });
 
@@ -256,6 +304,204 @@ dashboardRouter.post("/api/dashboard/clear-logs", (req: Request, res: Response) 
   clearLogs();
   addLog("info", "السجلات", "تم مسح السجلات الحية من الذاكرة");
   res.json({ success: true });
+});
+
+// ─── 7. Accounts Management Endpoints ───
+dashboardRouter.get("/api/dashboard/accounts", (req: Request, res: Response) => {
+  res.json({
+    success: true,
+    telegram: {
+      connected: !!(activeClient && activeClient.connected),
+      channel: appConfig.telegramPostChannel || 'lydollar',
+      hasSession: !!(process.env.TELEGRAM_SESSION || appConfig.telegramSessionString),
+      hasBotToken: !!appConfig.telegramBotToken
+    },
+    whatsapp: whatsappManager.getStatus(),
+    facebook: {
+      pageId: appConfig.facebookPageId || '',
+      hasToken: !!appConfig.facebookAccessToken,
+      autoPost: !!appConfig.facebookAutoPost
+    },
+    toggles: {
+      cblFetchEnabled: isCblFetchEnabled,
+      telegramFetchEnabled: isTelegramFetchEnabled,
+      whatsappFetchEnabled: isWhatsAppFetchEnabled,
+      telegramAutoPost: !!appConfig.telegramAutoPost,
+      facebookAutoPost: !!appConfig.facebookAutoPost
+    }
+  });
+});
+
+// Save Telegram Session or Token
+dashboardRouter.post("/api/dashboard/accounts/telegram/save", async (req: Request, res: Response) => {
+  const { sessionString, botToken, postChannel } = req.body || {};
+
+  if (sessionString !== undefined && typeof sessionString === "string") {
+    appConfig.telegramSessionString = sessionString.trim();
+    process.env.TELEGRAM_SESSION = sessionString.trim();
+  }
+  if (botToken !== undefined && typeof botToken === "string") {
+    appConfig.telegramBotToken = botToken.trim();
+  }
+  if (postChannel !== undefined && typeof postChannel === "string") {
+    appConfig.telegramPostChannel = postChannel.trim();
+  }
+
+  addLog("info", "حسابات", "تم حفظ وتحديث إعدادات جلسة تيليجرام");
+  await saveConfigToSupabase(appConfig);
+
+  // Trigger reconnect
+  try {
+    await initializeTelegram();
+    return res.json({
+      success: true,
+      message: "تم حفظ الجلسة وبدء الاتصال بتيليجرام بنجاح",
+      connected: !!(activeClient && activeClient.connected)
+    });
+  } catch (err: any) {
+    return res.json({
+      success: true,
+      message: `تم حفظ الإعدادات (جاري الاتصال: ${err?.message || err})`,
+      connected: false
+    });
+  }
+});
+
+// Telegram Reconnect
+dashboardRouter.post("/api/dashboard/accounts/telegram/reconnect", async (req: Request, res: Response) => {
+  addLog("info", "حسابات", "طلب إعادة اتصال تيليجرام يدوياً");
+  try {
+    await initializeTelegram();
+    return res.json({
+      success: true,
+      message: "تمت إعادة محاولة الاتصال بتيليجرام",
+      connected: !!(activeClient && activeClient.connected)
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || String(err) });
+  }
+});
+
+// Telegram Disconnect
+dashboardRouter.post("/api/dashboard/accounts/telegram/disconnect", async (req: Request, res: Response) => {
+  addLog("info", "حسابات", "قطع اتصال جلسة تيليجرام يدوياً");
+  try {
+    if (activeClient && activeClient.connected) {
+      await activeClient.disconnect();
+    }
+    return res.json({ success: true, message: "تم قطع اتصال تيليجرام" });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || String(err) });
+  }
+});
+
+// WhatsApp Init Client (Generates QR Code if needed)
+dashboardRouter.post("/api/dashboard/accounts/whatsapp/init", async (req: Request, res: Response) => {
+  addLog("info", "حسابات", "تهيئة وتشغيل عميل واتساب وتوليد الرمز");
+  try {
+    await whatsappManager.initClient();
+    return res.json({
+      success: true,
+      message: "تم بدء تهيئة واتساب",
+      status: whatsappManager.getStatus()
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || String(err) });
+  }
+});
+
+// WhatsApp Disconnect
+dashboardRouter.post("/api/dashboard/accounts/whatsapp/disconnect", async (req: Request, res: Response) => {
+  addLog("info", "حسابات", "تسجيل الخروج وحذف جلسة واتساب");
+  try {
+    await whatsappManager.disconnect();
+    return res.json({ success: true, message: "تم تسجيل الخروج وقطع جلسة واتساب بنجاح" });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || String(err) });
+  }
+});
+
+// Save Facebook Settings
+dashboardRouter.post("/api/dashboard/accounts/facebook/save", async (req: Request, res: Response) => {
+  const { pageId, accessToken, autoPost } = req.body || {};
+
+  if (pageId !== undefined) appConfig.facebookPageId = String(pageId).trim();
+  if (accessToken !== undefined) appConfig.facebookAccessToken = String(accessToken).trim();
+  if (autoPost !== undefined) appConfig.facebookAutoPost = Boolean(autoPost);
+
+  addLog("info", "حسابات", "تم حفظ إعدادات الربط مع فيسبوك");
+  await saveConfigToSupabase(appConfig);
+
+  return res.json({
+    success: true,
+    message: "تم حفظ إعدادات فيسبوك بنجاح"
+  });
+});
+
+// Test Facebook Post
+dashboardRouter.post("/api/dashboard/accounts/facebook/test", async (req: Request, res: Response) => {
+  addLog("info", "حسابات", "إرسال منشور تجريبي إلى صفحة فيسبوك");
+  try {
+    const result = await broadcastToSocialMedia("منشور تجريبي من لوحة تحكم مؤشر الدينار الليبي", true, "facebook", true);
+    return res.json({ success: true, message: "تم نشر الرسالة التجريبية على فيسبوك بنجاح!", result });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || String(err) });
+  }
+});
+
+// ─── 8. Automation & Scraping Toggles ───
+dashboardRouter.post("/api/dashboard/toggles", async (req: Request, res: Response) => {
+  const { 
+    cblFetchEnabled, 
+    telegramFetchEnabled, 
+    whatsappFetchEnabled, 
+    telegramAutoPost, 
+    facebookAutoPost 
+  } = req.body || {};
+
+  if (cblFetchEnabled !== undefined) {
+    setCblFetchEnabled(Boolean(cblFetchEnabled));
+    addLog("info", "التحكم", `تم ${cblFetchEnabled ? 'تفعيل' : 'تعطيل'} الجلب من مصرف ليبيا المركزي`);
+  }
+  if (telegramFetchEnabled !== undefined) {
+    setTelegramFetchEnabled(Boolean(telegramFetchEnabled));
+    addLog("info", "التحكم", `تم ${telegramFetchEnabled ? 'تفعيل' : 'تعطيل'} الجلب من قنوات تيليجرام`);
+  }
+  if (whatsappFetchEnabled !== undefined) {
+    setWhatsAppFetchEnabled(Boolean(whatsappFetchEnabled));
+    addLog("info", "التحكم", `تم ${whatsappFetchEnabled ? 'تفعيل' : 'تعطيل'} الجلب من مجموعات واتساب`);
+  }
+  if (telegramAutoPost !== undefined) {
+    appConfig.telegramAutoPost = Boolean(telegramAutoPost);
+    addLog("info", "التحكم", `تم ${telegramAutoPost ? 'تفعيل' : 'تعطيل'} النشر التلقائي في تيليجرام`);
+  }
+  if (facebookAutoPost !== undefined) {
+    appConfig.facebookAutoPost = Boolean(facebookAutoPost);
+    addLog("info", "التحكم", `تم ${facebookAutoPost ? 'تفعيل' : 'تعطيل'} النشر التلقائي في فيسبوك`);
+  }
+
+  await saveConfigToSupabase(appConfig);
+
+  return res.json({
+    success: true,
+    message: "تم تحديث إعدادات التشغيل والتحكم بنجاح",
+    toggles: {
+      cblFetchEnabled: isCblFetchEnabled,
+      telegramFetchEnabled: isTelegramFetchEnabled,
+      whatsappFetchEnabled: isWhatsAppFetchEnabled,
+      telegramAutoPost: !!appConfig.telegramAutoPost,
+      facebookAutoPost: !!appConfig.facebookAutoPost
+    }
+  });
+});
+
+// ─── 9. Ingested Messages & Extraction History ───
+dashboardRouter.get("/api/dashboard/ingested-messages", (req: Request, res: Response) => {
+  const records = getRecentIngestedRecords(35);
+  res.json({
+    success: true,
+    messages: records
+  });
 });
 
 export default dashboardRouter;

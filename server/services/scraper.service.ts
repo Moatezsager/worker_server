@@ -8,9 +8,12 @@ import { broadcastOfficialRates, broadcastRateChanges, getOrInitTelegramManager,
 import { fetchPublicChannelMessages } from '../../telegramClient';
 import { isSignificantChange, isProbablyDateOrTime } from '../utils/helpers';
 import { updateStats } from './reporting.service';
+import { recordIngestion } from './ingestion.service';
 
 export let lastOfficialFetchDate = "";
 export let isCblFetchEnabled = true;
+export let isTelegramFetchEnabled = true;
+export let isWhatsAppFetchEnabled = true;
 
 export function setCblFetchEnabled(enabled: boolean) {
   isCblFetchEnabled = enabled;
@@ -32,6 +35,16 @@ export function setCblFetchEnabled(enabled: boolean) {
   } catch (e) {
     console.error('[Official] Error persisting cbl_fetch_enabled:', e);
   }
+}
+
+export function setTelegramFetchEnabled(enabled: boolean) {
+  isTelegramFetchEnabled = enabled;
+  console.log(`[Scraper] Telegram auto-fetch set to: ${enabled}`);
+}
+
+export function setWhatsAppFetchEnabled(enabled: boolean) {
+  isWhatsAppFetchEnabled = enabled;
+  console.log(`[WhatsApp] WhatsApp auto-fetch set to: ${enabled}`);
 }
 
 export const CBL_STATUS = {
@@ -491,6 +504,16 @@ export async function fetchOfficialRates(force: boolean = false, isManualAdmin: 
 
   console.log(`[CBL] Rates validated successfully for bulletin date: ${cblDate}`);
 
+  recordIngestion({
+    source: 'موقع مصرف ليبيا المركزي (CBL)',
+    platform: 'cbl',
+    timestamp: new Date().toISOString(),
+    rawText: `النشرة الرسمية الصادرة بتاريخ ${cblDate} عن مصرف ليبيا المركزي`,
+    status: Object.keys(cblRates).length > 0 ? 'extracted' : 'ignored',
+    extractedRates: Object.entries(cblRates).map(([k, v]) => ({ code: k, value: Number(v) })),
+    ignoreReason: Object.keys(cblRates).length === 0 ? 'لم يتم العثور على جدول أسعار صالح' : undefined
+  });
+
   // 4. CREATE CANDIDATE DATA (In-memory state remains UNCHANGED at this point!)
   const candidateOfficialRates: RateMap = { ...rates.official, ...cblRates };
   const candidatePreviousOfficial: RateMap = { ...rates.previousOfficial };
@@ -740,9 +763,14 @@ export const extractRatesFromText = (originalText: string) => {
   return results;
 };
 
-export async function fetchParallelRatesFromTelegram(): Promise<boolean | null> {
+export async function fetchParallelRatesFromTelegram(isManual: boolean = false): Promise<boolean | null> {
   console.log(`\n[Scraper] Starting parallel rates fetch at ${new Date().toISOString()}`);
   
+  if (!isTelegramFetchEnabled && !isManual) {
+    console.log("[Scraper] Telegram parallel fetch is currently disabled via dashboard. Skipping.");
+    return false;
+  }
+
   if (isScraping) {
     console.log("[Scraper] Scrape already in progress, skipping...");
     return null;
@@ -866,6 +894,16 @@ export async function fetchParallelRatesFromTelegram(): Promise<boolean | null> 
                 
                 liveFeed.unshift(feedMsg);
                 if (liveFeed.length > 100) liveFeed = liveFeed.slice(0, 100);
+
+                recordIngestion({
+                  source: '@' + channel,
+                  platform: 'telegram',
+                  timestamp: new Date(msg.date).toISOString(),
+                  rawText: msg.text,
+                  status: extracted.length > 0 ? 'extracted' : 'ignored',
+                  extractedRates: extracted.map(e => ({ code: e.code, value: e.value })),
+                  ignoreReason: extracted.length === 0 ? 'لا تحتوي الرسالة على أسعار مطابقة لشروط الصرف' : undefined
+                });
 
                 if (extracted.length > 0) {
                   for (const res of extracted) {
@@ -1109,6 +1147,10 @@ export async function processWhatsAppMessage(
   msgTime: number
 ): Promise<{ processed: boolean; extractedCount: number; rates?: { code: string; value: number }[] }> {
   try {
+    if (!isWhatsAppFetchEnabled) {
+      return { processed: false, extractedCount: 0 };
+    }
+
     // 1. Time boundary check: message must be from today in Libya (GMT+2)
     // ─── حساب بداية اليوم الحالي بتوقيت ليبيا (Africa/Tripoli = UTC+2) ────────
     // نستخدم نفس منهجية Telegram: Intl لتحديد التاريخ الليبي بدقة
@@ -1161,6 +1203,16 @@ export async function processWhatsAppMessage(
     };
     liveFeed.unshift(feedMsg);
     if (liveFeed.length > 100) liveFeed = liveFeed.slice(0, 100);
+
+    recordIngestion({
+      source: `واتساب (${chatName})`,
+      platform: 'whatsapp',
+      timestamp: new Date(msgTime).toISOString(),
+      rawText,
+      status: extracted.length > 0 ? 'extracted' : 'ignored',
+      extractedRates: extracted.map(e => ({ code: e.code, value: e.value })),
+      ignoreReason: extracted.length === 0 ? 'نص محادثة واتساب لا يتضمن أسعار عملات مطابقة' : undefined
+    });
 
     if (extracted.length === 0) {
       return { processed: true, extractedCount: 0 };
