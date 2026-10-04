@@ -11,8 +11,8 @@ export interface IngestedMessageRecord {
   ignoreReason?: string;
 }
 
-// In-memory buffer of latest 50 ingested messages
-const memoryBuffer: IngestedMessageRecord[] = [];
+// In-memory buffer of ingested messages
+let memoryBuffer: IngestedMessageRecord[] = [];
 
 // Initialize SQLite table for ingested messages
 try {
@@ -30,14 +30,15 @@ try {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
       CREATE INDEX IF NOT EXISTS idx_ingested_messages_created ON ingested_messages(created_at);
+      CREATE INDEX IF NOT EXISTS idx_ingested_messages_source ON ingested_messages(source);
     `);
 
-    // Load recent 30 from DB on startup
+    // Load recent from DB on startup
     const rows = db.prepare(`
       SELECT id, source, platform, timestamp, raw_text, status, extracted_rates, ignore_reason
       FROM ingested_messages
       ORDER BY rowid DESC
-      LIMIT 30
+      LIMIT 50
     `).all() as any[];
 
     for (const r of rows) {
@@ -74,9 +75,97 @@ if (memoryBuffer.length === 0) {
 }
 
 /**
+ * Perform smart cleanup on memory buffer and SQLite database:
+ * 1. Limits per-channel/source messages to maximum 4 newest records.
+ * 2. Limits overall total records to 50 newest.
+ */
+function performSmartCleanup(): void {
+  // Group by source and keep max 4 per source
+  const sourceCounts: Record<string, number> = {};
+  const cleanedBuffer: IngestedMessageRecord[] = [];
+
+  for (const item of memoryBuffer) {
+    const srcKey = item.source.toLowerCase().trim();
+    sourceCounts[srcKey] = (sourceCounts[srcKey] || 0) + 1;
+    if (sourceCounts[srcKey] <= 4) {
+      cleanedBuffer.push(item);
+    }
+  }
+
+  // Cap total buffer size to 50
+  memoryBuffer = cleanedBuffer.slice(0, 50);
+
+  // Perform per-channel cleanup in SQLite
+  try {
+    if (db) {
+      // Delete old rows per source keeping max 4 per source
+      const sources = db.prepare(`SELECT DISTINCT source FROM ingested_messages`).all() as { source: string }[];
+      for (const s of sources) {
+        db.prepare(`
+          DELETE FROM ingested_messages 
+          WHERE source = ? AND rowid NOT IN (
+            SELECT rowid FROM ingested_messages WHERE source = ? ORDER BY rowid DESC LIMIT 4
+          )
+        `).run(s.source, s.source);
+      }
+
+      // Cap overall table to newest 50 rows
+      db.prepare(`
+        DELETE FROM ingested_messages WHERE rowid NOT IN (
+          SELECT rowid FROM ingested_messages ORDER BY rowid DESC LIMIT 50
+        )
+      `).run();
+    }
+  } catch (err) {
+    console.warn('[IngestionService] Smart cleanup error:', err);
+  }
+}
+
+/**
  * Record a message ingested from Telegram, WhatsApp, or CBL website.
+ * Prevents exact duplicates and enforces max 4 messages per channel/source.
  */
 export function recordIngestion(entry: Omit<IngestedMessageRecord, 'id'>): IngestedMessageRecord {
+  const normText = entry.rawText.trim();
+  const normSource = entry.source.trim();
+
+  // Deduplication check: if identical message exists from same source, update timestamp/status
+  const existingIndex = memoryBuffer.findIndex(
+    m => m.source.trim() === normSource && m.rawText.trim() === normText
+  );
+
+  if (existingIndex !== -1) {
+    const existing = memoryBuffer[existingIndex];
+    existing.timestamp = entry.timestamp || new Date().toISOString();
+    existing.status = entry.status;
+    existing.extractedRates = entry.extractedRates;
+    existing.ignoreReason = entry.ignoreReason;
+
+    // Move to front
+    memoryBuffer.splice(existingIndex, 1);
+    memoryBuffer.unshift(existing);
+
+    // Update in SQLite
+    try {
+      if (db) {
+        db.prepare(`
+          UPDATE ingested_messages 
+          SET timestamp = ?, status = ?, extracted_rates = ?, ignore_reason = ?
+          WHERE id = ?
+        `).run(
+          existing.timestamp,
+          existing.status,
+          existing.extractedRates ? JSON.stringify(existing.extractedRates) : null,
+          existing.ignoreReason || null,
+          existing.id
+        );
+      }
+    } catch {}
+
+    performSmartCleanup();
+    return existing;
+  }
+
   const fullRecord: IngestedMessageRecord = {
     ...entry,
     id: `ingest_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`
@@ -84,9 +173,6 @@ export function recordIngestion(entry: Omit<IngestedMessageRecord, 'id'>): Inges
 
   // Add to in-memory buffer at front
   memoryBuffer.unshift(fullRecord);
-  if (memoryBuffer.length > 50) {
-    memoryBuffer.pop();
-  }
 
   // Persist to SQLite
   try {
@@ -103,19 +189,16 @@ export function recordIngestion(entry: Omit<IngestedMessageRecord, 'id'>): Inges
         fullRecord.rawText,
         fullRecord.status,
         fullRecord.extractedRates ? JSON.stringify(fullRecord.extractedRates) : null,
-        fullRecord.ignoreReason || null
+        fullRecord.ignoreReason || null,
+        fullRecord.id
       );
-
-      // Keep only newest 100 rows in SQLite
-      db.prepare(`
-        DELETE FROM ingested_messages WHERE rowid NOT IN (
-          SELECT rowid FROM ingested_messages ORDER BY rowid DESC LIMIT 100
-        )
-      `).run();
     }
   } catch (err) {
     console.warn('[IngestionService] Failed to persist message log:', err);
   }
+
+  // Execute smart auto-cleanup
+  performSmartCleanup();
 
   return fullRecord;
 }

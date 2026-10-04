@@ -837,8 +837,8 @@ export async function fetchParallelRatesFromTelegram(isManual: boolean = false):
         const gramJsResults: Array<{ status: 'fulfilled'; value: { channel: string; messages: { text: string; date: number }[] } } | { status: 'rejected'; reason: { channel: string; error: any } }> = [];
         for (const channel of channels) {
           try {
-            // Optimized limit of 6 messages (more than enough for daily rates, reduces network payload by 70%)
-            const messages = await mgr.fetchMessages(channel, 6);
+            // Fetch last 4 messages per channel as requested
+            const messages = await mgr.fetchMessages(channel, 4);
             gramJsResults.push({ status: 'fulfilled', value: { channel, messages } });
             // Small pause between channels to keep MTProto connection calm and avoid flood wait
             await new Promise(r => setTimeout(r, 250));
