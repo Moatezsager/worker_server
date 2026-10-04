@@ -1491,8 +1491,8 @@ export function renderDashboardHtml(initialState?: any): string {
             '</div>' +
           '</div>' +
           '<div style="display:flex; gap:4px;">' +
-            '<button class="btn btn-secondary btn-sm" onclick="editTgChannel(\'' + ch + '\')" style="padding:2px 8px; font-size:10px;">✏️ تعديل</button>' +
-            '<button class="btn btn-danger btn-sm" onclick="deleteTgChannel(\'' + ch + '\')" style="padding:2px 8px; font-size:10px;">🗑️ حذف</button>' +
+            '<button class="btn btn-secondary btn-sm" onclick="editTgChannel(&quot;' + ch + '&quot;)" style="padding:2px 8px; font-size:10px;">✏️ تعديل</button>' +
+            '<button class="btn btn-danger btn-sm" onclick="deleteTgChannel(&quot;' + ch + '&quot;)" style="padding:2px 8px; font-size:10px;">🗑️ حذف</button>' +
           '</div>' +
         '</div>';
       }).join('');
@@ -1600,10 +1600,10 @@ export function renderDashboardHtml(initialState?: any): string {
           '</div>' +
           '<div style="display:flex; align-items:center; gap:8px;">' +
             '<label class="switch" style="transform:scale(0.85);" title="' + (isEnabled ? 'تعطيل الاستخراج' : 'تفعيل الاستخراج') + '">' +
-              '<input type="checkbox" onchange="toggleWhatsAppSource(\'' + item.jid + '\', this.checked)" ' + (isEnabled ? 'checked' : '') + '>' +
+              '<input type="checkbox" onchange="toggleWhatsAppSource(&quot;' + item.jid + '&quot;, this.checked)" ' + (isEnabled ? 'checked' : '') + '>' +
               '<span class="slider"></span>' +
             '</label>' +
-            '<button class="btn btn-danger btn-sm" onclick="deleteWhatsAppSource(\'' + item.jid + '\')" style="padding:2px 6px; font-size:10px;" title="حذف المصدر">🗑️</button>' +
+            '<button class="btn btn-danger btn-sm" onclick="deleteWhatsAppSource(&quot;' + item.jid + '&quot;)" style="padding:2px 6px; font-size:10px;" title="حذف المصدر">🗑️</button>' +
           '</div>' +
         '</div>';
       }).join('');
