@@ -3,7 +3,7 @@ import { appConfig, telegramManager, setTelegramManager } from '../config';
 import { rates } from '../state';
 import { db, supabase, supabaseKey } from '../db';
 import { addBroadcastLog } from './broadcastLog.service';
-import { delay, getPublicAppUrl } from '../utils/helpers';
+import { delay, getPublicAppUrl, getLibyaTimeInfo } from '../utils/helpers';
 
 interface FacebookApiResponse {
   error?: {
@@ -560,13 +560,8 @@ export async function broadcastToSocialMedia(message: string, isTest: boolean = 
       let lastErrMessage = "";
       const maxRetries = isTest ? 1 : 2;
 
-      // تجهيز رسالة تيليجرام: إزالة أي روابط مختصرة تماماً واستبدالها برابط الموقع المباشر مع رقم عشوائي
+      // تجهيز رسالة تيليجرام: الحفاظ على الرابط المختصر https://tinyurl.com/2j7667u2
       let tgMessage = message;
-      const tgRandomNum = Math.floor(100000 + Math.random() * 900000);
-      const publicBase = getPublicAppUrl();
-      const dynamicTgUrl = `${publicBase}/?r=${tgRandomNum}`;
-      tgMessage = tgMessage.replace(/https:\/\/tinyurl\.com\/2j7667u2/g, dynamicTgUrl);
-      tgMessage = tgMessage.replace(/https?:\/\/[a-zA-Z0-9.-]+\.onrender\.com(?:\/[^\s]*)?/g, dynamicTgUrl);
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
@@ -891,8 +886,7 @@ export async function broadcastOfficialRates(
   }
 
   message += `\n━━━━━━━━━━━━━━━━━━━\n`;
-  const officialRandomCode = Math.floor(100000 + Math.random() * 900000);
-  message += `🔗 *لمزيد من التفاصيل والبيانات الحية:*\n🌐 ${getPublicAppUrl()}/?r=${officialRandomCode}\n`;
+  message += `🔗 *لمزيد من التفاصيل والبيانات الحية:*\n🌐 https://tinyurl.com/2j7667u2\n`;
   message += `📱 *المصدر:* مصرف ليبيا المركزي`;
 
   try {
@@ -1263,45 +1257,27 @@ function getBroadcastDisplayRank(u: { id?: string; name?: string }): number {
 
 export function formatSmartBroadcastMessage(updates: { id?: string; name: string; oldVal: number; newVal: number; flag: string }[]): string {
   const now = new Date();
-  const dateStr = now.toLocaleDateString('ar-LY', { timeZone: 'Africa/Tripoli' });
-  const timeStr = now.toLocaleTimeString('ar-LY', { timeZone: 'Africa/Tripoli', hour: '2-digit', minute: '2-digit' });
-
-  const dayNames = ["الأحد", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"];
-  let dayName = "اليوم";
-  try {
-    const dayIndex = new Date(now.toLocaleString('en-US', { timeZone: 'Africa/Tripoli' })).getDay();
-    dayName = dayNames[dayIndex];
-  } catch (e) {}
+  const libyaInfo = getLibyaTimeInfo(now);
+  
+  const daysInArabic = ['الأحد', 'الإثنين', 'الثلاثاء', 'الأربعاء', 'الخميس', 'الجمعة', 'السبت'];
+  const dayName = daysInArabic[libyaInfo.dayIndex];
+  
+  const dateStr = `${libyaInfo.dateObj.getDate()}/${libyaInfo.dateObj.getMonth() + 1}/${libyaInfo.dateObj.getFullYear()}`;
+  
+  let hours = libyaInfo.hour;
+  const period = hours >= 12 ? 'م' : 'ص';
+  hours = hours % 12 || 12;
+  const mins = String(libyaInfo.minute).padStart(2, '0');
+  const timeStr = `${hours}:${mins} ${period}`;
 
   const flagMap: Record<string, string> = {
-    'us': '🇺🇸', 'eu': '🇪🇺', 'gb': '🇬🇧', 'tn': '🇹🇳', 'eg': '🇪🇬', 
-    'tr': '🇹🇷', 'ly': '🇱🇾', 'jo': '🇯🇴', 'bh': '🇧🇭', 'kw': '🇰🇼',
-    'ae': '🇦🇪', 'sa': '🇸🇦', 'qa': '🇶🇦', 'cn': '🇨🇳',
+    'us': '💵', 'eu': '💶', 'gb': '💷', 'eg': '🇪🇬', 'tn': '🇹🇳', 'tr': '✈️',
     'gold': '✨', 'silver': '🪙'
   };
 
   const sorted = [...updates].sort((a, b) => getBroadcastDisplayRank(a) - getBroadcastDisplayRank(b));
 
-  const cashAndCurrencies: typeof sorted = [];
-  const remittances: typeof sorted = [];
-  const metals: typeof sorted = [];
-  const others: typeof sorted = [];
-
-  for (const u of sorted) {
-    const id = (u.id || '').toUpperCase();
-    const rank = getBroadcastDisplayRank(u);
-    if (rank >= 80 && rank <= 89) {
-      remittances.push(u);
-    } else if ((rank >= 900 && rank <= 950) || id.startsWith('GOLD') || id.startsWith('SILVER')) {
-      metals.push(u);
-    } else if (rank < 80) {
-      cashAndCurrencies.push(u);
-    } else {
-      others.push(u);
-    }
-  }
-
-  const formatItemLine = (u: typeof sorted[0]) => {
+  const formatItemBlock = (u: typeof sorted[0]) => {
     const isUp = u.newVal > u.oldVal;
     const isDown = u.newVal < u.oldVal;
     const diff = Math.abs(u.newVal - u.oldVal);
@@ -1316,48 +1292,32 @@ export function formatSmartBroadcastMessage(updates: { id?: string; name: string
     if (u.id === 'USD' && !displayName.includes('كاش')) {
       displayName = 'دولار أمريكي (كاش)';
     } else if (u.id === 'USD_CHECKS' && !displayName.includes('صكوك')) {
-      displayName = 'دولار أمريكي (صكوك)';
+      displayName = 'دولار أمريكي (صكوك مصرفية)';
     }
 
     const isMetal = u.id?.startsWith('GOLD') || u.id?.startsWith('SILVER');
     const decimals = isMetal ? 2 : 3;
 
-    let changeText = '🟢 استقرار';
-    if (isUp) changeText = `🔺 +${diff.toFixed(decimals)} (كان ${u.oldVal.toFixed(decimals)})`;
-    if (isDown) changeText = `🔻 -${diff.toFixed(decimals)} (كان ${u.oldVal.toFixed(decimals)})`;
+    let changeText = `🟢 استقرار عند ${u.newVal.toFixed(decimals)} د.ل`;
+    if (isUp) {
+      changeText = `🔺 ارتفاع بمقدار ${diff.toFixed(decimals)} (كان ${u.oldVal.toFixed(decimals)})`;
+    } else if (isDown) {
+      changeText = `🔻 انخفاض بمقدار ${diff.toFixed(decimals)} (كان ${u.oldVal.toFixed(decimals)})`;
+    }
 
-    return `${fe} *${displayName}*: *${u.newVal.toFixed(decimals)} د.ل* | ${changeText}`;
+    return `${fe} *${displayName}*\n💵 السعر: *${u.newVal.toFixed(decimals)} د.ل*\n📊 التغير: ${changeText}`;
   };
 
-  let message = `📊 *مؤشر الدينار | النشرة الموحدة لأسعار السوق الموازي*\n`;
+  let message = `📊 *مؤشر الدينار | تحديث السوق الموازي*\n`;
   message += `━━━━━━━━━━━━━━━━━━━\n`;
   message += `📅 ${dayName}، ${dateStr} | ⏰ ${timeStr}\n\n`;
 
-  if (cashAndCurrencies.length > 0) {
-    message += `💵 *العملات النقدية (كاش وصكوك):*\n`;
-    message += cashAndCurrencies.map(formatItemLine).join('\n') + `\n\n`;
-  }
-
-  if (remittances.length > 0) {
-    message += `✈️ *أسعار الحوالات المالية الخارجية:*\n`;
-    message += remittances.map(formatItemLine).join('\n') + `\n\n`;
-  }
-
-  if (metals.length > 0) {
-    message += `✨ *سوق الذهب والفضة (مسبوك وكسر):*\n`;
-    message += metals.map(formatItemLine).join('\n') + `\n\n`;
-  }
-
-  if (others.length > 0) {
-    message += `🌐 *أسعار وعملات أخرى:*\n`;
-    message += others.map(formatItemLine).join('\n') + `\n\n`;
-  }
+  message += sorted.map(formatItemBlock).join('\n\n') + `\n\n`;
 
   message += `━━━━━━━━━━━━━━━━━━━\n`;
-  message += `📈 *الرسوم البيانية والمتابعة الحية لحظة بلحظة:*\n`;
-  const broadcastRandomNum = Math.floor(100000 + Math.random() * 900000);
-  message += `🌐 ${getPublicAppUrl()}/?r=${broadcastRandomNum}\n`;
-  message += `📱 *المصدر:* شبكة مؤشر الدينار | طرابلس`;
+  message += `🔗 *المتابعة الحية والرسوم البيانية:*\n`;
+  message += `🌐 https://tinyurl.com/2j7667u2\n`;
+  message += `📱 *المصدر:* شبكة مؤشر الدينار`;
 
   return message;
 }

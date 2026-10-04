@@ -79,8 +79,7 @@ export async function broadcastDailyReport() {
     }
   }
   
-  const reportRandomCode = Math.floor(100000 + Math.random() * 900000);
-  message += `━━━━━━━━━━━━━━━━━\n📡 *مؤشر الدينار | الدقة والسرعة*\n🔗 ${getPublicAppUrl()}/?r=${reportRandomCode}`;
+  message += `━━━━━━━━━━━━━━━━━\n📡 *مؤشر الدينار | الدقة والسرعة*\n🔗 https://tinyurl.com/2j7667u2`;
   
   try {
     await broadcastToSocialMedia(message, false);

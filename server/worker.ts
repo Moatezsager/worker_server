@@ -1,6 +1,8 @@
 import dotenv from "dotenv";
 dotenv.config({ override: true });
 
+import path from "path";
+import fs from "fs";
 import { createServer, Server as HttpServer } from "http";
 import express from "express";
 import compression from "compression";
@@ -201,6 +203,17 @@ export function createWorkerApp() {
       activeJobs: getWorkerJobsStatus(),
       lastUpdated: rates?.lastUpdated || new Date().toISOString()
     });
+  });
+
+  // Serve Social Preview Banner Image for OpenGraph Cards
+  app.get(["/banner.jpg", "/og-image.jpg", "/banner.png", "/og-image.png"], (req: express.Request, res: express.Response) => {
+    const bannerPath = path.join(process.cwd(), "src/assets/images/lyd_index_banner_1791112922432.jpg");
+    if (fs.existsSync(bannerPath)) {
+      res.setHeader("Content-Type", "image/jpeg");
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      return res.sendFile(bannerPath);
+    }
+    return res.status(404).end();
   });
 
   // Mount Interactive Dashboard UI and Telemetry API

@@ -319,7 +319,11 @@ export class TelegramManager {
           chat_id: target,
           text: message,
           parse_mode: options?.parseMode === 'html' ? 'HTML' : 'Markdown',
-          disable_web_page_preview: options?.linkPreview === false
+          link_preview_options: {
+            is_disabled: options?.linkPreview === false,
+            prefer_large_media: true,
+            show_above_text: false
+          }
         })
       });
       const data: any = await res.json();
@@ -337,7 +341,11 @@ export class TelegramManager {
           body: JSON.stringify({
             chat_id: target,
             text: plain,
-            disable_web_page_preview: options?.linkPreview === false
+            link_preview_options: {
+              is_disabled: options?.linkPreview === false,
+              prefer_large_media: true,
+              show_above_text: false
+            }
           })
         });
         const retryData: any = await retryRes.json();

@@ -129,7 +129,24 @@ export function renderDashboardHtml(initialState?: any): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>لوحة تحكم خادم العمليات والحسابات | LYD Worker Hub</title>
+  <title>مؤشر الدينار | تحديث أسعار العملات والذهب في ليبيا</title>
+  
+  <!-- OpenGraph & Social Link Preview Cards -->
+  <meta property="og:site_name" content="مؤشر الدينار">
+  <meta property="og:title" content="📊 مؤشر الدينار | أسعار العملات والذهب في ليبيا">
+  <meta property="og:description" content="تحديث حي ومباشر لأسعار الدولار واليورو والذهب والعملات في السوق الموازي والبنك المركزي طرابلس لحظة بلحظة.">
+  <meta property="og:image" content="https://worker-server-89vz.onrender.com/banner.jpg">
+  <meta property="og:image:secure_url" content="https://worker-server-89vz.onrender.com/banner.jpg">
+  <meta property="og:image:type" content="image/jpeg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:type" content="website">
+  
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="📊 مؤشر الدينار | أسعار العملات والذهب في ليبيا">
+  <meta name="twitter:description" content="تحديث حي ومباشر لأسعار الدولار واليورو والذهب والعملات في السوق الموازي طرابلس.">
+  <meta name="twitter:image" content="https://worker-server-89vz.onrender.com/banner.jpg">
   <style>
     /* ─── RESET & BASE CSS (100% Standalone - Zero Dependencies) ─── */
     *, *::before, *::after {
