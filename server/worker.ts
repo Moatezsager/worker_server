@@ -41,6 +41,7 @@ import {
 import cronRouter from "./routes/cron.routes";
 import systemRouter from "./routes/system.routes";
 import internalRouter from "./routes/internal.routes";
+import dashboardRouter from "./routes/dashboard.routes";
 
 // ─── Environment Validation on Bootstrap ───
 if (process.env.NODE_ENV === "production") {
@@ -172,7 +173,7 @@ export function createWorkerApp() {
   app.use(permissionsPolicyMiddleware);
 
   // Root health probes for Render / Cloud Run health checks
-  app.get(["/health", "/ping", "/", "/api/health"], (req: express.Request, res: express.Response) => {
+  app.get(["/health", "/ping", "/api/health"], (req: express.Request, res: express.Response) => {
     if (isShuttingDown) {
       return res.status(503).json({
         status: "shutting_down",
@@ -196,6 +197,9 @@ export function createWorkerApp() {
       lastUpdated: rates?.lastUpdated || new Date().toISOString()
     });
   });
+
+  // Mount Interactive Dashboard UI and Telemetry API
+  app.use(dashboardRouter);
 
   // Dedicated Worker Job Status endpoint
   app.get("/api/worker/jobs", (req: express.Request, res: express.Response) => {

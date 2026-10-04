@@ -11,6 +11,7 @@ import { rates } from "../state";
 import { getOrInitTelegramManager } from "../services/social.service";
 import { initializeTelegram, activeClient } from "../../telegramClient";
 import { whatsappManager, hasSavedSession } from "../services/whatsapp.service";
+import { addLog } from "../utils/logger";
 
 export type JobStatus = 'idle' | 'running' | 'timed_out' | 'failed' | 'success';
 
@@ -119,6 +120,7 @@ export async function runJobSafely<T>(
   job.runCount++;
 
   console.log(`[WorkerJob] ▶️ Starting job: '${jobName}' (#${job.runCount})`);
+  addLog("info", "المهام المجدولة", `بدء تنفيذ المهمة: [${jobName}] (تشغيل #${job.runCount})`);
 
   let timeoutHandle: NodeJS.Timeout | null = null;
   let isTimedOut = false;
@@ -159,6 +161,7 @@ export async function runJobSafely<T>(
     job.consecutiveFailures = 0;
 
     console.log(`[WorkerJob] ✅ Completed job: '${jobName}' in ${job.lastRunDurationMs}ms`);
+    addLog("success", "المهام المجدولة", `اكتملت المهمة بنجاح: [${jobName}] خلال ${job.lastRunDurationMs}ms`);
     return result;
   } catch (error: any) {
     const endTime = Date.now();

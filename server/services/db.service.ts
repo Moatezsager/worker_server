@@ -4,6 +4,7 @@ import { appConfig } from '../config';
 import { HistoryPoint, PriceChangeLog, RateMap, AppConfig } from '../types';
 import { isSignificantChange, METAL_IDS } from '../utils/helpers';
 import { updateStats } from './reporting.service';
+import { addLog } from '../utils/logger';
 
 export let lastRatesFetchTime = 0;
 export const RATES_CACHE_TTL = 30 * 1000; // 30 seconds
@@ -55,6 +56,7 @@ export async function loadWorkerStateFromSupabase<T = any>(key: string): Promise
 }
 
 export async function logErrorArabic(message: string, context = "النظام", stack?: string, url?: string) {
+  addLog("error", context, message, stack);
   if (!supabase || !supabaseKey || supabaseKey.includes('dummy')) {
     console.error(`[ArabicLog] ${context}: ${message}`);
     return;
