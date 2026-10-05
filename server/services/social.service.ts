@@ -799,8 +799,7 @@ export let lastOfficialBroadcastDate = "";
 })();
 
 // Smart Queue (Debounce Buffer) to aggregate rapid price updates safely
-export let broadcastQueue: Map<string, { id?: string, name: string, oldVal: number, newVal: number, flag: string }> = new Map();
-export let broadcastQueueTimer: NodeJS.Timeout | null = null;
+
 
 const OFFICIAL_CURRENCIES_INFO: Record<string, { name: string; flag: string; rank: number }> = {
   USD: { name: 'دولار أمريكي', flag: '🇺🇸', rank: 1 },
@@ -1119,14 +1118,18 @@ export async function processSmartBroadcastQueue(): Promise<boolean> {
   }
 
   console.log(`[SmartBroadcastQueue] 🚀 Cooldown clear! Dispatching consolidated bulletin for ${toBroadcast.length} currencies...`);
-  smartBroadcastQueue.clear();
-
   const resolvedTarget: 'all' | 'telegram' | 'facebook' =
     (appConfig.telegramAutoPost && appConfig.facebookAutoPost) ? 'all'
     : appConfig.telegramAutoPost ? 'telegram'
     : 'facebook';
 
-  await executeBroadcast(toBroadcast, false, resolvedTarget, true, false);
+  try {
+    await executeBroadcast(toBroadcast, false, resolvedTarget, true, false);
+    smartBroadcastQueue.clear(); // ← يُمسح فقط بعد نجاح النشر
+  } catch (err) {
+    console.error('[SmartBroadcastQueue] executeBroadcast failed. Retaining queue items for next cycle.', err);
+    // Queue محتفظ به للمحاولة التالية عبر الـ watchdog
+  }
   return true;
 }
 

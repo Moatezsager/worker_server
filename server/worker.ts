@@ -25,6 +25,7 @@ import { whatsappManager, hasSavedSession } from "./services/whatsapp.service";
 import { activeClient, initializeTelegram } from "../telegramClient";
 import { rates } from "./state";
 import { db } from "./db";
+import { notifyWebServer } from './utils/notify';
 
 // Middlewares
 import {
@@ -300,6 +301,7 @@ export async function startWorkerServer() {
             console.log("[Worker Startup] Initial changes detected! Saving to Supabase database...");
             const saveType = (officialChanged && parallelChanged) ? "both" : (officialChanged ? "official" : "parallel");
             await saveToSupabase(saveType);
+            await notifyWebServer(rates);
           }
         }
       }, { timeoutMs: 60000 });
