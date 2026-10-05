@@ -346,6 +346,60 @@ export function renderDashboardHtml(initialState?: any): string {
       border-color: #059669;
     }
 
+    /* ─── DEDICATED MANUAL EDITABLE TABLE ─── */
+    .manual-table-wrapper {
+      width: 100%;
+      overflow-x: auto;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      background: #0f172a;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+    }
+    .manual-table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: right;
+      font-size: 13px;
+    }
+    .manual-table th {
+      background: #1e293b;
+      color: #94a3b8;
+      font-weight: 700;
+      font-size: 12px;
+      padding: 12px 14px;
+      border-bottom: 1px solid #334155;
+      white-space: nowrap;
+    }
+    .manual-table td {
+      padding: 10px 14px;
+      border-bottom: 1px solid #1e293b;
+      vertical-align: middle;
+    }
+    .manual-table tr:hover {
+      background: rgba(30, 41, 59, 0.45);
+    }
+    .manual-table tr.manual-row-selected {
+      background: rgba(16, 185, 129, 0.05);
+    }
+    .manual-table-input {
+      background: #020617;
+      border: 1px solid #38bdf8;
+      border-radius: 6px;
+      color: #ffffff;
+      font-weight: 700;
+      font-size: 15px;
+      padding: 7px 12px;
+      width: 140px;
+      text-align: center;
+      transition: all 0.15s ease;
+    }
+    .manual-table-input:focus {
+      outline: none;
+      border-color: #10b981;
+      box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.25);
+      background: #0f172a;
+    }
+
     /* ─── RATES CARDS ─── */
     .rates-grid {
       display: grid;
@@ -729,6 +783,7 @@ export function renderDashboardHtml(initialState?: any): string {
     <!-- TABS BAR (EXPANDED TO INCLUDE SETTINGS, ACCOUNTS AND INGESTION) -->
     <div class="tabs-nav">
       <button class="tab-item active" onclick="switchTab('rates')" id="tab-btn-rates">📊 الأسعار</button>
+      <button class="tab-item" onclick="switchTab('manual')" id="tab-btn-manual" style="background:#0284c7; color:#fff; border-color:#38bdf8;">✏️ التحديث اليدوي والنشر</button>
       <button class="tab-item" onclick="switchTab('settings')" id="tab-btn-settings">⚙️ إعدادات العملات والشروط</button>
       <button class="tab-item" onclick="switchTab('sources')" id="tab-btn-sources">📡 مصادر القنوات والواتساب</button>
       <button class="tab-item" onclick="switchTab('accounts')" id="tab-btn-accounts">🔗 الحسابات والربط</button>
@@ -742,12 +797,22 @@ export function renderDashboardHtml(initialState?: any): string {
     <div id="tab-content-rates">
       
       <!-- Quick Action Buttons -->
-      <div style="display:grid; grid-template-columns:repeat(2, 1fr); gap:8px; margin-bottom:12px;">
+      <div style="display:grid; grid-template-columns:repeat(2, 1fr); gap:8px; margin-bottom:8px;">
         <button class="btn btn-action" onclick="triggerJob('cbl', 'جلب مصرف ليبيا المركزي')">
           🏦 جلب أسعار CBL
         </button>
         <button class="btn btn-action" onclick="triggerJob('telegram', 'جلب أسعار تيليجرام')">
           📱 جلب تيليجرام الموازي
+        </button>
+      </div>
+
+      <!-- Manual Price Entry & Intelligent Auto-Broadcast Buttons -->
+      <div style="display:grid; grid-template-columns:repeat(2, 1fr); gap:8px; margin-bottom:14px;">
+        <button class="btn btn-primary" onclick="switchTab('manual'); selectManualCategory('currencies');" style="background: linear-gradient(135deg, #0284c7, #0369a1); border-color: #38bdf8; font-size: 13px; font-weight: 700; padding: 10px 12px; box-shadow: 0 4px 12px rgba(2,132,199,0.25);">
+          💵 جدول تعديل ونشر العملات
+        </button>
+        <button class="btn btn-primary" onclick="switchTab('manual'); selectManualCategory('metals');" style="background: linear-gradient(135deg, #d97706, #b45309); border-color: #fbbf24; font-size: 13px; font-weight: 700; padding: 10px 12px; box-shadow: 0 4px 12px rgba(217,119,6,0.25);">
+          🪙 جدول تعديل ونشر المعادن
         </button>
       </div>
 
@@ -779,6 +844,109 @@ export function renderDashboardHtml(initialState?: any): string {
         <div class="rates-grid" id="grid-cbl">
           ${preCblHtml || '<div style="color: #94a3b8; font-size: 12px;">جاري تحميل أسعار المصرف...</div>'}
         </div>
+      </div>
+
+    </div>
+
+    <!-- DEDICATED INDEPENDENT TAB: MANUAL PRICE ENTRY & SMART BROADCAST -->
+    <div id="tab-content-manual" class="hidden">
+
+      <!-- Section Header Card -->
+      <div class="section-card" style="margin-bottom: 14px;">
+        <div class="section-header" style="flex-wrap: wrap; gap: 8px;">
+          <div>
+            <div class="section-title" style="display:flex; align-items:center; gap:8px;">
+              <span>✏️ قسم التدخل والتحديث اليدوي للأسعار والنشر الذكي</span>
+            </div>
+            <div style="font-size: 11px; color: #94a3b8; margin-top: 4px; max-width: 720px; line-height: 1.6;">
+              قسم مستقل للتحكم وتحديث أسعار العملات أو المعادن بشكل جماعي أو فردي. اختر جدول العملات أو جدول المعادن لتحرير الأسعار بسهولة، حدد الأصناف المراد نشرها، أدخل الأسعار الجديدة، واحفظها فوراً في قاعدة البيانات مع النشر التلقائي الذكي بتسلسل دقيق على القنوات.
+            </div>
+          </div>
+        </div>
+
+        <!-- The Two Main Category Buttons (Currencies vs Metals) -->
+        <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 14px;">
+          <button id="manual-cat-btn-currencies" class="btn" onclick="selectManualCategory('currencies')" style="background: linear-gradient(135deg, #0284c7, #0369a1); border: 2px solid #38bdf8; color: #ffffff; font-size: 14px; font-weight: 700; padding: 12px 14px; border-radius: 10px; display: flex; align-items: center; justify-content: center; gap: 8px; box-shadow: 0 4px 14px rgba(2,132,199,0.3);">
+            <span style="font-size: 20px;">💵</span>
+            <span>جدول أسعار العملات في السوق الموازي</span>
+          </button>
+          <button id="manual-cat-btn-metals" class="btn" onclick="selectManualCategory('metals')" style="background: #1e293b; border: 1px solid #334155; color: #cbd5e1; font-size: 14px; font-weight: 700; padding: 12px 14px; border-radius: 10px; display: flex; align-items: center; justify-content: center; gap: 8px; transition: all 0.2s ease;">
+            <span style="font-size: 20px;">🪙</span>
+            <span>جدول أسعار الذهب والمعادن الثمينة</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Table Toolbar Card: Search, Select/Deselect All, Broadcast Settings -->
+      <div class="section-card" style="margin-bottom: 14px;">
+        <div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; padding-bottom: 12px; border-bottom: 1px solid #334155;">
+          
+          <!-- Select All / Deselect All / Reset -->
+          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <button class="btn btn-secondary btn-sm" onclick="toggleAllManualRows(true)">
+              ☑️ تحديد الكل
+            </button>
+            <button class="btn btn-secondary btn-sm" onclick="toggleAllManualRows(false)">
+              ◻️ إلغاء تحديد الكل
+            </button>
+            <button class="btn btn-secondary btn-sm" onclick="resetManualTableToCurrentPrices()">
+              🔄 استعادة الأسعار الأصلية
+            </button>
+            <div style="font-size: 12px; color: #cbd5e1; margin-right: 6px;">
+              المحدد: <strong id="manual-table-selected-badge" class="font-num" style="color: #10b981; font-size: 14px;">0</strong> من <span id="manual-table-total-badge" class="font-num">0</span> صنف
+            </div>
+          </div>
+
+          <!-- Quick Filter Input -->
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <input type="text" id="manual-table-search-input" class="form-input" placeholder="🔍 تصفية الجدول بالاسم أو الكود..." style="width: 220px; font-size: 12px; padding: 6px 10px;" oninput="filterManualTableRows()">
+          </div>
+        </div>
+
+        <!-- Publishing Controls & Big Save Button -->
+        <div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; margin-top: 12px;">
+          <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
+            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; color: #f8fafc; font-weight: 700;">
+              <input type="checkbox" id="manual-table-auto-broadcast" checked style="accent-color: #10b981; width: 18px; height: 18px; cursor: pointer;">
+              <span>📢 نشر تلقائي فوري بعد الحفظ بتسلسل احترافي</span>
+            </label>
+
+            <div style="display: flex; align-items: center; gap: 6px;">
+              <span style="font-size: 12px; color: #94a3b8;">منصة النشر:</span>
+              <select id="manual-table-broadcast-target" class="form-input" style="font-size: 12px; padding: 5px 8px; width: auto;">
+                <option value="all">📱 تيليجرام + فيسبوك (الكل)</option>
+                <option value="telegram">✈️ تيليجرام فقط</option>
+                <option value="facebook">📘 فيسبوك فقط</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- Primary Save & Publish Button -->
+          <button class="btn btn-primary" onclick="submitManualTableRates()" id="btn-manual-table-submit" style="font-size: 13px; font-weight: 700; padding: 10px 18px; box-shadow: 0 4px 14px rgba(16,185,129,0.3);">
+            💾 حفظ التعديلات ونشر النشرة الآن
+          </button>
+        </div>
+      </div>
+
+      <!-- Editable Table Container -->
+      <div class="manual-table-wrapper" style="margin-bottom: 20px;">
+        <table class="manual-table">
+          <thead>
+            <tr>
+              <th style="width: 45px; text-align: center;">
+                <input type="checkbox" id="manual-th-select-all" checked onchange="toggleAllManualRows(this.checked)" style="accent-color: #10b981; width: 17px; height: 17px; cursor: pointer;" title="تحديد / إلغاء تحديد الكل">
+              </th>
+              <th style="min-width: 170px;">الصنف / العملة</th>
+              <th style="min-width: 110px; text-align: center;">السعر الحالي المسجل</th>
+              <th style="min-width: 160px; text-align: center;">السعر الجديد (مربع التحرير)</th>
+              <th style="min-width: 120px; text-align: center;">مؤشر التغير اللحظي</th>
+              <th style="min-width: 100px; text-align: center;">حالة التضمين</th>
+            </tr>
+          </thead>
+          <tbody id="manual-table-tbody">
+            <!-- Rendered dynamically -->
+          </tbody>
+        </table>
       </div>
 
     </div>
@@ -1273,6 +1441,80 @@ export function renderDashboardHtml(initialState?: any): string {
     </div>
   </div>
 
+  <!-- MANUAL BATCH RATES & AUTO-BROADCAST MODAL -->
+  <div id="manual-batch-modal" class="modal-overlay hidden">
+    <div class="modal-box modal-box-large" style="max-width:760px; max-height:92vh; display:flex; flex-direction:column; padding:0; overflow:hidden;">
+      
+      <!-- Modal Header -->
+      <div style="padding:14px 18px; background:#0f172a; border-bottom:1px solid #334155; display:flex; justify-content:space-between; align-items:center;">
+        <div>
+          <div style="font-size:16px; font-weight:800; color:#ffffff; display:flex; align-items:center; gap:8px;" id="batch-modal-title">
+            <span>💵 تحديث ونشر أسعار العملات يدوياً</span>
+          </div>
+          <div style="font-size:11px; color:#94a3b8; margin-top:2px;" id="batch-modal-subtitle">
+            حدد الأصناف المراد تحديثها، أدخل القيم الجديدة، ثم احفظها في قاعدة البيانات وانشرها بتسلسل احترافي.
+          </div>
+        </div>
+        <button class="btn btn-secondary btn-sm" onclick="closeManualBatchModal()" style="padding:3px 8px; font-size:14px;">✕</button>
+      </div>
+
+      <!-- Modal Toolbar: Select/Deselect, Search, Counters -->
+      <div style="padding:10px 18px; background:#1e293b; border-bottom:1px solid #334155; display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:8px;">
+        <div style="display:flex; gap:6px; align-items:center;">
+          <button class="btn btn-secondary btn-sm" onclick="selectAllBatchItems(true)" style="font-size:11px; padding:4px 8px;">
+            ☑️ تحديد الكل
+          </button>
+          <button class="btn btn-secondary btn-sm" onclick="selectAllBatchItems(false)" style="font-size:11px; padding:4px 8px;">
+            ◻️ إلغاء تحديد الكل
+          </button>
+          <span style="font-size:12px; color:#cbd5e1; margin-right:4px;">
+            المحدد: <strong id="batch-selected-count" class="font-num" style="color:#10b981;">0</strong> / <span id="batch-total-count" class="font-num">0</span>
+          </span>
+        </div>
+
+        <div style="display:flex; gap:6px; align-items:center;">
+          <input type="text" id="batch-search-input" class="form-input" placeholder="🔍 تصفية بالاسم أو الكود..." style="font-size:11px; padding:4px 10px; width:160px;" oninput="filterBatchModalItems()">
+        </div>
+      </div>
+
+      <!-- Broadcast Options Bar -->
+      <div style="padding:8px 18px; background:#0f172a; border-bottom:1px solid #334155; display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:8px;">
+        <label style="display:flex; align-items:center; gap:6px; cursor:pointer; font-size:12px; color:#f1f5f9; font-weight:600;">
+          <input type="checkbox" id="batch-auto-broadcast" checked style="accent-color:#10b981; width:17px; height:17px;">
+          <span>📢 نشر تلقائي فوري بعد الحفظ على القنوات</span>
+        </label>
+
+        <div style="display:flex; align-items:center; gap:6px;">
+          <label style="font-size:11px; color:#94a3b8;">منصة النشر:</label>
+          <select id="batch-broadcast-target" class="form-input" style="font-size:11px; padding:4px 8px; width:auto;">
+            <option value="all">📱 تيليجرام + فيسبوك (الكل)</option>
+            <option value="telegram">✈️ تيليجرام فقط</option>
+            <option value="facebook">📘 فيسبوك فقط</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Items List Container (Scrollable) -->
+      <div id="batch-items-container" style="flex:1; overflow-y:auto; padding:12px 18px; display:flex; flex-direction:column; gap:8px; max-height:480px;">
+        <!-- Rendered dynamically -->
+      </div>
+
+      <!-- Modal Footer -->
+      <div style="padding:12px 18px; background:#0f172a; border-top:1px solid #334155; display:flex; justify-content:space-between; align-items:center;">
+        <div style="font-size:11px; color:#64748b;" id="batch-footer-hint">
+          * يتم تحديث قاعدة البيانات ومزامنة موقع الويب وإرسال إشعار فوري للمشتركين.
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-secondary" onclick="closeManualBatchModal()">إلغاء</button>
+          <button class="btn btn-primary" onclick="submitManualBatchRates()" id="btn-submit-batch">
+            💾 حفظ ونشر الآن
+          </button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
   <!-- CURRENCY TERM ADD/EDIT MODAL -->
   <div id="term-modal" class="modal-overlay hidden">
     <div class="modal-box modal-box-large">
@@ -1444,6 +1686,9 @@ export function renderDashboardHtml(initialState?: any): string {
       if (activeSec) activeSec.classList.remove('hidden');
       if (activeBtn) activeBtn.classList.add('active');
 
+      if (tabId === 'manual') {
+        renderManualTable();
+      }
       if (tabId === 'ingested') {
         fetchIngestedMessages();
       }
@@ -2223,6 +2468,617 @@ export function renderDashboardHtml(initialState?: any): string {
         }
       } catch (err) {
         showToast('خطأ: ' + err.message, true);
+      }
+    }
+
+    // ─── Manual Batch Rates Entry & Intelligent Auto-Broadcast ───
+    let activeBatchCategory = 'currencies'; // 'currencies' | 'metals'
+    let batchItemsState = [];
+
+    const CURRENCY_DEFINITIONS = [
+      { code: 'USD', name: 'دولار أمريكي (كاش)', flag: 'us', decimals: 3 },
+      { code: 'USD_CHECKS', name: 'دولار أمريكي (صكوك)', flag: 'us', decimals: 3 },
+      { code: 'EUR', name: 'يورو أوروبي', flag: 'eu', decimals: 3 },
+      { code: 'GBP', name: 'جنيه إسترليني', flag: 'gb', decimals: 3 },
+      { code: 'TND', name: 'دينار تونسي', flag: 'tn', decimals: 3 },
+      { code: 'EGP', name: 'جنيه مصري', flag: 'eg', decimals: 3 },
+      { code: 'TRY', name: 'ليرة تركية', flag: 'tr', decimals: 3 },
+      { code: 'JOD', name: 'دينار أردني', flag: 'jo', decimals: 3 },
+      { code: 'AED', name: 'درهم إماراتي', flag: 'ae', decimals: 3 },
+      { code: 'SAR', name: 'ريال سعودي', flag: 'sa', decimals: 3 },
+      { code: 'QAR', name: 'ريال قطري', flag: 'qa', decimals: 3 },
+      { code: 'KWD', name: 'دينار كويتي', flag: 'kw', decimals: 3 },
+      { code: 'BHD', name: 'دينار بحريني', flag: 'bh', decimals: 3 },
+      { code: 'USD_TR', name: 'حوالات تركيا', flag: 'tr', decimals: 3 },
+      { code: 'USD_AE', name: 'حوالات دبي', flag: 'ae', decimals: 3 },
+      { code: 'USD_CN', name: 'حوالات الصين', flag: 'cn', decimals: 3 },
+      { code: 'CNY', name: 'يوان صيني', flag: 'cn', decimals: 3 }
+    ];
+
+    const METAL_DEFINITIONS = [
+      { code: 'GOLD_SCRAP_18', name: 'ذهب كسر 18', flag: 'gold', decimals: 2 },
+      { code: 'GOLD_SCRAP_21', name: 'ذهب كسر 21', flag: 'gold', decimals: 2 },
+      { code: 'GOLD_CAST_18', name: 'ذهب مسبوك 18 (سبائك)', flag: 'gold', decimals: 2 },
+      { code: 'GOLD_CAST_21', name: 'ذهب مسبوك 21 (سبائك)', flag: 'gold', decimals: 2 },
+      { code: 'GOLD_CAST_24', name: 'ذهب مسبوك 24 (سبائك)', flag: 'gold', decimals: 2 },
+      { code: 'GOLD_EXT_18', name: 'ذهب خارجي 18', flag: 'gold', decimals: 2 },
+      { code: 'GOLD_EXT_21', name: 'ذهب خارجي 21', flag: 'gold', decimals: 2 },
+      { code: 'GOLD_LIRA_8G', name: 'ليرة ذهب (8 جرام)', flag: 'gold', decimals: 2 },
+      { code: 'GOLD_LIRA_14G', name: 'ليرة ذهب (14 جرام)', flag: 'gold', decimals: 2 },
+      { code: 'GOLD_MUJARA_14G', name: 'مجارة ذهب (14 جرام)', flag: 'gold', decimals: 2 },
+      { code: 'SILVER_CAST_1000', name: 'مسبوك فضة 1000', flag: 'silver', decimals: 2 },
+      { code: 'SILVER_SCRAP', name: 'فضة كسر (جرام)', flag: 'silver', decimals: 2 }
+    ];
+
+    function openManualBatchModal(category) {
+      activeBatchCategory = category || 'currencies';
+      const isMetals = activeBatchCategory === 'metals';
+
+      const titleEl = document.getElementById('batch-modal-title');
+      const subtitleEl = document.getElementById('batch-modal-subtitle');
+      const searchInput = document.getElementById('batch-search-input');
+      const modal = document.getElementById('manual-batch-modal');
+
+      if (titleEl) {
+        titleEl.innerHTML = isMetals 
+          ? '<span style="font-size:20px;">🪙</span><span>تحديث ونشر أسعار المعادن والذهب يدوياً</span>'
+          : '<span style="font-size:20px;">💵</span><span>تحديث ونشر أسعار العملات يدوياً</span>';
+      }
+      if (subtitleEl) {
+        subtitleEl.textContent = isMetals
+          ? 'حدد أصناف الذهب والفضة، أدخل الأسعار الجديدة، وسيتم حفظها في قاعدة البيانات ونشر نشرة احترافية مخصصة للمعادن.'
+          : 'حدد العملات المراد تحديثها، أدخل الأسعار الجديدة، وسيتم حفظها في قاعدة البيانات ونشر نشرة السوق الموازي بتسلسل دقيق.';
+      }
+      if (searchInput) searchInput.value = '';
+
+      const defs = isMetals ? METAL_DEFINITIONS : CURRENCY_DEFINITIONS;
+      const seenCodes = new Set();
+      batchItemsState = [];
+
+      const currentParallel = (currentRates && currentRates.parallel) ? currentRates.parallel : {};
+
+      for (const def of defs) {
+        seenCodes.add(def.code.toUpperCase());
+        const curVal = Number(currentParallel[def.code] || currentParallel[def.code.toLowerCase()] || 0);
+        batchItemsState.push({
+          code: def.code,
+          name: def.name,
+          flag: def.flag,
+          decimals: def.decimals,
+          oldRate: curVal,
+          newRate: curVal,
+          selected: curVal > 0
+        });
+      }
+
+      // Check any terms from currentTerms that fit this category but weren't in default definitions
+      if (Array.isArray(currentTerms)) {
+        for (const t of currentTerms) {
+          const tId = t.id.toUpperCase();
+          if (seenCodes.has(tId)) continue;
+          if (tId === 'OFFICIAL_USD') continue;
+
+          const isMetalTerm = (t.flag === 'gold' || t.flag === 'silver' || tId.startsWith('GOLD_') || tId.startsWith('SILVER_'));
+          if ((isMetals && isMetalTerm) || (!isMetals && !isMetalTerm)) {
+            seenCodes.add(tId);
+            const curVal = Number(currentParallel[t.id] || currentParallel[t.id.toLowerCase()] || 0);
+            batchItemsState.push({
+              code: t.id,
+              name: t.name,
+              flag: t.flag || (isMetals ? 'gold' : 'us'),
+              decimals: isMetals ? 2 : 3,
+              oldRate: curVal,
+              newRate: curVal,
+              selected: curVal > 0
+            });
+          }
+        }
+      }
+
+      renderBatchModalItems();
+      if (modal) modal.classList.remove('hidden');
+    }
+
+    function closeManualBatchModal() {
+      const modal = document.getElementById('manual-batch-modal');
+      if (modal) modal.classList.add('hidden');
+    }
+
+    function selectAllBatchItems(selectAll) {
+      for (const item of batchItemsState) {
+        item.selected = Boolean(selectAll);
+      }
+      renderBatchModalItems();
+    }
+
+    function filterBatchModalItems() {
+      renderBatchModalItems();
+    }
+
+    function onBatchItemPriceChange(code, val) {
+      const item = batchItemsState.find(i => i.code === code);
+      if (!item) return;
+      const num = parseFloat(val);
+      item.newRate = isNaN(num) ? 0 : num;
+      if (item.newRate > 0) {
+        item.selected = true;
+        const chk = document.getElementById('batch-chk-' + code);
+        if (chk) chk.checked = true;
+      }
+      updateBatchItemRowDiff(item);
+      updateBatchCounts();
+    }
+
+    function toggleBatchItemSelection(code, forceVal) {
+      const item = batchItemsState.find(i => i.code === code);
+      if (!item) return;
+      if (typeof forceVal === 'boolean') {
+        item.selected = forceVal;
+      } else {
+        item.selected = !item.selected;
+      }
+      updateBatchCounts();
+    }
+
+    function updateBatchCounts() {
+      const selectedCount = batchItemsState.filter(i => i.selected).length;
+      const totalCount = batchItemsState.length;
+      const selBadge = document.getElementById('batch-selected-count');
+      const totBadge = document.getElementById('batch-total-count');
+      if (selBadge) selBadge.textContent = String(selectedCount);
+      if (totBadge) totBadge.textContent = String(totalCount);
+    }
+
+    function updateBatchItemRowDiff(item) {
+      const diffBadge = document.getElementById('batch-diff-' + item.code);
+      if (!diffBadge) return;
+
+      const oldR = Number(item.oldRate) || 0;
+      const newR = Number(item.newRate) || 0;
+
+      if (newR <= 0) {
+        diffBadge.innerHTML = '<span style="color:#64748b; font-size:11px;">--</span>';
+        return;
+      }
+
+      const diff = newR - oldR;
+      const absDiff = Math.abs(diff);
+      const dec = item.decimals || 3;
+
+      if (oldR > 0 && Math.abs(diff) >= 0.0001) {
+        if (diff > 0) {
+          diffBadge.innerHTML = '<span style="color:#34d399; font-weight:700; font-size:11px; background:rgba(16,185,129,0.15); padding:2px 6px; border-radius:4px;">🔺 +' + absDiff.toFixed(dec) + '</span>';
+        } else {
+          diffBadge.innerHTML = '<span style="color:#f87171; font-weight:700; font-size:11px; background:rgba(244,63,94,0.15); padding:2px 6px; border-radius:4px;">🔻 -' + absDiff.toFixed(dec) + '</span>';
+        }
+      } else {
+        diffBadge.innerHTML = '<span style="color:#94a3b8; font-size:11px; background:rgba(148,163,184,0.1); padding:2px 6px; border-radius:4px;">🟢 استقرار</span>';
+      }
+    }
+
+    function renderBatchModalItems() {
+      const container = document.getElementById('batch-items-container');
+      if (!container) return;
+
+      const q = (document.getElementById('batch-search-input')?.value || '').trim().toLowerCase();
+      const filtered = q
+        ? batchItemsState.filter(i => i.name.toLowerCase().includes(q) || i.code.toLowerCase().includes(q))
+        : batchItemsState;
+
+      updateBatchCounts();
+
+      if (filtered.length === 0) {
+        container.innerHTML = '<div style="color:#94a3b8; font-size:12px; text-align:center; padding:25px;">لا توجد عناصر مطابقة لبحثك</div>';
+        return;
+      }
+
+      let html = '';
+      for (const item of filtered) {
+        const flagIcon = getFlagEmoji(item.flag);
+        const dec = item.decimals || (activeBatchCategory === 'metals' ? 2 : 3);
+        const oldR = Number(item.oldRate) || 0;
+        const newR = Number(item.newRate) || oldR;
+
+        const isUp = oldR > 0 && newR > oldR;
+        const isDown = oldR > 0 && newR < oldR;
+        const diff = Math.abs(newR - oldR);
+
+        let diffHtml = '<span style="color:#94a3b8; font-size:11px; background:rgba(148,163,184,0.1); padding:2px 6px; border-radius:4px;">🟢 استقرار</span>';
+        if (oldR > 0 && Math.abs(newR - oldR) >= 0.0001) {
+          if (isUp) {
+            diffHtml = '<span style="color:#34d399; font-weight:700; font-size:11px; background:rgba(16,185,129,0.15); padding:2px 6px; border-radius:4px;">🔺 +' + diff.toFixed(dec) + '</span>';
+          } else if (isDown) {
+            diffHtml = '<span style="color:#f87171; font-weight:700; font-size:11px; background:rgba(244,63,94,0.15); padding:2px 6px; border-radius:4px;">🔻 -' + diff.toFixed(dec) + '</span>';
+          }
+        }
+
+        html += '<div style="display:flex; align-items:center; justify-content:space-between; gap:10px; background:#1e293b; border:1px solid #334155; border-radius:8px; padding:10px 12px; transition:border 0.15s;" id="batch-row-' + item.code + '">' +
+          '<div style="display:flex; align-items:center; gap:10px; flex:1; min-width:0;">' +
+            '<input type="checkbox" id="batch-chk-' + item.code + '" ' + (item.selected ? 'checked' : '') + ' onchange="toggleBatchItemSelection(&quot;' + item.code + '&quot;, this.checked)" style="accent-color:#10b981; width:18px; height:18px; cursor:pointer;">' +
+            '<span style="font-size:18px;">' + flagIcon + '</span>' +
+            '<div style="min-width:0; flex:1;">' +
+              '<div style="display:flex; align-items:center; gap:6px;">' +
+                '<span style="font-size:13px; font-weight:700; color:#f8fafc;">' + item.name + '</span>' +
+                '<span style="font-size:10px; background:#0f172a; color:#94a3b8; border:1px solid #334155; border-radius:4px; padding:1px 5px; font-family:monospace;">' + item.code + '</span>' +
+              '</div>' +
+              '<div style="font-size:11px; color:#94a3b8; margin-top:2px;">' +
+                'السعر المسجل: <span class="font-num" style="color:#cbd5e1; font-weight:600;">' + (oldR > 0 ? oldR.toFixed(dec) : 'غير محدد') + ' د.ل</span>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
+
+          '<div style="display:flex; align-items:center; gap:8px;">' +
+            '<div id="batch-diff-' + item.code + '" style="min-width:70px; text-align:center;">' + diffHtml + '</div>' +
+            '<div style="display:flex; align-items:center; gap:4px;">' +
+              '<input type="number" step="any" id="batch-input-' + item.code + '" value="' + (newR > 0 ? newR : '') + '" placeholder="' + (oldR > 0 ? oldR.toFixed(dec) : '0.00') + '" class="form-input font-num" style="width:115px; font-size:14px; font-weight:700; text-align:center; padding:6px 8px; border-color:#38bdf8;" oninput="onBatchItemPriceChange(&quot;' + item.code + '&quot;, this.value)">' +
+              '<span style="font-size:11px; color:#94a3b8;">د.ل</span>' +
+            '</div>' +
+          '</div>' +
+        '</div>';
+      }
+
+      container.innerHTML = html;
+    }
+
+    async function submitManualBatchRates() {
+      const selectedItems = batchItemsState.filter(i => i.selected && i.newRate > 0);
+      if (selectedItems.length === 0) {
+        showToast('يرجى تحديد عنصر واحد على الأقل وإدخال سعر صحيح أكبر من الصفر', true);
+        return;
+      }
+
+      const autoBroadcast = Boolean(document.getElementById('batch-auto-broadcast')?.checked);
+      const broadcastTarget = document.getElementById('batch-broadcast-target')?.value || 'all';
+      const submitBtn = document.getElementById('btn-submit-batch');
+
+      if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.textContent = '⏳ جاري الحفظ والنشر...';
+      }
+
+      showToast('جاري حفظ الأسعار ومزامنة قاعدة البيانات والنشر...');
+
+      try {
+        const res = await fetch('/api/dashboard/manual-rates-batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            category: activeBatchCategory,
+            items: selectedItems,
+            autoBroadcast,
+            broadcastTarget
+          })
+        });
+
+        const data = await res.json();
+        if (data.success) {
+          showToast(data.message || 'تم حفظ ونشر الأسعار بنجاح!');
+          closeManualBatchModal();
+          fetchDashboardData();
+        } else {
+          showToast(data.error || 'فشل تحديث الأسعار', true);
+        }
+      } catch (err) {
+        showToast('خطأ أثناء إرسال البيانات: ' + err.message, true);
+      } finally {
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          submitBtn.textContent = '💾 حفظ ونشر الآن';
+        }
+      }
+    }
+
+    // ─── DEDICATED MANUAL RATES SECTION & EDITABLE TABLE ───
+    let manualCategory = 'currencies'; // 'currencies' | 'metals'
+    let manualTableRows = [];
+
+    function selectManualCategory(cat) {
+      manualCategory = cat || 'currencies';
+      const isMetals = manualCategory === 'metals';
+
+      const btnCur = document.getElementById('manual-cat-btn-currencies');
+      const btnMet = document.getElementById('manual-cat-btn-metals');
+
+      if (btnCur && btnMet) {
+        if (isMetals) {
+          btnCur.style.background = '#1e293b';
+          btnCur.style.border = '1px solid #334155';
+          btnCur.style.color = '#cbd5e1';
+          btnCur.style.boxShadow = 'none';
+
+          btnMet.style.background = 'linear-gradient(135deg, #d97706, #b45309)';
+          btnMet.style.border = '2px solid #fbbf24';
+          btnMet.style.color = '#ffffff';
+          btnMet.style.boxShadow = '0 4px 14px rgba(217,119,6,0.35)';
+        } else {
+          btnMet.style.background = '#1e293b';
+          btnMet.style.border = '1px solid #334155';
+          btnMet.style.color = '#cbd5e1';
+          btnMet.style.boxShadow = 'none';
+
+          btnCur.style.background = 'linear-gradient(135deg, #0284c7, #0369a1)';
+          btnCur.style.border = '2px solid #38bdf8';
+          btnCur.style.color = '#ffffff';
+          btnCur.style.boxShadow = '0 4px 14px rgba(2,132,199,0.35)';
+        }
+      }
+
+      loadManualTableData();
+    }
+
+    function loadManualTableData() {
+      const isMetals = manualCategory === 'metals';
+      const defs = isMetals ? METAL_DEFINITIONS : CURRENCY_DEFINITIONS;
+      const seenCodes = new Set();
+      manualTableRows = [];
+
+      const currentParallel = (currentRates && currentRates.parallel) ? currentRates.parallel : {};
+
+      for (const def of defs) {
+        seenCodes.add(def.code.toUpperCase());
+        const curVal = Number(currentParallel[def.code] || currentParallel[def.code.toLowerCase()] || 0);
+        manualTableRows.push({
+          code: def.code,
+          name: def.name,
+          flag: def.flag,
+          decimals: def.decimals,
+          oldRate: curVal,
+          newRate: curVal,
+          selected: curVal > 0
+        });
+      }
+
+      if (Array.isArray(currentTerms)) {
+        for (const t of currentTerms) {
+          const tId = t.id.toUpperCase();
+          if (seenCodes.has(tId)) continue;
+          if (tId === 'OFFICIAL_USD') continue;
+
+          const isMetalTerm = (t.flag === 'gold' || t.flag === 'silver' || tId.startsWith('GOLD_') || tId.startsWith('SILVER_'));
+          if ((isMetals && isMetalTerm) || (!isMetals && !isMetalTerm)) {
+            seenCodes.add(tId);
+            const curVal = Number(currentParallel[t.id] || currentParallel[t.id.toLowerCase()] || 0);
+            manualTableRows.push({
+              code: t.id,
+              name: t.name,
+              flag: t.flag || (isMetals ? 'gold' : 'us'),
+              decimals: isMetals ? 2 : 3,
+              oldRate: curVal,
+              newRate: curVal,
+              selected: curVal > 0
+            });
+          }
+        }
+      }
+
+      renderManualTable();
+    }
+
+    function toggleAllManualRows(selectAll) {
+      for (const row of manualTableRows) {
+        row.selected = Boolean(selectAll);
+      }
+      const masterChk = document.getElementById('manual-th-select-all');
+      if (masterChk) masterChk.checked = Boolean(selectAll);
+      renderManualTable();
+    }
+
+    function toggleManualRow(code, forceVal) {
+      const row = manualTableRows.find(r => r.code === code);
+      if (!row) return;
+      row.selected = (typeof forceVal === 'boolean') ? forceVal : !row.selected;
+      updateManualRowVisual(row);
+      updateManualTableBadges();
+    }
+
+    function onManualTablePriceChange(code, val) {
+      const row = manualTableRows.find(r => r.code === code);
+      if (!row) return;
+      const num = parseFloat(val);
+      row.newRate = isNaN(num) ? 0 : num;
+      if (row.newRate > 0) {
+        row.selected = true;
+        const chk = document.getElementById('manual-row-chk-' + code);
+        if (chk) chk.checked = true;
+      }
+      updateManualRowVisual(row);
+      updateManualTableBadges();
+    }
+
+    function resetManualTableToCurrentPrices() {
+      const currentParallel = (currentRates && currentRates.parallel) ? currentRates.parallel : {};
+      for (const row of manualTableRows) {
+        const curVal = Number(currentParallel[row.code] || currentParallel[row.code.toLowerCase()] || 0);
+        row.oldRate = curVal;
+        row.newRate = curVal;
+      }
+      renderManualTable();
+      showToast('تم استعادة الأسعار الحالية المسجلة');
+    }
+
+    function filterManualTableRows() {
+      renderManualTable();
+    }
+
+    function updateManualTableBadges() {
+      const selectedCount = manualTableRows.filter(r => r.selected).length;
+      const totalCount = manualTableRows.length;
+      const selBadge = document.getElementById('manual-table-selected-badge');
+      const totBadge = document.getElementById('manual-table-total-badge');
+      const masterChk = document.getElementById('manual-th-select-all');
+      if (selBadge) selBadge.textContent = String(selectedCount);
+      if (totBadge) totBadge.textContent = String(totalCount);
+      if (masterChk) masterChk.checked = (selectedCount > 0 && selectedCount === totalCount);
+    }
+
+    function updateManualRowVisual(row) {
+      const tr = document.getElementById('manual-tr-' + row.code);
+      const diffBadge = document.getElementById('manual-diff-' + row.code);
+      const statusBadge = document.getElementById('manual-status-' + row.code);
+
+      if (tr) {
+        if (row.selected) tr.classList.add('manual-row-selected');
+        else tr.classList.remove('manual-row-selected');
+      }
+
+      if (statusBadge) {
+        if (row.selected) {
+          statusBadge.innerHTML = '<span style="color:#10b981; font-weight:700; font-size:11px; background:rgba(16,185,129,0.15); padding:3px 8px; border-radius:9999px;">✓ محدد</span>';
+        } else {
+          statusBadge.innerHTML = '<span style="color:#64748b; font-size:11px; background:rgba(100,116,139,0.15); padding:3px 8px; border-radius:9999px;">✕ مستبعد</span>';
+        }
+      }
+
+      if (diffBadge) {
+        const oldR = Number(row.oldRate) || 0;
+        const newR = Number(row.newRate) || 0;
+        const dec = row.decimals || (manualCategory === 'metals' ? 2 : 3);
+
+        if (newR <= 0) {
+          diffBadge.innerHTML = '<span style="color:#64748b; font-size:11px;">--</span>';
+          return;
+        }
+
+        const diff = newR - oldR;
+        const absDiff = Math.abs(diff);
+
+        if (oldR > 0 && Math.abs(diff) >= 0.0001) {
+          if (diff > 0) {
+            diffBadge.innerHTML = '<span style="color:#34d399; font-weight:700; font-size:12px; background:rgba(16,185,129,0.15); padding:3px 8px; border-radius:6px;">🔺 +' + absDiff.toFixed(dec) + '</span>';
+          } else {
+            diffBadge.innerHTML = '<span style="color:#f87171; font-weight:700; font-size:12px; background:rgba(244,63,94,0.15); padding:3px 8px; border-radius:6px;">🔻 -' + absDiff.toFixed(dec) + '</span>';
+          }
+        } else {
+          diffBadge.innerHTML = '<span style="color:#94a3b8; font-size:12px; background:rgba(148,163,184,0.1); padding:3px 8px; border-radius:6px;">🟢 استقرار</span>';
+        }
+      }
+    }
+
+    function renderManualTable() {
+      const tbody = document.getElementById('manual-table-tbody');
+      if (!tbody) return;
+
+      if (!manualTableRows || manualTableRows.length === 0) {
+        loadManualTableData();
+        return;
+      }
+
+      const q = (document.getElementById('manual-table-search-input')?.value || '').trim().toLowerCase();
+      const filtered = q
+        ? manualTableRows.filter(r => r.name.toLowerCase().includes(q) || r.code.toLowerCase().includes(q))
+        : manualTableRows;
+
+      updateManualTableBadges();
+
+      if (filtered.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:30px; color:#94a3b8;">لا توجد أصناف مطابقة لبحثك في جدول ' + (manualCategory === 'metals' ? 'المعادن' : 'العملات') + '</td></tr>';
+        return;
+      }
+
+      let html = '';
+      for (const row of filtered) {
+        const flagIcon = getFlagEmoji(row.flag);
+        const dec = row.decimals || (manualCategory === 'metals' ? 2 : 3);
+        const oldR = Number(row.oldRate) || 0;
+        const newR = Number(row.newRate) || oldR;
+
+        const isUp = oldR > 0 && newR > oldR;
+        const isDown = oldR > 0 && newR < oldR;
+        const diff = Math.abs(newR - oldR);
+
+        let diffHtml = '<span style="color:#94a3b8; font-size:12px; background:rgba(148,163,184,0.1); padding:3px 8px; border-radius:6px;">🟢 استقرار</span>';
+        if (oldR > 0 && Math.abs(newR - oldR) >= 0.0001) {
+          if (isUp) {
+            diffHtml = '<span style="color:#34d399; font-weight:700; font-size:12px; background:rgba(16,185,129,0.15); padding:3px 8px; border-radius:6px;">🔺 +' + diff.toFixed(dec) + '</span>';
+          } else if (isDown) {
+            diffHtml = '<span style="color:#f87171; font-weight:700; font-size:12px; background:rgba(244,63,94,0.15); padding:3px 8px; border-radius:6px;">🔻 -' + diff.toFixed(dec) + '</span>';
+          }
+        }
+
+        const statusHtml = row.selected 
+          ? '<span style="color:#10b981; font-weight:700; font-size:11px; background:rgba(16,185,129,0.15); padding:3px 8px; border-radius:9999px;">✓ محدد</span>'
+          : '<span style="color:#64748b; font-size:11px; background:rgba(100,116,139,0.15); padding:3px 8px; border-radius:9999px;">✕ مستبعد</span>';
+
+        html += '<tr id="manual-tr-' + row.code + '" class="' + (row.selected ? 'manual-row-selected' : '') + '">' +
+          '<td style="text-align:center;">' +
+            '<input type="checkbox" id="manual-row-chk-' + row.code + '" ' + (row.selected ? 'checked' : '') + ' onchange="toggleManualRow(&quot;' + row.code + '&quot;, this.checked)" style="accent-color:#10b981; width:18px; height:18px; cursor:pointer;">' +
+          '</td>' +
+          '<td>' +
+            '<div style="display:flex; align-items:center; gap:8px;">' +
+              '<span style="font-size:20px;">' + flagIcon + '</span>' +
+              '<div>' +
+                '<div style="font-size:13px; font-weight:700; color:#f8fafc;">' + row.name + '</div>' +
+                '<div style="font-size:10px; color:#94a3b8; font-family:monospace;">' + row.code + '</div>' +
+              '</div>' +
+            '</div>' +
+          '</td>' +
+          '<td style="text-align:center;">' +
+            '<span class="font-num" style="font-size:14px; font-weight:600; color:#cbd5e1;">' + (oldR > 0 ? oldR.toFixed(dec) : 'غير مسجل') + '</span> ' +
+            '<span style="font-size:10px; color:#64748b;">د.ل</span>' +
+          '</td>' +
+          '<td style="text-align:center;">' +
+            '<div style="display:inline-flex; align-items:center; gap:6px;">' +
+              '<input type="number" step="any" id="manual-input-' + row.code + '" value="' + (newR > 0 ? newR : '') + '" placeholder="' + (oldR > 0 ? oldR.toFixed(dec) : '0.00') + '" class="manual-table-input font-num" oninput="onManualTablePriceChange(&quot;' + row.code + '&quot;, this.value)">' +
+              '<span style="font-size:11px; color:#94a3b8;">د.ل</span>' +
+            '</div>' +
+          '</td>' +
+          '<td style="text-align:center;" id="manual-diff-' + row.code + '">' +
+            diffHtml +
+          '</td>' +
+          '<td style="text-align:center;" id="manual-status-' + row.code + '">' +
+            statusHtml +
+          '</td>' +
+        '</tr>';
+      }
+
+      tbody.innerHTML = html;
+    }
+
+    async function submitManualTableRates() {
+      const selectedItems = manualTableRows.filter(r => r.selected && r.newRate > 0);
+      if (selectedItems.length === 0) {
+        showToast('يرجى تحديد عنصر واحد على الأقل وإدخال سعر صحيح أكبر من الصفر في الجدول', true);
+        return;
+      }
+
+      const autoBroadcast = Boolean(document.getElementById('manual-table-auto-broadcast')?.checked);
+      const broadcastTarget = document.getElementById('manual-table-broadcast-target')?.value || 'all';
+      const submitBtn = document.getElementById('btn-manual-table-submit');
+
+      if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.textContent = '⏳ جاري الحفظ والنشر...';
+      }
+
+      showToast('جاري حفظ الأسعار ومزامنة قاعدة البيانات والنشر...');
+
+      try {
+        const res = await fetch('/api/dashboard/manual-rates-batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            category: manualCategory,
+            items: selectedItems,
+            autoBroadcast,
+            broadcastTarget
+          })
+        });
+
+        const data = await res.json();
+        if (data.success) {
+          showToast(data.message || 'تم حفظ ونشر الأسعار بنجاح!');
+          fetchDashboardData();
+          loadManualTableData();
+        } else {
+          showToast(data.error || 'فشل تحديث الأسعار', true);
+        }
+      } catch (err) {
+        showToast('خطأ أثناء إرسال البيانات: ' + err.message, true);
+      } finally {
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          submitBtn.textContent = '💾 حفظ التعديلات ونشر النشرة الآن';
+        }
       }
     }
 

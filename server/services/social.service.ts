@@ -930,7 +930,8 @@ export async function broadcastOfficialRates(
  * - في حال وجود أي تحديث لصكوك تجاري أو جمهورية، يُحوّل إلى USD_CHECKS وتدمج التحديثات
  */
 export function sanitizeBroadcastUpdates(
-  updates: { id?: string; name: string; oldVal: number; newVal: number; flag: string }[]
+  updates: { id?: string; name: string; oldVal: number; newVal: number; flag: string }[],
+  isManual: boolean = false
 ): { id?: string; name: string; oldVal: number; newVal: number; flag: string }[] {
   const result: { id?: string; name: string; oldVal: number; newVal: number; flag: string }[] = [];
   let checkUpdate: { id: string; name: string; oldVal: number; newVal: number; flag: string } | null = null;
@@ -986,7 +987,7 @@ export function sanitizeBroadcastUpdates(
   if (checkUpdate) {
     // 🛡️ فحص أمان صارم: التأكد من أن سعر الصكوك ليس مطابقاً بالخطأ لسعر الكاش
     const cashPrice = cashUsdUpdate?.newVal || rates?.parallel?.['USD'] || 0;
-    if (cashPrice > 0 && Math.abs(checkUpdate.newVal - cashPrice) < 0.05) {
+    if (!isManual && cashPrice > 0 && Math.abs(checkUpdate.newVal - cashPrice) < 0.05) {
       console.warn(`[SanitizeBroadcast] ⚠️ تم استبعاد دولار الصكوك من المنشور لأن سعره (${checkUpdate.newVal}) مطابق لسعر الدولار كاش (${cashPrice}).`);
     } else {
       result.push(checkUpdate);
@@ -1213,7 +1214,7 @@ const BROADCAST_DISPLAY_ORDER: string[] = [
   'USD_CN',       // حوالات الصين
 ];
 
-function getBroadcastDisplayRank(u: { id?: string; name?: string }): number {
+export function getBroadcastDisplayRank(u: { id?: string; name?: string }): number {
   const id = (u.id || '').toUpperCase();
   const name = u.name || '';
 
@@ -1244,21 +1245,26 @@ function getBroadcastDisplayRank(u: { id?: string; name?: string }): number {
   if (id === 'USD_AE' || (name.includes('حوال') && (name.includes('دبي') || name.includes('امارات') || name.includes('إمارات')))) return 82;
   if (id === 'USD_CN' || (name.includes('حوال') && (name.includes('صين') || name.includes('الصين')))) return 83;
 
-  if (id === 'GOLD_CAST_18') return 901;
-  if (id === 'GOLD_EXT_18') return 902;
-  if (id === 'GOLD_EXT_21') return 903;
-  if (id === 'GOLD_SCRAP_18') return 904;
-  if (id === 'GOLD_SCRAP_21') return 905;
-  if (id === 'GOLD_CAST_24') return 906;
-  if (id === 'GOLD_LIRA_8G') return 907;
-  if (id === 'GOLD_LIRA_14G') return 908;
-  if (id === 'GOLD_MUJARA_14G') return 909;
-  if (id === 'SILVER_CAST_1000' || id.startsWith('SILVER')) return 910;
+  if (id === 'GOLD_SCRAP_18' || id === 'GOLD') return 901;
+  if (id === 'GOLD_SCRAP_21') return 902;
+  if (id === 'GOLD_CAST_18') return 903;
+  if (id === 'GOLD_CAST_21') return 904;
+  if (id === 'GOLD_CAST_24') return 905;
+  if (id === 'GOLD_EXT_18') return 906;
+  if (id === 'GOLD_EXT_21') return 907;
+  if (id === 'GOLD_LIRA_8G') return 908;
+  if (id === 'GOLD_LIRA_14G') return 909;
+  if (id === 'GOLD_MUJARA_14G') return 910;
+  if (id === 'SILVER_CAST_1000' || id === 'SILVER') return 920;
+  if (id === 'SILVER_SCRAP') return 921;
 
   return 9999;
 }
 
-export function formatSmartBroadcastMessage(updates: { id?: string; name: string; oldVal: number; newVal: number; flag: string }[]): string {
+export function formatSmartBroadcastMessage(
+  updates: { id?: string; name: string; oldVal: number; newVal: number; flag: string }[],
+  customHeaderTitle?: string
+): string {
   const now = new Date();
   const libyaInfo = getLibyaTimeInfo(now);
   
@@ -1311,7 +1317,8 @@ export function formatSmartBroadcastMessage(updates: { id?: string; name: string
     return `${fe} *${displayName}*\n💵 السعر: *${u.newVal.toFixed(decimals)} د.ل*\n📊 التغير: ${changeText}`;
   };
 
-  let message = `📊 *مؤشر الدينار | تحديث السوق الموازي*\n`;
+  const titleLine = customHeaderTitle || `📊 *مؤشر الدينار | تحديث السوق الموازي*`;
+  let message = `${titleLine}\n`;
   message += `━━━━━━━━━━━━━━━━━━━\n`;
   message += `📅 ${dayName}، ${dateStr} | ⏰ ${timeStr}\n\n`;
 
@@ -1330,9 +1337,10 @@ export async function executeBroadcast(
   isTest: boolean = false, 
   target: 'all' | 'telegram' | 'facebook' = 'all',
   skipFilters: boolean = false,
-  isManual: boolean = false
+  isManual: boolean = false,
+  customHeaderTitle?: string
 ) {
-  updates = sanitizeBroadcastUpdates(updates);
+  updates = sanitizeBroadcastUpdates(updates, isManual);
 
   const uniqueUpdatesMap = new Map<string, typeof updates[0]>();
   for (const u of updates) {
@@ -1361,7 +1369,7 @@ export async function executeBroadcast(
     updates = eligible;
   }
 
-  const message = formatSmartBroadcastMessage(updates);
+  const message = formatSmartBroadcastMessage(updates, customHeaderTitle);
 
   const startTime = Date.now();
   const platform = target === 'all' ? 'both' : target;

@@ -15,10 +15,14 @@ import { cleanupUserLogs, monitorMemory } from "../services/maintenance.service"
 import { extractRatesWithAI } from "../services/ai.service";
 import { 
   broadcastToSocialMedia, 
+  executeBroadcast,
+  getBroadcastDisplayRank,
   getBroadcastQueueStatus, 
   flushBroadcastQueueImmediately, 
   clearBroadcastQueue 
 } from "../services/social.service";
+import { notifyWebServer } from "../utils/notify";
+import { updateStats } from "../services/reporting.service";
 import { activeClient, initializeTelegram } from "../../telegramClient";
 import { whatsappManager } from "../services/whatsapp.service";
 import { addLog, getRecentLogs, clearLogs } from "../utils/logger";
@@ -310,6 +314,154 @@ dashboardRouter.post("/api/dashboard/update-rate", async (req: Request, res: Res
       rate: numRate
     });
   }
+});
+
+// ─── 4b. Manual Batch Price Entry & Auto Broadcast (Currencies or Metals) ───
+dashboardRouter.post("/api/dashboard/manual-rates-batch", async (req: Request, res: Response) => {
+  const { category = "currencies", items, autoBroadcast = true, broadcastTarget = "all" } = req.body || {};
+
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ success: false, error: "قائمة العناصر المدخلة فارغة" });
+  }
+
+  // Filter only items that are selected and have a valid positive rate
+  const selectedItems = items.filter((item: any) => {
+    const rate = Number(item.newRate);
+    return Boolean(item.selected) && !isNaN(rate) && rate > 0;
+  });
+
+  if (selectedItems.length === 0) {
+    return res.status(400).json({ success: false, error: "يرجى تحديد عنصر واحد على الأقل وإدخال سعر صحيح أكبر من الصفر" });
+  }
+
+  const isMetals = category === "metals";
+  const catLabelAr = isMetals ? "الذهب والمعادن" : "العملات";
+
+  addLog(
+    "info",
+    "تعديل يدوي جماعي",
+    `بدء تحديث يدوي لـ ${selectedItems.length} صنف من أصناف [${catLabelAr}] ${autoBroadcast ? 'مع النشر التلقائي الذكي' : 'بدون نشر'}`
+  );
+
+  const updatedCodes: string[] = [];
+  const broadcastUpdates: Array<{ id: string; name: string; oldVal: number; newVal: number; flag: string }> = [];
+
+  for (const item of selectedItems) {
+    const rawCode = String(item.code || "").trim();
+    if (!rawCode) continue;
+
+    const newRate = Number(item.newRate);
+    const oldRate = (typeof item.oldRate === "number" && item.oldRate > 0) 
+      ? Number(item.oldRate) 
+      : (Number(rates.parallel[rawCode]) || newRate);
+
+    // Save previous and new rate
+    rates.previousParallel[rawCode] = oldRate;
+    rates.previousParallel[rawCode.toUpperCase()] = oldRate;
+    rates.previousParallel[rawCode.toLowerCase()] = oldRate;
+
+    rates.parallel[rawCode] = newRate;
+    rates.parallel[rawCode.toUpperCase()] = newRate;
+    rates.parallel[rawCode.toLowerCase()] = newRate;
+
+    // Handle key aliases
+    if (rawCode.toUpperCase() === "USD") {
+      rates.parallel.usd = newRate;
+      rates.previousParallel.usd = oldRate;
+    }
+    if (rawCode.toUpperCase() === "GOLD_SCRAP_18") {
+      rates.parallel.GOLD = newRate;
+      rates.parallel.gold = newRate;
+      rates.previousParallel.GOLD = oldRate;
+      rates.previousParallel.gold = oldRate;
+    }
+    if (rawCode.toUpperCase() === "GOLD") {
+      rates.parallel.GOLD_SCRAP_18 = newRate;
+      rates.previousParallel.GOLD_SCRAP_18 = oldRate;
+    }
+
+    if (!rates.lastChanged) rates.lastChanged = { official: {}, parallel: {} };
+    if (!rates.lastChanged.parallel) rates.lastChanged.parallel = {};
+    rates.lastChanged.parallel[rawCode] = new Date().toISOString();
+
+    updateStats(rawCode, newRate);
+    updatedCodes.push(rawCode);
+
+    // Determine flag and display name
+    const term = appConfig.terms.find(t => t.id === rawCode);
+    const flag = item.flag || term?.flag || (isMetals ? (rawCode.startsWith("SILVER") ? "silver" : "gold") : "us");
+    const displayName = item.name || term?.name || rawCode;
+
+    broadcastUpdates.push({
+      id: rawCode,
+      name: displayName,
+      oldVal: oldRate,
+      newVal: newRate,
+      flag
+    });
+  }
+
+  rates.lastUpdated = new Date().toISOString();
+
+  // 1. Persist to Database (Supabase & SQLite)
+  let dbPersisted = false;
+  try {
+    dbPersisted = await saveToSupabase('parallel');
+  } catch (err: any) {
+    console.error("[ManualBatch] Save to Supabase failed:", err);
+  }
+
+  // 2. Notify Web Server
+  notifyWebServer(rates).catch(err => console.warn("[ManualBatch] Notify Web Server error:", err));
+
+  // 3. Intelligent Professional Auto Broadcast
+  let broadcastSuccess = false;
+  let broadcastError: string | null = null;
+
+  if (autoBroadcast && broadcastUpdates.length > 0) {
+    try {
+      // Sort in correct sequence according to official market hierarchy
+      broadcastUpdates.sort((a, b) => getBroadcastDisplayRank(a) - getBroadcastDisplayRank(b));
+
+      const title = isMetals
+        ? "✨ *مؤشر الدينار | نشرة أسعار الذهب والمعادن الثمينة* ✨"
+        : "📊 *مؤشر الدينار | نشرة أسعار العملات في السوق الموازي*";
+
+      const targetPlatform = (broadcastTarget === "telegram" || broadcastTarget === "facebook") 
+        ? broadcastTarget 
+        : "all";
+
+      console.log(`[ManualBatch] 📢 Broadcasting ${broadcastUpdates.length} ${catLabelAr} items to ${targetPlatform}...`);
+      await executeBroadcast(broadcastUpdates, false, targetPlatform, true, true, title);
+      broadcastSuccess = true;
+
+      addLog("success", "النشر التلقائي الذكي", `تم نشر نشرة [${catLabelAr}] بنجاح (${broadcastUpdates.length} صنف) على (${targetPlatform})`);
+    } catch (bcErr: any) {
+      broadcastError = bcErr?.message || String(bcErr);
+      addLog("error", "النشر التلقائي الذكي", `فشل النشر التلقائي لنشرة [${catLabelAr}]: ${broadcastError}`);
+    }
+  }
+
+  addLog(
+    "success",
+    "تعديل يدوي جماعي",
+    `تم تحديث ${updatedCodes.length} صنف في قاعدة البيانات [${catLabelAr}]`
+  );
+
+  return res.json({
+    success: true,
+    message: broadcastSuccess 
+      ? `تم حفظ أسعار ${updatedCodes.length} صنف ونشر النشرة بنجاح على القنوات!`
+      : `تم حفظ أسعار ${updatedCodes.length} صنف بنجاح في قاعدة البيانات${broadcastError ? ` (تعذر النشر: ${broadcastError})` : ''}`,
+    category,
+    updatedCount: updatedCodes.length,
+    updatedCodes,
+    persisted: dbPersisted,
+    broadcasted: broadcastSuccess,
+    broadcastError,
+    lastUpdated: rates.lastUpdated,
+    rates: rates.parallel
+  });
 });
 
 // ─── 5. Custom Message Broadcast to Channels ───
