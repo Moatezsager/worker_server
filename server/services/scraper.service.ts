@@ -462,9 +462,13 @@ export async function fetchOfficialRates(force: boolean = false, isManualAdmin: 
       return false;
     }
 
-    // 2. Check work start time: Do not fetch before 09:00 AM Libya time
+    // 2. Check work window: Only fetch between 09:00 AM and 10:59 AM Libya time
     if (currentLibyaHour < 9) {
       console.log(`[CBL] Before work start time (09:00 AM Libya time). Current hour: ${currentLibyaHour}:00. Skipping automatic fetch.`);
+      return false;
+    }
+    if (currentLibyaHour >= 11) {
+      console.log(`[CBL] Outside fetch window (after 11:00 AM Libya time). Current hour: ${currentLibyaHour}:00. Skipping automatic fetch. Will retry tomorrow.`);
       return false;
     }
 

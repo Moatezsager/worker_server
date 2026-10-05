@@ -336,12 +336,14 @@ export function initBackgroundTasks(port: number) {
         return;
       }
 
-      console.log("[Auto-Refresh] Triggering automatic parallel rates update cycle...");
+      console.log("[Auto-Refresh] Triggering automatic rates update cycle...");
       const parallelChanged = await fetchParallelRatesFromTelegram();
-      
-      if (parallelChanged) {
+      const officialChanged = await fetchOfficialRates();
+
+      if (parallelChanged || officialChanged) {
         console.log("[Auto-Refresh] Changes detected! Persisting to Supabase database...");
-        await saveToSupabase('parallel');
+        const saveType = (parallelChanged && officialChanged) ? 'both' : (officialChanged ? 'official' : 'parallel');
+        await saveToSupabase(saveType);
         await notifyWebServer(rates);
       }
     }, { timeoutMs: 90000 }); // 90 seconds timeout for full scraper cycle
