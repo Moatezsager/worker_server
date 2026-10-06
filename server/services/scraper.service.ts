@@ -552,11 +552,6 @@ export async function fetchOfficialRates(force: boolean = false, isManualAdmin: 
   rates.previousOfficial = { ...rates.previousOfficial, ...candidatePreviousOfficial };
   rates.lastChanged.official = { ...rates.lastChanged.official, ...candidateLastChanged };
 
-  if (rates.official.USD) {
-    rates.parallel.OFFICIAL_USD = rates.official.USD;
-    rates.lastChanged.parallel.OFFICIAL_USD = new Date().toISOString();
-  }
-
   if (anyChanged) {
     console.log(`[Official] Rates updated via CBL Scraper (USD: ${rates.official.USD})`);
     history.push({
@@ -621,12 +616,13 @@ export const extractRatesFromText = (originalText: string) => {
   const results: { code: string, value: number, date?: string }[] = [];
   const foundCodes = new Set<string>();
   
-  const compiledTerms = appConfig.terms.map(t => ({
+  const compiledTerms = appConfig.terms.filter(t => t && t.id !== 'OFFICIAL_USD').map(t => ({
     ...t,
     compiledRegex: new RegExp(t.regex, 'i')
   }));
 
   const processTermValue = (term: typeof compiledTerms[0], valStr: string): number | null => {
+    if (term.id === 'OFFICIAL_USD') return null;
     let cleanValStr = valStr.replace(/,/g, ''); 
     let val = parseFloat(cleanValStr);
     
@@ -1227,8 +1223,9 @@ export async function processWhatsAppMessage(
     let anyChanged = false;
 
     for (const res of extracted) {
+      if (res.code === 'OFFICIAL_USD') continue;
       const term = appConfig.terms.find(t => t.id === res.code);
-      if (!term) continue;
+      if (!term || term.id === 'OFFICIAL_USD') continue;
 
       const currentVal = rates.parallel[term.id];
       const newVal = res.value;

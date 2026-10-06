@@ -224,6 +224,15 @@ export async function initializeRatesFromDB(force = false) {
       }
     }
     
+    delete rates.parallel.OFFICIAL_USD;
+    delete (rates.parallel as any).official_usd;
+    delete rates.previousParallel.OFFICIAL_USD;
+    delete (rates.previousParallel as any).official_usd;
+    if (rates.lastChanged.parallel) {
+      delete rates.lastChanged.parallel.OFFICIAL_USD;
+      delete (rates.lastChanged.parallel as any).official_usd;
+    }
+
     lastRatesFetchTime = Date.now();
     console.log(`[DB] Successfully loaded state from separated tables (Parallel USD: ${rates.parallel.USD})`);
   } catch (err) {
@@ -244,6 +253,15 @@ export async function saveToSupabase(
     const results = [];
     const now = new Date().toISOString();
     
+    delete rates.parallel.OFFICIAL_USD;
+    delete (rates.parallel as any).official_usd;
+    delete rates.previousParallel.OFFICIAL_USD;
+    delete (rates.previousParallel as any).official_usd;
+    if (rates.lastChanged.parallel) {
+      delete rates.lastChanged.parallel.OFFICIAL_USD;
+      delete (rates.lastChanged.parallel as any).official_usd;
+    }
+
     if (type === 'parallel' || type === 'both') {
       if (rates.parallel.USD >= 5.5) {
         console.log(`[DB] Saving parallel rates to Supabase (USD: ${rates.parallel.USD})...`);

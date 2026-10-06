@@ -54,8 +54,7 @@ export let appConfig: AppConfig = {
     { id: "GOLD_LIRA_8G", name: "ليرة ذهب 8 جرام", regex: "(?:ليرة\\s*(?:ذهب\\s*)?8(?:\\s*جرام|ج)?|ليرة\\s*8(?:\\s*جرام|ج)?)[^\\d\\n]{0,30}(\\d{1,5}(?:[\\.,]\\d+)?)(?:[^\\d\\n]{1,15}(\\d{1,5}(?:[\\.,]\\d+)?))?", min: 1, max: 30000, isInverse: false, flag: "gold" },
     { id: "GOLD_LIRA_14G", name: "ليرة ذهب 14 جرام", regex: "(?:ليرة\\s*(?:ذهب\\s*)?14(?:\\s*جرام|ج)?|ليرة\\s*14(?:\\s*جرام|ج)?)[^\\d\\n]{0,30}(\\d{1,5}(?:[\\.,]\\d+)?)(?:[^\\d\\n]{1,15}(\\d{1,5}(?:[\\.,]\\d+)?))?", min: 1, max: 40000, isInverse: false, flag: "gold" },
     { id: "GOLD_MUJARA_14G", name: "مجارة ذهب 14", regex: "(?:مجارة\\s*(?:ذهب\\s*)?14(?:\\s*جرام|ج)?|مجارة\\s*14(?:\\s*جرام|ج)?)[^\\d\\n]{0,30}(\\d{1,5}(?:[\\.,]\\d+)?)(?:[^\\d\\n]{1,15}(\\d{1,5}(?:[\\.,]\\d+)?))?", min: 1, max: 40000, isInverse: false, flag: "gold" },
-    { id: "SILVER_CAST_1000", name: "مسبوك فضة", regex: "(?:مسبوك\\s*فضة(?:\\s*عيار\\s*1000|\\s*1000)?|فضة\\s*مسبوك)[^\\d\\n]{0,30}(\\d{1,5}(?:[\\.,]\\d+)?)(?:[^\\d\\n]{1,15}(\\d{1,5}(?:[\\.,]\\d+)?))?", min: 1, max: 1000, isInverse: false, flag: "silver" },
-    { id: "OFFICIAL_USD", name: "الدولار الرسمي", regex: "(?:الرسمي|المركزي)[^\\d]{0,40}(\\d{1,2}(?:[\\.,]\\d{1,4})?)", min: 4.0, max: 6.0, isInverse: false, flag: "us" }
+    { id: "SILVER_CAST_1000", name: "مسبوك فضة", regex: "(?:مسبوك\\s*فضة(?:\\s*عيار\\s*1000|\\s*1000)?|فضة\\s*مسبوك)[^\\d\\n]{0,30}(\\d{1,5}(?:[\\.,]\\d+)?)(?:[^\\d\\n]{1,15}(\\d{1,5}(?:[\\.,]\\d+)?))?", min: 1, max: 1000, isInverse: false, flag: "silver" }
   ]
 };
 
@@ -130,8 +129,8 @@ export function applyLoadedConfig(loadedConfig: AppConfig, source: string) {
       console.log(`[Migration] Added new missing currency term: ${defaultTerm.id}`);
     }
   }
-  // Filter out any obsolete gold/silver categories to keep exactly the 10 metals
-  loadedConfig.terms = mergedTerms.filter(t => t.id !== "GOLD" && t.id !== "GOLD_CAST_21" && t.id !== "SILVER_SCRAP");
+  // Filter out any obsolete gold/silver categories and ensure OFFICIAL_USD is permanently removed
+  loadedConfig.terms = mergedTerms.filter(t => t.id !== "GOLD" && t.id !== "GOLD_CAST_21" && t.id !== "SILVER_SCRAP" && t.id !== "OFFICIAL_USD");
 
   if (!Array.isArray(loadedConfig.channels) || loadedConfig.channels.length === 0) {
     loadedConfig.channels = ["dollarr_ly", "musheermarket", "lydollar", "suqalmushir"];
@@ -176,6 +175,11 @@ export function applyLoadedConfig(loadedConfig: AppConfig, source: string) {
 
 export function syncTermsToDatabase(terms: AppConfig['terms']) {
   try {
+    const cleanTerms = terms.filter(t => t && t.id !== 'OFFICIAL_USD');
+    try {
+      db.prepare("DELETE FROM currency_terms WHERE id = 'OFFICIAL_USD'").run();
+    } catch (e) {}
+
     const stmt = db.prepare(`
       INSERT INTO currency_terms (id, name, regex, min, max, is_inverse, flag, is_active, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
@@ -191,10 +195,11 @@ export function syncTermsToDatabase(terms: AppConfig['terms']) {
     `);
     const tx = db.transaction((items: AppConfig['terms']) => {
       for (const t of items) {
+        if (t.id === 'OFFICIAL_USD') continue;
         stmt.run(t.id, t.name, t.regex, t.min, t.max, t.isInverse ? 1 : 0, t.flag || 'ly');
       }
     });
-    tx(terms);
+    tx(cleanTerms);
   } catch (err) {
     console.error("[Storage] Failed to sync terms to SQLite currency_terms table:", err);
   }
@@ -202,10 +207,15 @@ export function syncTermsToDatabase(terms: AppConfig['terms']) {
 
 export function loadConfigFromStorage() {
   try {
+    try {
+      db.prepare("DELETE FROM currency_terms WHERE id = 'OFFICIAL_USD'").run();
+    } catch (e) {}
+
     const stored = db.prepare('SELECT value FROM server_config WHERE key = ?').get('app_config') as any;
     if (stored && stored.value) {
       const parsedConfig = JSON.parse(stored.value) as AppConfig;
       if (parsedConfig && Array.isArray(parsedConfig.terms) && Array.isArray(parsedConfig.channels)) {
+        parsedConfig.terms = parsedConfig.terms.filter(t => t && t.id !== 'OFFICIAL_USD');
         applyLoadedConfig(parsedConfig, "SQLite");
       }
     }
@@ -218,6 +228,7 @@ export function loadConfigFromStorage() {
       const rows = db.prepare('SELECT * FROM currency_terms WHERE is_active = 1').all() as any[];
       if (rows && rows.length > 0) {
         for (const row of rows) {
+          if (row.id === 'OFFICIAL_USD') continue;
           const idx = appConfig.terms.findIndex(t => t.id === row.id);
           const termItem = {
             id: row.id,
@@ -236,6 +247,7 @@ export function loadConfigFromStorage() {
         }
       }
     }
+    appConfig.terms = appConfig.terms.filter(t => t && t.id !== 'OFFICIAL_USD');
   } catch (e) {
     console.error("[Storage] Failed to read config from SQLite:", e);
   }
@@ -289,10 +301,15 @@ export async function loadConfigFromSupabase() {
 
     // Try loading directly from currency_terms table in Supabase if exists
     try {
+      try {
+        await supabase.from('currency_terms').delete().eq('id', 'OFFICIAL_USD');
+      } catch (e) {}
+
       const { data: dbTerms } = await supabase.from('currency_terms').select('*');
       if (dbTerms && Array.isArray(dbTerms) && dbTerms.length > 0) {
         console.log(`[Config] Syncing ${dbTerms.length} currency terms from Supabase currency_terms table...`);
         for (const row of dbTerms) {
+          if (row.id === 'OFFICIAL_USD') continue;
           const idx = appConfig.terms.findIndex(t => t.id === row.id);
           const termObj = {
             id: row.id,
@@ -309,6 +326,7 @@ export async function loadConfigFromSupabase() {
             appConfig.terms.push(termObj);
           }
         }
+        appConfig.terms = appConfig.terms.filter(t => t && t.id !== 'OFFICIAL_USD');
         syncTermsToDatabase(appConfig.terms);
       }
     } catch (termsErr) {

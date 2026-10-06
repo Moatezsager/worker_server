@@ -105,7 +105,7 @@ dashboardRouter.get(["/", "/dashboard", "/admin"], (req: Request, res: Response)
       facebookAutoPost: !!appConfig.facebookAutoPost
     },
     broadcastQueue: getBroadcastQueueStatus(),
-    terms: appConfig.terms,
+    terms: appConfig.terms.filter(t => t && t.id !== 'OFFICIAL_USD'),
     ingestedMessages: getRecentIngestedRecords(30)
   };
 
@@ -115,6 +115,8 @@ dashboardRouter.get(["/", "/dashboard", "/admin"], (req: Request, res: Response)
 
 // ─── 2. Dedicated Dashboard Live Telemetry API ───
 dashboardRouter.get("/api/dashboard/stats", (req: Request, res: Response) => {
+  delete rates.parallel.OFFICIAL_USD;
+  delete (rates.parallel as any).official_usd;
   const mem = process.memoryUsage();
   const uptimeSeconds = Math.floor((Date.now() - serverStartTime.getTime()) / 1000);
 
@@ -132,7 +134,7 @@ dashboardRouter.get("/api/dashboard/stats", (req: Request, res: Response) => {
     telegramConnected: !!(activeClient && activeClient.connected),
     whatsappStatus: whatsappManager.getStatus().status,
     rates: {
-      parallel: rates.parallel,
+      parallel: Object.fromEntries(Object.entries(rates.parallel).filter(([k]) => k !== 'OFFICIAL_USD')),
       official: rates.official,
       lastUpdated: rates.lastUpdated,
     },
@@ -170,7 +172,7 @@ dashboardRouter.get("/api/dashboard/stats", (req: Request, res: Response) => {
       facebookAutoPost: !!appConfig.facebookAutoPost
     },
     broadcastQueue: getBroadcastQueueStatus(),
-    terms: appConfig.terms,
+    terms: appConfig.terms.filter(t => t && t.id !== 'OFFICIAL_USD'),
     ingestedMessages: getRecentIngestedRecords(30)
   });
 });
@@ -1041,6 +1043,7 @@ dashboardRouter.get("/api/dashboard/ingested-messages", (req: Request, res: Resp
 
 // ─── 10. Currency Terms & Extraction Settings ───
 dashboardRouter.get("/api/dashboard/settings/terms", (req: Request, res: Response) => {
+  appConfig.terms = appConfig.terms.filter(t => t && t.id !== 'OFFICIAL_USD');
   res.json({
     success: true,
     terms: appConfig.terms
@@ -1078,6 +1081,9 @@ dashboardRouter.post("/api/dashboard/settings/terms/save", async (req: Request, 
   }
 
   const termId = id.trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_');
+  if (termId === 'OFFICIAL_USD') {
+    return res.status(400).json({ success: false, error: "تم إلغاء كود OFFICIAL_USD نهائياً، الأسعار الرسمية تأتي حصراً من مصرف ليبيا المركزي CBL" });
+  }
   const termName = name.trim();
   const termRegex = regex.trim();
   const termFlag = (flag && String(flag).trim().toLowerCase()) || 'ly';

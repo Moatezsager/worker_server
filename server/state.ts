@@ -18,7 +18,6 @@ export let rates: Rates = {
   },
   parallel: {
     USD: 10.80,
-    OFFICIAL_USD: 4.85,
     USD_CHECKS: 11.60,
     EUR: 12.17,
     GBP: 13.80,
@@ -70,7 +69,6 @@ export let rates: Rates = {
   },
   previousParallel: {
     USD: 10.75,
-    OFFICIAL_USD: 4.85,
     USD_CHECKS: 11.55,
     EUR: 12.10,
     GBP: 13.75,
