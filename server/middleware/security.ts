@@ -73,9 +73,11 @@ export const userAgentMiddleware = (req: express.Request, res: express.Response,
 
 export const timeoutMiddleware = (req: express.Request, res: express.Response, next: express.NextFunction) => {
   if (req.path.startsWith('/api/')) {
-    res.setTimeout(5000, () => {
+    // Give broadcast/internal/trigger requests 30s timeout, others 15s
+    const timeoutMs = (req.path.includes('/internal') || req.path.includes('/broadcast') || req.path.includes('/trigger') || req.path.includes('/manual')) ? 30000 : 15000;
+    res.setTimeout(timeoutMs, () => {
       if (!res.headersSent) {
-        res.status(408).json({ success: false, error: "Request Timeout (5s limit exceeded)" });
+        res.status(408).json({ success: false, error: `Request Timeout (${timeoutMs / 1000}s limit exceeded)` });
       }
     });
   }

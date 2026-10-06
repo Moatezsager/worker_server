@@ -47,7 +47,9 @@ router.post('/manual-broadcast', requireWorkerSecret, async (
     };
 
     if (!updates || !Array.isArray(updates) || updates.length === 0) {
-      res.status(400).json({ success: false, message: 'لا توجد تحديثات للنشر' });
+      if (!res.headersSent) {
+        res.status(400).json({ success: false, message: 'لا توجد تحديثات للنشر' });
+      }
       return;
     }
 
@@ -65,17 +67,21 @@ router.post('/manual-broadcast', requireWorkerSecret, async (
     );
 
     console.log(`[Manual Broadcast] ✅ تم النشر بنجاح على ${resolvedTarget}`);
-    res.json({
-      success: true,
-      message: `تم النشر بنجاح على ${resolvedTarget} (${updates.length} صنف)`
-    });
+    if (!res.headersSent) {
+      res.json({
+        success: true,
+        message: `تم النشر بنجاح على ${resolvedTarget} (${updates.length} صنف)`
+      });
+    }
 
   } catch (err: any) {
     console.error('[Manual Broadcast] ❌ فشل النشر:', err);
-    res.status(500).json({
-      success: false,
-      message: `فشل النشر: ${err?.message || 'خطأ غير معروف'}`
-    });
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        message: `فشل النشر: ${err?.message || 'خطأ غير معروف'}`
+      });
+    }
   }
 });
 
