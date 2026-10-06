@@ -299,6 +299,46 @@ export async function loadConfigFromSupabase() {
       }
     }
 
+    // أولاً: محاولة تحميل من app_config (المصدر الرئيسي الذي يكتب فيه Web Server)
+    if (supabase) {
+      try {
+        const { data: appConfigData } = await supabase
+          .from('app_config')
+          .select('config')
+          .eq('id', 1)
+          .single();
+
+        if (appConfigData?.config?.terms && Array.isArray(appConfigData.config.terms)
+            && appConfigData.config.terms.length > 0) {
+          console.log(`[Config] تحميل ${appConfigData.config.terms.length} term من app_config (Web Server)`);
+
+          // دمج مع القيم الافتراضية للحفاظ على أي terms جديدة
+          const mergedTerms = appConfig.terms.map(defaultTerm => {
+            const dbTerm = appConfigData.config.terms.find((t: any) => t.id === defaultTerm.id);
+            return dbTerm ? { ...defaultTerm, ...dbTerm } : defaultTerm;
+          });
+
+          appConfig.terms = mergedTerms;
+
+          // تحديث channels وإعدادات النشر أيضاً
+          if (Array.isArray(appConfigData.config.channels)) {
+            appConfig.channels = appConfigData.config.channels;
+          }
+          if (appConfigData.config.telegramAutoPost !== undefined) {
+            appConfig.telegramAutoPost = appConfigData.config.telegramAutoPost;
+          }
+          if (appConfigData.config.facebookAutoPost !== undefined) {
+            appConfig.facebookAutoPost = appConfigData.config.facebookAutoPost;
+          }
+
+          console.log('[Config] ✅ تم تحميل الإعدادات من app_config بنجاح');
+          return; // ← نجح التحميل، لا حاجة للجداول الأخرى
+        }
+      } catch (appConfigErr) {
+        console.warn('[Config] تعذّر التحميل من app_config، سيتم المحاولة من currency_terms:', appConfigErr);
+      }
+    }
+
     // Try loading directly from currency_terms table in Supabase if exists
     try {
       try {

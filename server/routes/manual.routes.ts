@@ -1,7 +1,6 @@
 import express from 'express';
 import crypto from 'crypto';
 import { executeBroadcast } from '../services/social.service';
-import { rates } from '../state';
 
 const router = express.Router();
 
