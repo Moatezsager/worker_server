@@ -6,7 +6,7 @@ import { logErrorArabic, logPriceChange, saveToSupabase, syncCheckRates, saveWor
 import { extractRatesWithAI } from './ai.service';
 import { broadcastOfficialRates, broadcastRateChanges, getOrInitTelegramManager, lastBroadcastState, lastOfficialBroadcastDate } from './social.service';
 import { fetchPublicChannelMessages } from '../../telegramClient';
-import { isSignificantChange, isProbablyDateOrTime } from '../utils/helpers';
+import { isSignificantChange, isProbablyDateOrTime, isNonPriceAnnouncement, isLineExecutionOrNonPrice } from '../utils/helpers';
 import { updateStats } from './reporting.service';
 import { recordIngestion } from './ingestion.service';
 
@@ -613,6 +613,13 @@ export function stripArabicDiacritics(text: string): string {
 
 export const extractRatesFromText = (originalText: string) => {
   const cleanText = stripArabicDiacritics(originalText);
+  
+  // Ignore non-price execution status and banking card tracking reports
+  if (isNonPriceAnnouncement(cleanText)) {
+    console.log(`[Scraper] ⏭ Skipping non-price message (banking cards / execution tracking announcement).`);
+    return [];
+  }
+
   const results: { code: string, value: number, date?: string }[] = [];
   const foundCodes = new Set<string>();
   
@@ -680,6 +687,7 @@ export const extractRatesFromText = (originalText: string) => {
   // 1. Line-by-line pass: prevents multi-line pasted text from bleeding across lines
   if (lines.length > 1) {
     for (const line of lines) {
+      if (isLineExecutionOrNonPrice(line)) continue;
       for (const term of compiledTerms) {
         if (foundCodes.has(term.id)) continue;
         const match = line.match(term.compiledRegex);
@@ -701,6 +709,10 @@ export const extractRatesFromText = (originalText: string) => {
         }
 
         if (valStr) {
+          const valIndex = line.indexOf(valStr, match.index);
+          if (valIndex >= 0 && isProbablyDateOrTime(line, valIndex, valStr)) {
+            continue;
+          }
           const val = processTermValue(term, valStr);
           if (val !== null) {
             const dateMatch = line.match(/\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}/);
@@ -745,6 +757,10 @@ export const extractRatesFromText = (originalText: string) => {
     }
 
     if (valStr) {
+      const valIndex = cleanText.indexOf(valStr, match.index);
+      if (valIndex >= 0 && isProbablyDateOrTime(cleanText, valIndex, valStr)) {
+        continue;
+      }
       const val = processTermValue(term, valStr);
       if (val !== null) {
         const matchIndex = match.index!;

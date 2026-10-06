@@ -148,25 +148,60 @@ export function getLibyaDateString(now: Date = new Date()): string {
 }
 
 /**
- * Helper to detect if a number is likely part of a date or time (e.g. 2024, 21-03, 12/05, 15:48)
+ * Helper to detect if a number is likely part of a date or time (e.g. 2024, 21-03, 12/05, 15:48, 9/9, 19/8, 1:9)
  */
 export function isProbablyDateOrTime(text: string, matchIndex: number, matchValue: string): boolean {
-  const contextBefore = text.substring(Math.max(0, matchIndex - 10), matchIndex);
-  const contextAfter = text.substring(matchIndex + matchValue.length, Math.min(text.length, matchIndex + matchValue.length + 10));
+  if (!text || matchIndex === undefined || matchIndex < 0) return false;
 
+  const contextBefore = text.substring(Math.max(0, matchIndex - 12), matchIndex);
+  const contextAfter = text.substring(matchIndex + matchValue.length, Math.min(text.length, matchIndex + matchValue.length + 12));
+
+  // Full 4-digit years like 2024, 2025, 2026
   if (/^20\d{2}$/.test(matchValue)) return true;
 
-  if (matchValue.includes('.') || matchValue.includes(',') || matchValue.length > 4) {
-    return false;
+  // Check if adjacent to date slashes, dashes, or colons (e.g. 9/9, 19/8, 1:9, 8/31, 1-9)
+  if (/[/-]\s*$/.test(contextBefore) || /^\s*[/-]/.test(contextAfter)) return true;
+  if (/:\s*$/.test(contextBefore) || /^\s*:\d/.test(contextAfter)) return true;
+  if (/\d{1,2}\s*[/:\-]\s*$/.test(contextBefore)) return true;
+  if (/^\s*[/:\-]\s*\d{1,2}/.test(contextAfter)) return true;
+
+  // Check if adjacent to time/date words
+  if (/بتاريخ|تاريخ|يوم|سنة|عام|الساعة|ساعة|شهر|مواليد/i.test(contextBefore)) return true;
+
+  // Execution / booking status markers
+  if (/تم\s*التنفيذ|وصل\s*التنفي[دذ]|تم\s*تنفيذ|✅|شحن\s*البطاق|حساب\s*العملة|منظومة/i.test(contextBefore) ||
+      /تم\s*التنفيذ|وصل\s*التنفي[دذ]|تم\s*تنفيذ|✅|شحن\s*البطاق|حساب\s*العملة|منظومة/i.test(contextAfter)) {
+    if (/[/:\-]/.test(contextBefore) || /[/:\-]/.test(contextAfter)) return true;
   }
 
-  if (/[/-]\d{1,2}$/.test(contextBefore) || /[/-]$/.test(contextBefore)) return true;
-  if (/^\d{1,2}[/-]/.test(contextAfter) || /^[/-]/.test(contextAfter)) return true;
+  return false;
+}
 
-  if (/^:\d{2}/.test(contextAfter)) return true;
-  if (/\d{2}:$/.test(contextBefore) || /:$/.test(contextBefore)) return true;
+/**
+ * Detects messages about banking cards execution status, queue reports, personal currency system bookings,
+ * which contain dates (e.g. "الجمهورية 9/9 تم التنفيذ ✅") rather than actual market prices.
+ */
+export function isNonPriceAnnouncement(text: string): boolean {
+  if (!text || typeof text !== 'string') return false;
+  const clean = text.toLowerCase();
+  
+  const hasExecutionKeyword = /تم\s*التنفيذ|وصل\s*التنفي[دذ]|اختيار\s*شركات|البطاقات\s*وحساب\s*العملة|شحن\s*البطاق|أغلبية\s*البطاقات|حساب\s*العملة|حسابات\s*العملة|منظومة\s*الأغراض|الأغراض\s*الشخصية|حجز\s*العملة|مخصصات\s*الأغراض|لا\s*يوجد\s*بها\s*دولار|فروع\s*المنطقة\s*الشرقية|جاهزة\s*للاستلام|وصول\s*الفيزا|كروت\s*الفيزا/i.test(clean);
+  
+  if (!hasExecutionKeyword) return false;
 
-  if (/بتاريخ|يوم|سنة|عام|الساعة|ساعة/i.test(contextBefore)) return true;
+  const dateSlashes = (clean.match(/\d{1,2}\s*[/:\-]\s*\d{1,2}/g) || []).length;
+  const checkmarks = (clean.match(/✅|✔|☑|تم\s*التنفيذ|تم\s*تنفيذ/g) || []).length;
+
+  if (dateSlashes >= 2 || checkmarks >= 2 || /وصل\s*التنفي[دذ]|اختيار\s*شركات|البطاقات\s*وحساب\s*العملة|منظومة\s*الأغراض/i.test(clean)) {
+    return true;
+  }
 
   return false;
+}
+
+export function isLineExecutionOrNonPrice(line: string): boolean {
+  if (!line || typeof line !== 'string') return false;
+  const hasExecution = /تم\s*التنفيذ|وصل\s*التنفي[دذ]|تم\s*تنفيذ|✅|اختيار\s*شركات|البطاقات\s*وحساب\s*العملة/i.test(line);
+  const hasDateSlash = /\d{1,2}\s*[/:\-]\s*\d{1,2}/.test(line);
+  return hasExecution && hasDateSlash;
 }

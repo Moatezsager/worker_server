@@ -1,5 +1,6 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { appConfig } from '../config';
+import { isNonPriceAnnouncement } from '../utils/helpers';
 
 const aiProcessedTexts = new Set<string>();
 let aiQuotaExceededUntil = 0;
@@ -11,6 +12,12 @@ export function isAiQuotaExceeded(): boolean {
 export async function extractRatesWithAI(text: string, channel: string): Promise<{ code: string, value: number, date?: string }[]> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return [];
+
+  // Ignore non-price execution status and banking cards tracking reports
+  if (isNonPriceAnnouncement(text)) {
+    console.log(`[Scraper-AI] ⏭ Skipping non-price message (execution status / cards system announcement) from ${channel}`);
+    return [];
+  }
 
   // If in quota cooldown, skip calling AI to avoid 429 errors
   if (Date.now() < aiQuotaExceededUntil) {
@@ -58,7 +65,10 @@ ${text}
 7. **التفريق الصارم بين الدولار كاش والدولار صكوك**:
    - "دولار" أو "كاش" أو "الدولار" = استخدم كود USD (سعر الكاش).
    - "صكوك" أو "شيكات" أو "بصك" أو "صكوك تجاري / جمهورية / أمان" = استخدم كود USD_CHECKS (سعر الصكوك).
-   - في السوق الليبي، سعر الصكوك دائماً يختلف عن سعر الكاش (أعلى من الكاش). لا تخلط بينهما أبداً ولا تجعل أحدهما يحل محل الآخر.`;
+   - في السوق الليبي، سعر الصكوك دائماً يختلف عن سعر الكاش (أعلى من الكاش). لا تخلط بينهما أبداً ولا تجعل أحدهما يحل محل الآخر.
+8. **تجاهل تام لرسائل وصولات التنفيذ وشحن البطاقات والمخصصات**:
+   - إذا كان النص يتحدث عن وصل التنفيذ أو حجز العملة أو شحن البطاقات أو تواريخ تنفيذ المصارف (مثل: "الجمهورية 9/9 تم التنفيذ" أو "التجاري 19/8" أو "الأندلس 6/9" أو "البطاقات وحساب العملة")، فهذه تواريخ وأرقام أيام وأشهر لمعاملات مصرفية وليست أسعار صرف إطلاقاً!
+   - في هذه الحالة يجب عليك إرجاع مصفوفة فارغة [] فوراً دون استخراج أي عملة.`;
 
   try {
     const ai = new GoogleGenAI({ apiKey });
