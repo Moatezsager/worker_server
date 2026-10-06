@@ -26,31 +26,121 @@ import { updateStats } from "../services/reporting.service";
 import { activeClient, initializeTelegram } from "../../telegramClient";
 import { whatsappManager } from "../services/whatsapp.service";
 import { addLog, getRecentLogs, clearLogs } from "../utils/logger";
-import { renderDashboardHtml } from "../views/dashboard.html";
+import { renderDashboardHtml, renderLoginHtml } from "../views/dashboard.html";
 import { getRecentIngestedRecords } from "../services/ingestion.service";
+import {
+  requireAdmin,
+  validateAdminPassword,
+  getIpLockoutStatus,
+  recordFailedLogin,
+  clearFailedLogins,
+  createAdminSession,
+  revokeAdminSession,
+  extractAdminToken,
+  verifyAdminSessionFromReq
+} from "../middleware/auth";
 
 const dashboardRouter = Router();
 
-// ─── 1. Serve Dashboard HTML Web Application ───
+// ─── 0. Public Authentication Endpoints (Rate Limited & Anti-Brute-Force) ───
+
+dashboardRouter.post("/api/auth/login", async (req: Request, res: Response) => {
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '') as string;
+  const userAgent = (req.headers['user-agent'] || '') as string;
+  const { password } = req.body || {};
+
+  const lockout = getIpLockoutStatus(ip);
+  if (lockout.isLocked) {
+    console.warn(`[AuthShield] 🛑 رفض محاولة دخول من IP محظور: ${ip} (متبقي ${lockout.remainingSeconds} ثانية)`);
+    return res.status(429).json({
+      success: false,
+      isLocked: true,
+      remainingSeconds: lockout.remainingSeconds,
+      error: `تم حظر عنوان IP مؤقتاً بسبب تكرار المحاولات الخاطئة. يرجى الانتظار ${lockout.remainingSeconds} ثانية.`
+    });
+  }
+
+  // Enforce anti-timing and anti-bot artificial delay (approx 600ms)
+  await new Promise(r => setTimeout(r, 600));
+
+  if (!password || typeof password !== 'string' || !validateAdminPassword(password)) {
+    const updatedLockout = recordFailedLogin(ip);
+    console.warn(`[AuthShield] ⚠️ محاولة دخول فاشلة من IP: ${ip} | متبقي ${updatedLockout.attemptsLeft} محاولة`);
+    
+    return res.status(401).json({
+      success: false,
+      isLocked: updatedLockout.isLocked,
+      remainingSeconds: updatedLockout.remainingSeconds,
+      attemptsLeft: updatedLockout.attemptsLeft,
+      error: "كلمة المرور غير صحيحة"
+    });
+  }
+
+  // Successful login
+  clearFailedLogins(ip);
+  const session = createAdminSession(ip, userAgent);
+  console.log(`[AuthShield] ✅ تسجيل دخول ناجح للمدير من IP: ${ip}`);
+
+  // Set secure cookie
+  res.setHeader(
+    'Set-Cookie',
+    `lyd_admin_token=${encodeURIComponent(session.token)}; Path=/; Max-Age=43200; SameSite=Lax; HttpOnly`
+  );
+
+  return res.json({
+    success: true,
+    token: session.token,
+    expiresAt: session.expiresAt,
+    message: "تم تسجيل الدخول بنجاح"
+  });
+});
+
+dashboardRouter.post("/api/auth/logout", (req: Request, res: Response) => {
+  const token = extractAdminToken(req);
+  if (token) {
+    revokeAdminSession(token);
+  }
+  res.setHeader(
+    'Set-Cookie',
+    `lyd_admin_token=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax; HttpOnly`
+  );
+  return res.json({ success: true, message: "تم تسجيل الخروج بنجاح" });
+});
+
+dashboardRouter.get("/api/auth/verify", (req: Request, res: Response) => {
+  const isAuthenticated = verifyAdminSessionFromReq(req);
+  return res.json({ success: true, authenticated: isAuthenticated });
+});
+
+dashboardRouter.get("/api/auth/status", (req: Request, res: Response) => {
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '') as string;
+  const lockout = getIpLockoutStatus(ip);
+  return res.json({ success: true, ...lockout });
+});
+
+// ─── 1. Serve Dashboard HTML Web Application / Secure Login Shield ───
 dashboardRouter.get(["/", "/dashboard", "/admin"], (req: Request, res: Response) => {
-  // If client prefers JSON (such as programmatic probes), return JSON health status
+  // If client prefers JSON (such as programmatic health probes), return basic status
   if (req.headers.accept && !req.headers.accept.includes("text/html") && req.headers.accept.includes("application/json")) {
     return res.json({
       status: "online",
       role: "worker_server",
       timestamp: new Date().toISOString(),
-      uptimeSeconds: Math.floor((Date.now() - serverStartTime.getTime()) / 1000),
-      memory: {
-        rssMb: Math.round(process.memoryUsage().rss / (1024 * 1024)),
-        heapUsedMb: Math.round(process.memoryUsage().heapUsed / (1024 * 1024)),
-      },
-      telegramConnected: !!(activeClient && activeClient.connected),
-      whatsappStatus: whatsappManager.getStatus().status,
-      activeJobs: getWorkerJobsStatus(),
-      lastUpdated: rates?.lastUpdated || new Date().toISOString(),
+      uptimeSeconds: Math.floor((Date.now() - serverStartTime.getTime()) / 1000)
     });
   }
 
+  const clientIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '') as string;
+  const isAuthenticated = verifyAdminSessionFromReq(req);
+
+  // If unauthenticated: render Ultra-Secure Login Shield Gateway (Zero state leakage)
+  if (!isAuthenticated) {
+    const lockout = getIpLockoutStatus(clientIp);
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    return res.send(renderLoginHtml({ ...lockout, clientIp }));
+  }
+
+  // If authenticated: render full administrative dashboard
   const mem = process.memoryUsage();
   const uptimeSeconds = Math.floor((Date.now() - serverStartTime.getTime()) / 1000);
   const initialState = {
@@ -112,6 +202,9 @@ dashboardRouter.get(["/", "/dashboard", "/admin"], (req: Request, res: Response)
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(renderDashboardHtml(initialState));
 });
+
+// ─── Enforce requireAdmin on all /api/dashboard/* endpoints ───
+dashboardRouter.use("/api/dashboard", requireAdmin);
 
 // ─── 2. Dedicated Dashboard Live Telemetry API ───
 dashboardRouter.get("/api/dashboard/stats", (req: Request, res: Response) => {

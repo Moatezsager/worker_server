@@ -1,3 +1,364 @@
+export interface LoginHtmlOptions {
+  isLocked?: boolean;
+  remainingSeconds?: number;
+  attemptsLeft?: number;
+  clientIp?: string;
+  error?: string;
+}
+
+export function renderLoginHtml(options: LoginHtmlOptions = {}): string {
+  const isLocked = Boolean(options.isLocked);
+  const remainingSeconds = Number(options.remainingSeconds || 0);
+  const attemptsLeft = options.attemptsLeft ?? 5;
+  const clientIp = options.clientIp || '';
+
+  return `<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>بوابة الوصول المشفرة | LYD Shield v3.0</title>
+  <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      -webkit-tap-highlight-color: transparent;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans Arabic", "Cairo", sans-serif;
+      background: radial-gradient(circle at 50% 20%, #0f172a 0%, #060913 100%);
+      color: #f8fafc;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      overflow-x: hidden;
+    }
+    .shield-card {
+      width: 100%;
+      max-width: 440px;
+      background: rgba(15, 23, 42, 0.85);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid rgba(56, 189, 248, 0.2);
+      border-radius: 18px;
+      padding: 28px 24px;
+      box-shadow: 0 20px 40px -15px rgba(0, 0, 0, 0.7), 0 0 30px rgba(56, 189, 248, 0.1);
+      position: relative;
+    }
+    .shield-card::before {
+      content: '';
+      position: absolute;
+      top: -1px;
+      left: 20%;
+      right: 20%;
+      height: 2px;
+      background: linear-gradient(90deg, transparent, #38bdf8, transparent);
+    }
+    .icon-wrapper {
+      width: 64px;
+      height: 64px;
+      margin: 0 auto 16px;
+      background: radial-gradient(circle, rgba(56, 189, 248, 0.15) 0%, rgba(15, 23, 42, 0.4) 100%);
+      border: 1px solid rgba(56, 189, 248, 0.4);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 28px;
+      box-shadow: 0 0 20px rgba(56, 189, 248, 0.25);
+    }
+    .title {
+      text-align: center;
+      font-size: 19px;
+      font-weight: 800;
+      color: #ffffff;
+      margin-bottom: 6px;
+      letter-spacing: -0.3px;
+    }
+    .subtitle {
+      text-align: center;
+      font-size: 12px;
+      color: #94a3b8;
+      margin-bottom: 22px;
+      line-height: 1.5;
+    }
+    .badge-bar {
+      display: flex;
+      justify-content: center;
+      gap: 6px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+    .sec-badge {
+      font-size: 10px;
+      font-weight: 600;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: rgba(30, 41, 59, 0.8);
+      border: 1px solid #334155;
+      color: #cbd5e1;
+    }
+    .form-group {
+      margin-bottom: 16px;
+    }
+    .form-label {
+      display: block;
+      font-size: 12px;
+      font-weight: 700;
+      color: #e2e8f0;
+      margin-bottom: 8px;
+    }
+    .input-wrap {
+      position: relative;
+      display: flex;
+      align-items: center;
+    }
+    .input-field {
+      width: 100%;
+      background: #090e17;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 12px 42px 12px 14px;
+      color: #ffffff;
+      font-size: 14px;
+      outline: none;
+      transition: all 0.2s ease;
+      letter-spacing: 1px;
+    }
+    .input-field:focus {
+      border-color: #38bdf8;
+      box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.2);
+    }
+    .toggle-pass {
+      position: absolute;
+      left: 10px;
+      background: none;
+      border: none;
+      color: #94a3b8;
+      cursor: pointer;
+      font-size: 16px;
+      padding: 4px;
+    }
+    .btn-login {
+      width: 100%;
+      background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);
+      border: 1px solid #38bdf8;
+      border-radius: 10px;
+      padding: 12px 16px;
+      color: #ffffff;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: all 0.2s ease;
+      box-shadow: 0 4px 15px rgba(2, 132, 199, 0.35);
+    }
+    .btn-login:hover:not(:disabled) {
+      background: linear-gradient(135deg, #0369a1 0%, #075985 100%);
+      transform: translateY(-1px);
+    }
+    .btn-login:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      transform: none;
+    }
+    .alert-box {
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin-bottom: 16px;
+      font-size: 12px;
+      line-height: 1.5;
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+    }
+    .alert-danger {
+      background: rgba(239, 68, 68, 0.15);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      color: #fca5a5;
+    }
+    .alert-warning {
+      background: rgba(245, 158, 11, 0.15);
+      border: 1px solid rgba(245, 158, 11, 0.3);
+      color: #fcd34d;
+    }
+    .footer-note {
+      text-align: center;
+      font-size: 10px;
+      color: #64748b;
+      margin-top: 20px;
+      line-height: 1.6;
+    }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="shield-card">
+    <div class="icon-wrapper">🛡️</div>
+    <h1 class="title">بوابة الوصول المشفرة</h1>
+    <p class="subtitle">منطقة إدارية مقيدة ومحمية بجدار ناري مشفر ضد الاختراق والتخمين</p>
+
+    <div class="badge-bar">
+      <span class="sec-badge">🔒 تشفير SHA-256</span>
+      <span class="sec-badge">🛑 حظر تلقائي للـ IP</span>
+      <span class="sec-badge">🔐 جلسات HMAC</span>
+    </div>
+
+    <div id="lockout-banner" class="alert-box alert-danger ${isLocked ? '' : 'hidden'}">
+      <span>🛑</span>
+      <div>
+        <strong>تم حظر عنوان IP مؤقتاً</strong>
+        <div style="margin-top: 4px;">تجاوزت الحد الأقصى للمحاولات الخاطئة. يرجى الانتظار <span id="lock-countdown" style="font-weight: bold; font-family: monospace;">${remainingSeconds}</span> ثانية.</div>
+      </div>
+    </div>
+
+    <div id="error-banner" class="alert-box alert-warning hidden">
+      <span>⚠️</span>
+      <span id="error-text">كلمة المرور غير صحيحة.</span>
+    </div>
+
+    <form id="login-form" onsubmit="handleLogin(event)">
+      <div class="form-group">
+        <label class="form-label" for="password">كلمة مرور الإدارة الرئيسية (Master Password)</label>
+        <div class="input-wrap">
+          <input 
+            type="password" 
+            id="password" 
+            class="input-field" 
+            placeholder="أدخل كلمة المرور المشفرة..." 
+            autocomplete="current-password"
+            required
+            ${isLocked ? 'disabled' : ''}
+            autofocus
+          />
+          <button type="button" class="toggle-pass" onclick="togglePassVisibility()" tabindex="-1" title="إظهار/إخفاء">👁️</button>
+        </div>
+      </div>
+
+      <button type="submit" id="btn-submit" class="btn-login" ${isLocked ? 'disabled' : ''}>
+        <span>🔐</span>
+        <span id="btn-text">دخول آمن للنظام</span>
+      </button>
+    </form>
+
+    <div class="footer-note">
+      يتم تسجيل عنوان الـ IP والبيانات الأمنية لكل طلب لضمان سلامة قاعدة البيانات والخدمة.
+      ${clientIp ? `<div style="margin-top: 4px; font-family: monospace; color: #475569;">IP: ${clientIp}</div>` : ''}
+    </div>
+  </div>
+
+  <script>
+    let remainingLockTime = ${remainingSeconds};
+    let lockTimer = null;
+
+    if (remainingLockTime > 0) {
+      startLockCountdown();
+    }
+
+    function togglePassVisibility() {
+      const passInput = document.getElementById('password');
+      if (passInput.type === 'password') {
+        passInput.type = 'text';
+      } else {
+        passInput.type = 'password';
+      }
+    }
+
+    function startLockCountdown() {
+      const banner = document.getElementById('lockout-banner');
+      const counter = document.getElementById('lock-countdown');
+      const btn = document.getElementById('btn-submit');
+      const passInput = document.getElementById('password');
+
+      banner.classList.remove('hidden');
+      btn.disabled = true;
+      passInput.disabled = true;
+
+      if (lockTimer) clearInterval(lockTimer);
+
+      lockTimer = setInterval(() => {
+        remainingLockTime--;
+        if (counter) counter.textContent = remainingLockTime;
+
+        if (remainingLockTime <= 0) {
+          clearInterval(lockTimer);
+          banner.classList.add('hidden');
+          btn.disabled = false;
+          passInput.disabled = false;
+          passInput.focus();
+        }
+      }, 1000);
+    }
+
+    async function handleLogin(e) {
+      e.preventDefault();
+      const passInput = document.getElementById('password');
+      const password = passInput.value.trim();
+      const btn = document.getElementById('btn-submit');
+      const btnText = document.getElementById('btn-text');
+      const errBanner = document.getElementById('error-banner');
+      const errText = document.getElementById('error-text');
+
+      if (!password) return;
+
+      btn.disabled = true;
+      btnText.textContent = 'جارٍ التحقق المشفر...';
+      errBanner.classList.add('hidden');
+
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password })
+        });
+
+        const data = await res.json();
+
+        if (res.ok && data.success) {
+          btnText.textContent = '✅ تم التحقق، جارٍ الدخول...';
+          if (data.token) {
+            localStorage.setItem('lyd_admin_token', data.token);
+            // Set cookie fallback
+            document.cookie = 'lyd_admin_token=' + encodeURIComponent(data.token) + '; path=/; max-age=43200; SameSite=Lax';
+          }
+          setTimeout(() => {
+            window.location.reload();
+          }, 300);
+          return;
+        }
+
+        // Handle lock or failure
+        if (data.isLocked) {
+          remainingLockTime = data.remainingSeconds || 1800;
+          startLockCountdown();
+        } else {
+          errBanner.classList.remove('hidden');
+          const left = data.attemptsLeft !== undefined ? (' (المحاولات المتبقية: ' + data.attemptsLeft + ')') : '';
+          errText.textContent = (data.error || 'كلمة المرور غير صحيحة') + left;
+          passInput.value = '';
+          passInput.focus();
+        }
+      } catch (err) {
+        errBanner.classList.remove('hidden');
+        errText.textContent = 'تعذّر الاتصال بخادم الحماية، يرجى المحاولة لاحقاً.';
+      } finally {
+        if (!remainingLockTime || remainingLockTime <= 0) {
+          btn.disabled = false;
+          btnText.textContent = 'دخول آمن للنظام';
+        }
+      }
+    }
+  </script>
+</body>
+</html>`;
+}
+
 export function renderDashboardHtml(initialState?: any): string {
   const NAMES: Record<string, string> = {
     usd: 'الدولار الأمريكي (كاش)',
@@ -740,11 +1101,15 @@ export function renderDashboardHtml(initialState?: any): string {
       </div>
 
       <div class="header-actions">
+        <span class="status-badge" style="background: rgba(56, 189, 248, 0.15); color: #38bdf8; border-color: rgba(56, 189, 248, 0.3); font-size: 11px;">🛡️ جلسة آمنة</span>
         <button class="btn btn-secondary btn-sm" onclick="fetchDashboardData(true)" id="btn-refresh">
           🔄 تحديث
         </button>
         <button class="btn btn-primary btn-sm" onclick="triggerJob('refresh', 'تحديث شامل للأسعار')">
           ⚡ جلب الآن
+        </button>
+        <button class="btn btn-secondary btn-sm" onclick="logoutAdmin()" style="border-color: rgba(239, 68, 68, 0.4); color: #fca5a5;" title="تسجيل الخروج وإنهاء الجلسة">
+          🚪 خروج
         </button>
       </div>
     </div>
@@ -1648,6 +2013,50 @@ export function renderDashboardHtml(initialState?: any): string {
 
   <!-- CLIENT SCRIPTS -->
   <script>
+    // ─── AUTHENTICATED FETCH & SESSION INTERCEPTOR ───
+    const originalFetch = window.fetch;
+    window.fetch = async function(url, options = {}) {
+      options.headers = options.headers || {};
+      const token = localStorage.getItem('lyd_admin_token');
+      if (token) {
+        if (options.headers instanceof Headers) {
+          if (!options.headers.has('Authorization')) options.headers.set('Authorization', 'Bearer ' + token);
+          if (!options.headers.has('x-admin-token')) options.headers.set('x-admin-token', token);
+        } else if (Array.isArray(options.headers)) {
+          options.headers.push(['Authorization', 'Bearer ' + token]);
+          options.headers.push(['x-admin-token', token]);
+        } else {
+          if (!options.headers['Authorization']) options.headers['Authorization'] = 'Bearer ' + token;
+          if (!options.headers['x-admin-token']) options.headers['x-admin-token'] = token;
+        }
+      }
+
+      const res = await originalFetch(url, options);
+
+      // Handle session timeout / unauthorized
+      if (res.status === 401 && String(url).includes('/api/dashboard/')) {
+        if (pollTimer) clearInterval(pollTimer);
+        localStorage.removeItem('lyd_admin_token');
+        document.cookie = 'lyd_admin_token=; path=/; max-age=0; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+        showToast('انتهت صلاحية الجلسة، جارٍ التحويل لشاشة الدخول...', true);
+        setTimeout(() => {
+          window.location.reload();
+        }, 1200);
+      }
+
+      return res;
+    };
+
+    async function logoutAdmin() {
+      if (!confirm('هل أنت متأكد من رغبتك في تسجيل الخروج وإنهاء الجلسة الآمنة؟')) return;
+      try {
+        await originalFetch('/api/auth/logout', { method: 'POST' });
+      } catch (e) {}
+      localStorage.removeItem('lyd_admin_token');
+      document.cookie = 'lyd_admin_token=; path=/; max-age=0; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+      window.location.reload();
+    }
+
     let pollInterval = 5000;
     let pollTimer = null;
     let currentRates = null;
