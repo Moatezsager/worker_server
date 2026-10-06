@@ -1280,8 +1280,10 @@ export function formatSmartBroadcastMessage(
   const timeStr = `${hours}:${mins} ${period}`;
 
   const flagMap: Record<string, string> = {
-    'us': '💵', 'eu': '💶', 'gb': '💷', 'eg': '🇪🇬', 'tn': '🇹🇳', 'tr': '✈️',
-    'gold': '✨', 'silver': '🪙'
+    'us': '🇺🇸', 'eu': '🇪🇺', 'gb': '🇬🇧', 'uk': '🇬🇧', 'eg': '🇪🇬', 'tn': '🇹🇳', 
+    'tr': '🇹🇷', 'ae': '🇦🇪', 'cn': '🇨🇳', 'sa': '🇸🇦', 'jo': '🇯🇴', 'kw': '🇰🇼', 
+    'qa': '🇶🇦', 'bh': '🇧🇭', 'ca': '🇨🇦', 'au': '🇦🇺', 'ch': '🇨🇭', 'jp': '🇯🇵',
+    'se': '🇸🇪', 'no': '🇳🇴', 'dk': '🇩🇰', 'gold': '🥇', 'silver': '🪙'
   };
 
   const sorted = [...updates].sort((a, b) => getBroadcastDisplayRank(a) - getBroadcastDisplayRank(b));
@@ -1291,11 +1293,23 @@ export function formatSmartBroadcastMessage(
     const isDown = u.newVal < u.oldVal;
     const diff = Math.abs(u.newVal - u.oldVal);
 
-    let fe = flagMap[u.flag] || '💰';
-    if (u.id === 'USD') fe = '💵';
-    if (u.id === 'USD_CHECKS') fe = '🏦';
-    if (u.id?.startsWith('GOLD')) fe = '✨';
-    if (u.id?.startsWith('SILVER')) fe = '🪙';
+    let fe = flagMap[(u.flag || '').toLowerCase()] || '💰';
+    if (u.id === 'USD') fe = '🇺🇸';
+    else if (u.id === 'USD_CHECKS' || u.id === 'USD_JBANK' || u.id === 'USD_NCB' || u.id === 'USD_BCD' || u.id === 'USD_AB' || u.id === 'USD_WB' || u.id === 'USD_SUKUK') fe = '🏦';
+    else if (u.id === 'EUR') fe = '🇪🇺';
+    else if (u.id === 'GBP') fe = '🇬🇧';
+    else if (u.id === 'TRY' || u.id === 'USD_TR') fe = '🇹🇷';
+    else if (u.id === 'EGP') fe = '🇪🇬';
+    else if (u.id === 'TND') fe = '🇹🇳';
+    else if (u.id === 'AED' || u.id === 'USD_AE') fe = '🇦🇪';
+    else if (u.id === 'CNY' || u.id === 'USD_CN') fe = '🇨🇳';
+    else if (u.id === 'SAR') fe = '🇸🇦';
+    else if (u.id === 'JOD') fe = '🇯🇴';
+    else if (u.id === 'KWD') fe = '🇰🇼';
+    else if (u.id === 'QAR') fe = '🇶🇦';
+    else if (u.id === 'BHD') fe = '🇧🇭';
+    else if (u.id?.startsWith('GOLD') || u.flag === 'gold') fe = '🥇';
+    else if (u.id?.startsWith('SILVER') || u.flag === 'silver') fe = '🪙';
 
     let displayName = u.name;
     if (u.id === 'USD' && !displayName.includes('كاش')) {
