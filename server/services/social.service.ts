@@ -1011,14 +1011,140 @@ export interface QueuedRateUpdate {
 
 export let smartBroadcastQueue: Map<string, QueuedRateUpdate> = new Map();
 export let smartBroadcastAggregationTimer: NodeJS.Timeout | null = null;
+export let smartBroadcastAggregationTimerStartedAt: number | null = null;
 export let smartBroadcastWatchdogInterval: NodeJS.Timeout | null = null;
+
+export function isQuietHoursActive(): { isActive: boolean; reason?: string; quietStart: string; quietEnd: string } {
+  const quietStart = appConfig.quietHoursStart || "01:00";
+  const quietEnd = appConfig.quietHoursEnd || "08:30";
+
+  if (!appConfig.quietHoursEnabled) {
+    return { isActive: false, quietStart, quietEnd };
+  }
+
+  const [startH, startM] = quietStart.split(':').map(Number);
+  const [endH, endM] = quietEnd.split(':').map(Number);
+
+  const now = new Date();
+  const libya = getLibyaTimeInfo(now);
+  const curMinutes = libya.hour * 60 + libya.minute;
+  const startMinutes = (isNaN(startH) ? 1 : startH) * 60 + (isNaN(startM) ? 0 : startM);
+  const endMinutes = (isNaN(endH) ? 8 : endH) * 60 + (isNaN(endM) ? 30 : endM);
+
+  let inRange = false;
+  if (startMinutes <= endMinutes) {
+    inRange = curMinutes >= startMinutes && curMinutes < endMinutes;
+  } else {
+    inRange = curMinutes >= startMinutes || curMinutes < endMinutes;
+  }
+
+  return {
+    isActive: inRange,
+    reason: inRange ? `وضع الصمت الليلي نشط (${quietStart} إلى ${quietEnd})` : undefined,
+    quietStart,
+    quietEnd
+  };
+}
+
+export function removeQueueItem(itemIdOrKey: string): { success: boolean; removedName?: string; remainingCount: number } {
+  if (!itemIdOrKey) return { success: false, remainingCount: smartBroadcastQueue.size };
+  const targetKey = itemIdOrKey.toUpperCase();
+  let foundKey: string | null = null;
+  let removedName = "";
+
+  for (const [key, item] of smartBroadcastQueue.entries()) {
+    if (key === targetKey || (item.id && item.id.toUpperCase() === targetKey) || item.name === itemIdOrKey) {
+      foundKey = key;
+      removedName = item.name;
+      break;
+    }
+  }
+
+  if (foundKey) {
+    smartBroadcastQueue.delete(foundKey);
+    if (smartBroadcastQueue.size === 0 && smartBroadcastAggregationTimer) {
+      clearTimeout(smartBroadcastAggregationTimer);
+      smartBroadcastAggregationTimer = null;
+      smartBroadcastAggregationTimerStartedAt = null;
+    }
+    return { success: true, removedName, remainingCount: smartBroadcastQueue.size };
+  }
+
+  return { success: false, remainingCount: smartBroadcastQueue.size };
+}
+
+export function getBroadcastQueuePreview(): { 
+  message: string; 
+  itemCount: number; 
+  charactersCount: number; 
+  linesCount: number;
+  items: { id: string; name: string; newVal: number; oldVal: number; diff: number; flag: string }[] 
+} {
+  const rawQueuedItems = Array.from(smartBroadcastQueue.values()).map(item => ({
+    id: item.id,
+    name: item.name,
+    oldVal: item.oldVal,
+    newVal: item.newVal,
+    flag: item.flag
+  }));
+
+  if (rawQueuedItems.length === 0) {
+    return {
+      message: "⚠️ طابور التحديثات فارغ حالياً (لا توجد عملات بانتظار النشر).",
+      itemCount: 0,
+      charactersCount: 0,
+      linesCount: 0,
+      items: []
+    };
+  }
+
+  const sanitized = sanitizeBroadcastUpdates(rawQueuedItems, false);
+  const message = formatSmartBroadcastMessage(sanitized);
+
+  return {
+    message,
+    itemCount: sanitized.length,
+    charactersCount: message.length,
+    linesCount: message.split('\n').length,
+    items: sanitized.map(u => ({
+      id: u.id || '',
+      name: u.name,
+      newVal: u.newVal,
+      oldVal: u.oldVal,
+      diff: Number((u.newVal - u.oldVal).toFixed(3)),
+      flag: u.flag
+    }))
+  };
+}
 
 export function getBroadcastQueueStatus() {
   const now = Date.now();
   const minIntervalMs = Math.max(1, appConfig.minBroadcastIntervalMinutes ?? 20) * 60 * 1000;
   const timeSinceLast = lastSocialBroadcastTime ? (now - lastSocialBroadcastTime) : 999999999;
   const isCooldownActive = timeSinceLast < minIntervalMs;
-  const cooldownRemainingMs = isCooldownActive ? (minIntervalMs - timeSinceLast) : 0;
+  const cooldownRemainingMs = isCooldownActive ? Math.max(0, minIntervalMs - timeSinceLast) : 0;
+  const cooldownRemainingSeconds = Math.ceil(cooldownRemainingMs / 1000);
+  const cooldownTotalSeconds = Math.round(minIntervalMs / 1000);
+
+  // Quiet hours check
+  const quietHours = isQuietHoursActive();
+
+  // Aggregation window status
+  const aggWindowMs = Math.max(10, appConfig.aggregationWindowSeconds ?? 45) * 1000;
+  let aggregationRemainingMs = 0;
+  if (smartBroadcastAggregationTimer && smartBroadcastAggregationTimerStartedAt) {
+    aggregationRemainingMs = Math.max(0, aggWindowMs - (now - smartBroadcastAggregationTimerStartedAt));
+  }
+  const isAggregating = !!smartBroadcastAggregationTimer;
+  const aggregationRemainingSeconds = Math.ceil(aggregationRemainingMs / 1000);
+
+  // Next broadcast wait seconds
+  let nextBroadcastWaitSeconds = 0;
+  if (isCooldownActive) {
+    nextBroadcastWaitSeconds = cooldownRemainingSeconds;
+  } else if (isAggregating) {
+    nextBroadcastWaitSeconds = aggregationRemainingSeconds;
+  }
 
   const items = Array.from(smartBroadcastQueue.values()).map(item => ({
     id: item.id,
@@ -1037,7 +1163,17 @@ export function getBroadcastQueueStatus() {
     lastSocialBroadcastTime,
     isCooldownActive,
     cooldownRemainingMs,
+    cooldownRemainingSeconds,
+    cooldownTotalSeconds,
     cooldownRemainingMinutes: Math.ceil(cooldownRemainingMs / 60000),
+    isAggregating,
+    aggregationRemainingSeconds,
+    nextBroadcastWaitSeconds,
+    quietHours,
+    quietHoursEnabled: !!appConfig.quietHoursEnabled,
+    quietHoursStart: appConfig.quietHoursStart || "01:00",
+    quietHoursEnd: appConfig.quietHoursEnd || "08:30",
+    minBroadcastIntervalMinutes: appConfig.minBroadcastIntervalMinutes ?? 20,
     minIntervalMinutes: appConfig.minBroadcastIntervalMinutes ?? 20,
     minPriceChangeThreshold: appConfig.minPriceChangeThreshold ?? 0.015,
     aggregationWindowSeconds: appConfig.aggregationWindowSeconds ?? 45,
@@ -1046,14 +1182,41 @@ export function getBroadcastQueueStatus() {
   };
 }
 
-export function clearBroadcastQueue(): number {
+export function clearBroadcastQueue(resetCooldown: boolean = true): { count: number; cooldownReset: boolean; cooldownRemainingSeconds: number } {
   if (smartBroadcastAggregationTimer) {
     clearTimeout(smartBroadcastAggregationTimer);
     smartBroadcastAggregationTimer = null;
   }
+  smartBroadcastAggregationTimerStartedAt = null;
   const count = smartBroadcastQueue.size;
   smartBroadcastQueue.clear();
-  return count;
+
+  if (resetCooldown) {
+    // تصفير وقت الانتظار وبدء العد التنازلي من جديد من اللحظة الحالية
+    lastSocialBroadcastTime = Date.now();
+  }
+
+  const minIntervalMs = Math.max(1, appConfig.minBroadcastIntervalMinutes ?? 20) * 60 * 1000;
+  const cooldownRemainingSeconds = resetCooldown 
+    ? Math.round(minIntervalMs / 1000) 
+    : Math.max(0, Math.ceil((minIntervalMs - (Date.now() - (lastSocialBroadcastTime || 0))) / 1000));
+
+  return {
+    count,
+    cooldownReset: resetCooldown,
+    cooldownRemainingSeconds
+  };
+}
+
+export function resetBroadcastCooldown(toZero: boolean = false): { cooldownRemainingSeconds: number } {
+  if (toZero) {
+    lastSocialBroadcastTime = 0;
+    return { cooldownRemainingSeconds: 0 };
+  } else {
+    lastSocialBroadcastTime = Date.now();
+    const minIntervalMs = Math.max(1, appConfig.minBroadcastIntervalMinutes ?? 20) * 60 * 1000;
+    return { cooldownRemainingSeconds: Math.round(minIntervalMs / 1000) };
+  }
 }
 
 export async function flushBroadcastQueueImmediately(target?: 'all' | 'telegram' | 'facebook', isManual = true) {
@@ -1061,6 +1224,7 @@ export async function flushBroadcastQueueImmediately(target?: 'all' | 'telegram'
     clearTimeout(smartBroadcastAggregationTimer);
     smartBroadcastAggregationTimer = null;
   }
+  smartBroadcastAggregationTimerStartedAt = null;
   const updates = Array.from(smartBroadcastQueue.values()).map(item => ({
     id: item.id,
     name: item.name,
@@ -1082,6 +1246,13 @@ export async function flushBroadcastQueueImmediately(target?: 'all' | 'telegram'
 export async function processSmartBroadcastQueue(): Promise<boolean> {
   if (smartBroadcastQueue.size === 0) return false;
   if (!appConfig.telegramAutoPost && !appConfig.facebookAutoPost) return false;
+
+  // 🌙 فحص ساعات الصمت الليلي لمنع إزعاج المتابعين أثناء الليل
+  const quietCheck = isQuietHoursActive();
+  if (quietCheck.isActive) {
+    console.log(`[SmartBroadcastQueue] 🌙 Quiet hours active (${quietCheck.reason}). Holding ${smartBroadcastQueue.size} items in queue until morning.`);
+    return false;
+  }
 
   const now = Date.now();
   const minIntervalMs = Math.max(1, appConfig.minBroadcastIntervalMinutes ?? 20) * 60 * 1000;
@@ -1193,8 +1364,10 @@ export async function broadcastRateChanges(
 
   const aggWindowMs = Math.max(10, appConfig.aggregationWindowSeconds ?? 45) * 1000;
   if (!smartBroadcastAggregationTimer) {
+    smartBroadcastAggregationTimerStartedAt = Date.now();
     smartBroadcastAggregationTimer = setTimeout(() => {
       smartBroadcastAggregationTimer = null;
+      smartBroadcastAggregationTimerStartedAt = null;
       processSmartBroadcastQueue().catch(e => console.error("[SmartBroadcastQueue] Queue processing error:", e));
     }, aggWindowMs);
   }

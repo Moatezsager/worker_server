@@ -16,6 +16,9 @@ export let appConfig: AppConfig = {
   aggregationWindowSeconds: 45,
   smartConsolidatedPost: true,
   hourlyPostLimit: 4,
+  quietHoursEnabled: false,
+  quietHoursStart: "01:00",
+  quietHoursEnd: "08:30",
   apiConfig: {
     enabled: true,
     rateLimitWindowMs: 60000,

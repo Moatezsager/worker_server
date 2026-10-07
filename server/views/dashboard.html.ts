@@ -1695,8 +1695,33 @@ export function renderDashboardHtml(initialState?: any): string {
             <span id="queue-status-badge" class="status-badge" style="background:rgba(56,189,248,0.15); color:#38bdf8; font-size:11px; font-weight:700;">
               جاري الفحص...
             </span>
+            <button class="btn btn-secondary btn-sm" onclick="openBroadcastPreviewModal()" title="معاينة شكل المنشور المنسق كما سيصل للمتابعين">👁️ معاينة</button>
             <button class="btn btn-primary btn-sm" onclick="flushBroadcastQueue()">🚀 نشر الطابور فوراً</button>
-            <button class="btn btn-secondary btn-sm" onclick="clearBroadcastQueueClient()">🗑️ مسح</button>
+            <button class="btn btn-secondary btn-sm" onclick="clearBroadcastQueueClient()" title="مسح الطابور وتصفير الوقت للبدء من جديد">🗑️ مسح</button>
+          </div>
+        </div>
+
+        <!-- LIVE COUNTDOWN TIMER BAR -->
+        <div id="queue-countdown-box" style="background:linear-gradient(135deg, rgba(15, 23, 42, 0.95), rgba(30, 41, 59, 0.9)); border:1px solid #334155; border-radius:8px; padding:10px 14px; margin-bottom:12px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px;">
+          <div style="display:flex; align-items:center; gap:12px;">
+            <div id="queue-countdown-icon-wrap" style="width:40px; height:40px; border-radius:8px; background:rgba(56,189,248,0.12); border:1px solid rgba(56,189,248,0.25); display:flex; align-items:center; justify-content:center; font-size:20px; flex-shrink:0;">
+              ⏳
+            </div>
+            <div>
+              <div style="font-size:11px; color:#94a3b8; font-weight:600;">الوقت المتبقي حتى موعد النشر التلقائي القادم:</div>
+              <div style="display:flex; align-items:baseline; gap:8px; margin-top:2px;">
+                <span id="queue-countdown-clock" class="font-num" style="font-size:22px; font-weight:800; color:#38bdf8; letter-spacing:1px; font-family:monospace; line-height:1;">00:00</span>
+                <span id="queue-countdown-status-text" style="font-size:11px; color:#94a3b8;">(جاهز للنشر)</span>
+              </div>
+            </div>
+          </div>
+          <div style="display:flex; gap:6px; align-items:center;">
+            <button type="button" class="btn btn-secondary btn-sm" onclick="resetBroadcastCooldownOnly()" title="تصفير وإعادة تشغيل عداد الوقت للبدء من جديد" style="font-size:11px; padding:5px 10px;">
+              🔄 إعادة تشغيل العداد
+            </button>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="bypassBroadcastCooldown()" title="تجاوز فترة الانتظار وإتاحة النشر فوراً دون انتظار العداد" style="font-size:11px; padding:5px 10px; color:#34d399; border-color:rgba(52,211,153,0.3);">
+              ⚡ إتاحة النشر فوراً
+            </button>
           </div>
         </div>
 
@@ -1733,6 +1758,31 @@ export function renderDashboardHtml(initialState?: any): string {
               <input type="number" id="setting-hourly-cap" class="form-input font-num" min="1" max="20" placeholder="4">
               <div style="font-size:10px; color:#64748b; margin-top:2px;">سقف المنشورات التلقائية لكل ساعة حماية للقناة</div>
             </div>
+          </div>
+
+          <!-- QUIET HOURS CONFIGURATION -->
+          <div style="margin-top:12px; margin-bottom:12px; padding:10px 12px; background:rgba(15,23,42,0.6); border:1px solid #334155; border-radius:8px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+              <label style="font-size:12px; color:#fbbf24; font-weight:700; display:flex; align-items:center; gap:6px; cursor:pointer;">
+                <input type="checkbox" id="setting-quiet-hours-enabled">
+                <span>🌙 تفعيل ساعات الصمت الليلي (كتم النشر التلقائي أثناء نوم المتابعين)</span>
+              </label>
+              <span style="font-size:10px; color:#94a3b8;">توقيت ليبيا (UTC+2)</span>
+            </div>
+
+            <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:10px;">
+              <div class="form-group" style="margin-bottom:0;">
+                <label class="form-label" style="font-size:11px;">بداية الصمت الليلي:</label>
+                <input type="time" id="setting-quiet-hours-start" class="form-input font-num" value="01:00">
+                <div style="font-size:10px; color:#64748b; margin-top:2px;">بدء حظر إرسال الإشعارات التلقائية للمتابعين</div>
+              </div>
+              <div class="form-group" style="margin-bottom:0;">
+                <label class="form-label" style="font-size:11px;">انتهاء الصمت الليلي (استئناف النشر):</label>
+                <input type="time" id="setting-quiet-hours-end" class="form-input font-num" value="08:30">
+                <div style="font-size:10px; color:#64748b; margin-top:2px;">موعد استئناف النشر وإرسال النشرة الصباحية المجمعة</div>
+              </div>
+            </div>
+            <div style="font-size:10px; color:#64748b; margin-top:6px;">💡 يتم الاحتفاظ بالتحديثات في الطابور ونشرها صباحاً دون إزعاج. النشر اليدوي عبر "نشر الطابور فوراً" متاح في أي وقت.</div>
           </div>
 
           <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
@@ -1802,6 +1852,44 @@ export function renderDashboardHtml(initialState?: any): string {
       <div style="display: flex; justify-content: flex-end; gap: 8px;">
         <button class="btn btn-secondary" onclick="closeRateModal()">إلغاء</button>
         <button class="btn btn-primary" onclick="saveRateModal()">حفظ ومزامنة</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- BROADCAST QUEUE LIVE PREVIEW MODAL -->
+  <div id="queue-preview-modal" class="modal-overlay hidden">
+    <div class="modal-box modal-box-large" style="max-width:580px; max-height:92vh; display:flex; flex-direction:column; padding:0; overflow:hidden;">
+      <div style="padding:14px 18px; background:#0f172a; border-bottom:1px solid #334155; display:flex; justify-content:space-between; align-items:center;">
+        <div>
+          <div style="font-size:15px; font-weight:800; color:#ffffff; display:flex; align-items:center; gap:8px;">
+            <span>👁️ معاينة شكل المنشور الموحد</span>
+          </div>
+          <div style="font-size:11px; color:#94a3b8; margin-top:2px;">
+            هذا هو الشكل النهائي للرسالة الموحدة المدمجة كما ستظهر تماماً للمتابعين على تيليجرام وفيسبوك
+          </div>
+        </div>
+        <button class="btn btn-secondary btn-sm" onclick="closeBroadcastPreviewModal()" style="padding:2px 8px;">✕</button>
+      </div>
+
+      <div style="padding:8px 18px; background:#1e293b; border-bottom:1px solid #334155; display:flex; justify-content:space-between; align-items:center; font-size:11px; color:#94a3b8; flex-wrap:wrap; gap:6px;">
+        <span id="preview-stat-count">📦 العملات: 0</span>
+        <span id="preview-stat-chars">📝 الأحرف: 0</span>
+        <span id="preview-stat-lines">📏 الأسطر: 0</span>
+        <span id="preview-stat-target" style="color:#38bdf8;">🌐 الوجهة: تيليجرام / فيسبوك</span>
+      </div>
+
+      <div style="padding:16px; background:#0b1120; overflow-y:auto; flex:1;">
+        <div id="preview-message-body" style="background:#1e293b; border:1px solid #334155; border-radius:10px; padding:16px; color:#f1f5f9; font-size:13px; line-height:1.8; white-space:pre-wrap; font-family:system-ui, -apple-system, sans-serif; box-shadow:inset 0 2px 4px rgba(0,0,0,0.3);">
+          جاري تجهيز المعاينة الحية...
+        </div>
+      </div>
+
+      <div style="padding:12px 18px; background:#0f172a; border-top:1px solid #334155; display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
+        <button class="btn btn-secondary btn-sm" onclick="copyPreviewMessageText()">📋 نسخ نص المنشور</button>
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-secondary btn-sm" onclick="closeBroadcastPreviewModal()">إغلاق</button>
+          <button class="btn btn-primary btn-sm" onclick="flushQueueFromPreview()">🚀 نشر الطابور فوراً</button>
+        </div>
       </div>
     </div>
   </div>
@@ -2489,12 +2577,18 @@ export function renderDashboardHtml(initialState?: any): string {
         const aggEl = document.getElementById('setting-agg-window');
         const capEl = document.getElementById('setting-hourly-cap');
         const checkEl = document.getElementById('setting-smart-consolidated');
+        const quietEnabledEl = document.getElementById('setting-quiet-hours-enabled');
+        const quietStartEl = document.getElementById('setting-quiet-hours-start');
+        const quietEndEl = document.getElementById('setting-quiet-hours-end');
 
         if (intervalEl) intervalEl.value = data.broadcastConfig.minBroadcastIntervalMinutes || 20;
         if (threshEl) threshEl.value = data.broadcastConfig.minPriceChangeThreshold || 0.015;
         if (aggEl) aggEl.value = data.broadcastConfig.aggregationWindowSeconds || 45;
         if (capEl) capEl.value = data.broadcastConfig.hourlyPostLimit || 4;
         if (checkEl) checkEl.checked = Boolean(data.broadcastConfig.smartConsolidatedPost !== false);
+        if (quietEnabledEl) quietEnabledEl.checked = Boolean(data.broadcastConfig.quietHoursEnabled);
+        if (quietStartEl && data.broadcastConfig.quietHoursStart) quietStartEl.value = data.broadcastConfig.quietHoursStart;
+        if (quietEndEl && data.broadcastConfig.quietHoursEnd) quietEndEl.value = data.broadcastConfig.quietHoursEnd;
       }
 
       if (data.broadcastQueue) {
@@ -3491,25 +3585,144 @@ export function renderDashboardHtml(initialState?: any): string {
       }
     }
 
-    function renderQueueUI(q) {
-      const badge = document.getElementById('queue-status-badge');
-      const container = document.getElementById('queue-items-container');
+    let queueCountdownTimer = null;
+    let localRemainingSeconds = 0;
+    let isCooldownActiveState = false;
+    let isAggregatingState = false;
+    let isQuietHoursActiveState = false;
+    let quietHoursEndStr = '08:30';
+    let queueItemsCount = 0;
+    let currentPreviewText = '';
 
-      if (badge) {
-        if (q.isCooldownActive) {
-          badge.style.background = 'rgba(245, 158, 11, 0.15)';
+    function formatTimeSeconds(totalSec) {
+      if (totalSec <= 0) return '00:00';
+      const m = Math.floor(totalSec / 60);
+      const s = totalSec % 60;
+      return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+    }
+
+    function updateQueueTickerDisplay() {
+      const clock = document.getElementById('queue-countdown-clock');
+      const statusText = document.getElementById('queue-countdown-status-text');
+      const badge = document.getElementById('queue-status-badge');
+      const iconWrap = document.getElementById('queue-countdown-icon-wrap');
+
+      // 🌙 إذا كانت ساعات الصمت الليلي نشطة
+      if (isQuietHoursActiveState) {
+        if (clock) {
+          clock.textContent = quietHoursEndStr || '08:30';
+          clock.style.color = '#fbbf24';
+        }
+        if (iconWrap) {
+          iconWrap.innerHTML = '🌙';
+          iconWrap.style.borderColor = 'rgba(251, 191, 36, 0.4)';
+        }
+        if (statusText) statusText.textContent = '(وضع الصمت الليلي نشط حتى ' + (quietHoursEndStr || '08:30') + ' - النشر التلقائي محجوز للصباح لمنع الإزعاج)';
+        if (badge) {
+          badge.style.background = 'rgba(251, 191, 36, 0.15)';
           badge.style.color = '#fbbf24';
-          badge.textContent = '⏳ فترة انتظار (' + q.cooldownRemainingMinutes + ' دقيقة متبقية)';
-        } else if (q.queueSize > 0) {
-          badge.style.background = 'rgba(16, 185, 129, 0.15)';
-          badge.style.color = '#34d399';
-          badge.textContent = '🟢 جاهز للنشر (' + q.queueSize + ' عملة بالانتظار)';
+          badge.textContent = '🌙 صمت ليلي (حتى ' + (quietHoursEndStr || '08:30') + ')';
+        }
+        return;
+      }
+
+      const timeFormatted = formatTimeSeconds(localRemainingSeconds);
+
+      if (clock) {
+        clock.textContent = timeFormatted;
+        if (localRemainingSeconds > 0) {
+          clock.style.color = '#38bdf8';
         } else {
-          badge.style.background = 'rgba(56, 189, 248, 0.15)';
-          badge.style.color = '#38bdf8';
-          badge.textContent = '🟢 خامل (0 بالانتظار)';
+          clock.style.color = '#34d399';
         }
       }
+
+      if (localRemainingSeconds > 0) {
+        if (iconWrap) {
+          iconWrap.innerHTML = '⏳';
+          iconWrap.style.borderColor = 'rgba(56, 189, 248, 0.4)';
+        }
+        if (isCooldownActiveState) {
+          if (statusText) statusText.textContent = '(فترة التهدئة نشطة لمنع الإزعاج - النشر التلقائي بعد ' + timeFormatted + ')';
+          if (badge) {
+            badge.style.background = 'rgba(245, 158, 11, 0.15)';
+            badge.style.color = '#fbbf24';
+            badge.textContent = '⏳ متبقي ' + timeFormatted + ' للنشر';
+          }
+        } else if (isAggregatingState) {
+          if (statusText) statusText.textContent = '(جاري تجميع التحديثات في الطابور - النشر خلال ' + timeFormatted + ')';
+          if (badge) {
+            badge.style.background = 'rgba(56, 189, 248, 0.15)';
+            badge.style.color = '#38bdf8';
+            badge.textContent = '🔄 تجميع (' + timeFormatted + ')';
+          }
+        } else {
+          if (statusText) statusText.textContent = '(موعد النشر بعد ' + timeFormatted + ')';
+          if (badge) {
+            badge.style.background = 'rgba(245, 158, 11, 0.15)';
+            badge.style.color = '#fbbf24';
+            badge.textContent = '⏳ متبقي ' + timeFormatted;
+          }
+        }
+      } else {
+        if (iconWrap) {
+          iconWrap.innerHTML = '🟢';
+          iconWrap.style.borderColor = 'rgba(52, 211, 153, 0.4)';
+        }
+        if (queueItemsCount > 0) {
+          if (statusText) statusText.textContent = '(فترة الانتظار انتهت - جاهز للنشر الفوري لـ ' + queueItemsCount + ' عملة)';
+          if (badge) {
+            badge.style.background = 'rgba(16, 185, 129, 0.15)';
+            badge.style.color = '#34d399';
+            badge.textContent = '🟢 جاهز للنشر (' + queueItemsCount + ' عملة بالانتظار)';
+          }
+        } else {
+          if (statusText) statusText.textContent = '(فترة الانتظار غير نشطة - جاهز للنشر فور ورود أي أسعار جديدة)';
+          if (badge) {
+            badge.style.background = 'rgba(56, 189, 248, 0.15)';
+            badge.style.color = '#38bdf8';
+            badge.textContent = '🟢 جاهز للنشر (0 بالانتظار)';
+          }
+        }
+      }
+    }
+
+    function startQueueCountdownLoop() {
+      if (queueCountdownTimer) return;
+      queueCountdownTimer = setInterval(() => {
+        if (localRemainingSeconds > 0 && !isQuietHoursActiveState) {
+          localRemainingSeconds--;
+          updateQueueTickerDisplay();
+          if (localRemainingSeconds === 0) {
+            fetchBroadcastQueue();
+          }
+        }
+      }, 1000);
+    }
+
+    function renderQueueUI(q) {
+      const container = document.getElementById('queue-items-container');
+
+      isCooldownActiveState = Boolean(q.isCooldownActive);
+      isAggregatingState = Boolean(q.isAggregating);
+      isQuietHoursActiveState = Boolean(q.quietHours?.isActive);
+      quietHoursEndStr = q.quietHours?.quietEnd || '08:30';
+      queueItemsCount = Number(q.queueSize || 0);
+
+      if (q.nextBroadcastWaitSeconds !== undefined) {
+        localRemainingSeconds = Number(q.nextBroadcastWaitSeconds);
+      } else if (q.isCooldownActive && q.cooldownRemainingSeconds !== undefined) {
+        localRemainingSeconds = Number(q.cooldownRemainingSeconds);
+      } else if (q.isAggregating && q.aggregationRemainingSeconds !== undefined) {
+        localRemainingSeconds = Number(q.aggregationRemainingSeconds);
+      } else if (q.isCooldownActive && q.cooldownRemainingMinutes) {
+        localRemainingSeconds = Number(q.cooldownRemainingMinutes) * 60;
+      } else {
+        localRemainingSeconds = 0;
+      }
+
+      updateQueueTickerDisplay();
+      startQueueCountdownLoop();
 
       if (container) {
         if (!q.items || q.items.length === 0) {
@@ -3521,7 +3734,9 @@ export function renderDashboardHtml(initialState?: any): string {
             const isDown = item.diff < 0;
             const color = isUp ? '#34d399' : isDown ? '#f87171' : '#cbd5e1';
             const sign = isUp ? '+' : '';
+            const itemIdStr = item.id || item.name;
             html += '<div style="background:#1e293b; border:1px solid #334155; border-radius:6px; padding:6px 10px; font-size:11px; display:flex; align-items:center; gap:6px;">' +
+              '<button type="button" onclick="removeSingleQueueItem(\'' + itemIdStr + '\', event)" style="background:rgba(239,68,68,0.2); border:1px solid rgba(239,68,68,0.3); color:#fca5a5; border-radius:4px; width:18px; height:18px; display:inline-flex; align-items:center; justify-content:center; font-size:10px; cursor:pointer; padding:0; line-height:1; margin-left:2px;" title="استبعاد هذه العملة من الطابور">✕</button>' +
               '<span style="font-weight:700; color:#f1f5f9;">' + item.name + '</span>' +
               '<span class="font-num" style="color:#cbd5e1;">' + Number(item.newVal).toFixed(2) + '</span>' +
               '<span class="font-num" style="color:' + color + '; font-weight:700;">(' + sign + item.diff + ')</span>' +
@@ -3532,6 +3747,87 @@ export function renderDashboardHtml(initialState?: any): string {
           container.innerHTML = html;
         }
       }
+    }
+
+    async function removeSingleQueueItem(id, event) {
+      if (event) {
+        event.stopPropagation();
+        event.preventDefault();
+      }
+      if (!confirm('هل تريد استبعاد هذه العملة من الطابور؟')) return;
+      showToast('جاري استبعاد العملة من الطابور...');
+      try {
+        const res = await fetch('/api/dashboard/broadcast/queue/remove-item', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast(data.message || 'تم استبعاد العملة من الطابور');
+          fetchBroadcastQueue();
+        } else {
+          showToast('فشل الاستبعاد: ' + (data.error || 'خطأ'), true);
+        }
+      } catch (err) {
+        showToast('خطأ بالاتصال: ' + err.message, true);
+      }
+    }
+
+    async function openBroadcastPreviewModal() {
+      const modal = document.getElementById('queue-preview-modal');
+      const body = document.getElementById('preview-message-body');
+      const countEl = document.getElementById('preview-stat-count');
+      const charsEl = document.getElementById('preview-stat-chars');
+      const linesEl = document.getElementById('preview-stat-lines');
+
+      if (body) body.textContent = '⏳ جاري توليد المعاينة الحية للمنشور الموحد...';
+      if (modal) modal.classList.remove('hidden');
+
+      try {
+        const res = await fetch('/api/dashboard/broadcast/queue/preview');
+        const data = await res.json();
+        if (data.success) {
+          currentPreviewText = data.message || '';
+          if (body) body.textContent = currentPreviewText;
+          if (countEl) countEl.textContent = '📦 العملات: ' + (data.itemCount || 0);
+          if (charsEl) charsEl.textContent = '📝 الأحرف: ' + (data.charactersCount || currentPreviewText.length);
+          if (linesEl) linesEl.textContent = '📏 الأسطر: ' + (data.linesCount || currentPreviewText.split('\n').length);
+        } else {
+          if (body) body.textContent = '❌ تعذر توليد المعاينة: ' + (data.error || 'خطأ غير معروف');
+        }
+      } catch (err) {
+        if (body) body.textContent = '❌ خطأ بالاتصال: ' + err.message;
+      }
+    }
+
+    function closeBroadcastPreviewModal() {
+      const modal = document.getElementById('queue-preview-modal');
+      if (modal) modal.classList.add('hidden');
+    }
+
+    async function copyPreviewMessageText() {
+      if (!currentPreviewText) {
+        showToast('لا يوجد نص لنسخه', true);
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(currentPreviewText);
+        showToast('تم نسخ نص المنشور بنجاح إلى الحافظة 📋');
+      } catch (e) {
+        const ta = document.createElement('textarea');
+        ta.value = currentPreviewText;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        showToast('تم نسخ نص المنشور بنجاح 📋');
+      }
+    }
+
+    async function flushQueueFromPreview() {
+      closeBroadcastPreviewModal();
+      await flushBroadcastQueue();
     }
 
     async function fetchBroadcastQueue() {
@@ -3561,16 +3857,80 @@ export function renderDashboardHtml(initialState?: any): string {
     }
 
     async function clearBroadcastQueueClient() {
-      if (!confirm('هل أنت متأكد من مسح جميع العملات المنتظرة في الطابور دون نشرها؟')) return;
-      showToast('جاري مسح الطابور...');
+      if (!confirm('هل أنت متأكد من مسح جميع العملات المنتظرة في الطابور وتصفير عداد الوقت للبدء من جديد؟')) return;
+      showToast('جاري مسح الطابور وتصفير الوقت للبدء من جديد...');
       try {
-        const res = await fetch('/api/dashboard/broadcast/queue/clear', { method: 'POST' });
+        const res = await fetch('/api/dashboard/broadcast/queue/clear', { 
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ resetTimer: true })
+        });
         const data = await res.json();
         if (data.success) {
-          showToast(data.message || 'تم مسح الطابور');
+          queueItemsCount = 0;
+          isCooldownActiveState = true;
+          if (data.cooldownRemainingSeconds !== undefined) {
+            localRemainingSeconds = Number(data.cooldownRemainingSeconds);
+          } else {
+            const intervalMins = parseInt(document.getElementById('setting-broadcast-interval')?.value || '20');
+            localRemainingSeconds = intervalMins * 60;
+          }
+          updateQueueTickerDisplay();
+          const container = document.getElementById('queue-items-container');
+          if (container) {
+            container.innerHTML = '<div style="color:#64748b; font-size:12px; text-align:center;">طابور التحديثات فارغ حالياً (تم مسح الطابور وتصفير الوقت)</div>';
+          }
+          showToast(data.message || 'تم مسح الطابور وتصفير عداد الوقت للبدء من جديد');
           fetchDashboardData();
         } else {
-          showToast('فشل المسح: ' + data.error, true);
+          showToast('فشل المسح: ' + (data.error || 'خطأ'), true);
+        }
+      } catch (err) {
+        showToast('خطأ بالاتصال: ' + err.message, true);
+      }
+    }
+
+    async function resetBroadcastCooldownOnly() {
+      showToast('جاري تصفير وإعادة تشغيل عداد الوقت للبدء من جديد...');
+      try {
+        const res = await fetch('/api/dashboard/broadcast/cooldown/reset', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ toZero: false })
+        });
+        const data = await res.json();
+        if (data.success) {
+          isCooldownActiveState = true;
+          localRemainingSeconds = Number(data.cooldownRemainingSeconds || 1200);
+          updateQueueTickerDisplay();
+          showToast(data.message || 'تمت إعادة تشغيل عداد فترة الانتظار');
+          fetchBroadcastQueue();
+        } else {
+          showToast('فشل إعادة تشغيل العداد', true);
+        }
+      } catch (err) {
+        showToast('خطأ بالاتصال: ' + err.message, true);
+      }
+    }
+
+    async function bypassBroadcastCooldown() {
+      if (!confirm('هل تريد تجاوز فترة الانتظار وإتاحة النشر التلقائي فوراً دون انتظار؟')) return;
+      showToast('جاري إلغاء فترة الانتظار وإتاحة النشر...');
+      try {
+        const res = await fetch('/api/dashboard/broadcast/cooldown/reset', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ toZero: true })
+        });
+        const data = await res.json();
+        if (data.success) {
+          isCooldownActiveState = false;
+          localRemainingSeconds = 0;
+          updateQueueTickerDisplay();
+          showToast('تم إلغاء فترة الانتظار وأصبح النشر متاحاً فوراً');
+          fetchBroadcastQueue();
+        } else {
+          showToast('فشل إلغاء فترة الانتظار', true);
         }
       } catch (err) {
         showToast('خطأ بالاتصال: ' + err.message, true);
@@ -3583,6 +3943,9 @@ export function renderDashboardHtml(initialState?: any): string {
       const aggregationWindowSeconds = parseInt(document.getElementById('setting-agg-window')?.value || '45');
       const hourlyPostLimit = parseInt(document.getElementById('setting-hourly-cap')?.value || '4');
       const smartConsolidatedPost = Boolean(document.getElementById('setting-smart-consolidated')?.checked);
+      const quietHoursEnabled = Boolean(document.getElementById('setting-quiet-hours-enabled')?.checked);
+      const quietHoursStart = document.getElementById('setting-quiet-hours-start')?.value || '01:00';
+      const quietHoursEnd = document.getElementById('setting-quiet-hours-end')?.value || '08:30';
 
       showToast('جاري حفظ شروط وإعدادات النشر التلقائي...');
       try {
@@ -3594,7 +3957,10 @@ export function renderDashboardHtml(initialState?: any): string {
             minPriceChangeThreshold,
             aggregationWindowSeconds,
             hourlyPostLimit,
-            smartConsolidatedPost
+            smartConsolidatedPost,
+            quietHoursEnabled,
+            quietHoursStart,
+            quietHoursEnd
           })
         });
         const data = await res.json();

@@ -19,7 +19,11 @@ import {
   getBroadcastDisplayRank,
   getBroadcastQueueStatus, 
   flushBroadcastQueueImmediately, 
-  clearBroadcastQueue 
+  clearBroadcastQueue,
+  resetBroadcastCooldown,
+  removeQueueItem,
+  getBroadcastQueuePreview,
+  isQuietHoursActive
 } from "../services/social.service";
 import { notifyWebServer } from "../utils/notify";
 import { updateStats } from "../services/reporting.service";
@@ -191,6 +195,9 @@ dashboardRouter.get(["/", "/dashboard", "/admin"], (req: Request, res: Response)
       aggregationWindowSeconds: appConfig.aggregationWindowSeconds ?? 45,
       smartConsolidatedPost: appConfig.smartConsolidatedPost ?? true,
       hourlyPostLimit: appConfig.hourlyPostLimit ?? 4,
+      quietHoursEnabled: !!appConfig.quietHoursEnabled,
+      quietHoursStart: appConfig.quietHoursStart || "01:00",
+      quietHoursEnd: appConfig.quietHoursEnd || "08:30",
       telegramAutoPost: !!appConfig.telegramAutoPost,
       facebookAutoPost: !!appConfig.facebookAutoPost
     },
@@ -261,6 +268,9 @@ dashboardRouter.get("/api/dashboard/stats", (req: Request, res: Response) => {
       aggregationWindowSeconds: appConfig.aggregationWindowSeconds ?? 45,
       smartConsolidatedPost: appConfig.smartConsolidatedPost ?? true,
       hourlyPostLimit: appConfig.hourlyPostLimit ?? 4,
+      quietHoursEnabled: !!appConfig.quietHoursEnabled,
+      quietHoursStart: appConfig.quietHoursStart || "01:00",
+      quietHoursEnd: appConfig.quietHoursEnd || "08:30",
       telegramAutoPost: !!appConfig.telegramAutoPost,
       facebookAutoPost: !!appConfig.facebookAutoPost
     },
@@ -599,9 +609,65 @@ dashboardRouter.post("/api/dashboard/broadcast/queue/flush", async (req: Request
 });
 
 dashboardRouter.post("/api/dashboard/broadcast/queue/clear", (req: Request, res: Response) => {
-  const clearedCount = clearBroadcastQueue();
-  addLog("info", "البث والنشر", `تم مسح ${clearedCount} عنصر من طابور التحديثات`);
-  res.json({ success: true, count: clearedCount, message: `تم مسح ${clearedCount} عنصر من الطابور` });
+  const resetTimer = req.body?.resetTimer !== false;
+  const result = clearBroadcastQueue(resetTimer);
+  const logMsg = resetTimer
+    ? `تم مسح ${result.count} عنصر من طابور التحديثات وتصفير عداد وقت النشر للبدء من جديد`
+    : `تم مسح ${result.count} عنصر من طابور التحديثات دون تصفير العداد`;
+  addLog("info", "البث والنشر", logMsg);
+  res.json({ 
+    success: true, 
+    count: result.count, 
+    cooldownReset: result.cooldownReset,
+    cooldownRemainingSeconds: result.cooldownRemainingSeconds,
+    message: resetTimer 
+      ? `تم مسح ${result.count} عنصر وتصفير عداد الوقت للبدء من جديد (${Math.round(result.cooldownRemainingSeconds / 60)} دقيقة)` 
+      : `تم مسح ${result.count} عنصر من الطابور` 
+  });
+});
+
+dashboardRouter.post("/api/dashboard/broadcast/cooldown/reset", (req: Request, res: Response) => {
+  const { toZero = false } = req.body || {};
+  const result = resetBroadcastCooldown(Boolean(toZero));
+  const logMsg = toZero 
+    ? "تم تصفير فترة الانتظار وإتاحة النشر فوراً" 
+    : `تمت إعادة تشغيل عداد فترة الانتظار للبدء من جديد (${Math.round(result.cooldownRemainingSeconds / 60)} دقيقة)`;
+  addLog("info", "البث والنشر", logMsg);
+  res.json({
+    success: true,
+    toZero: Boolean(toZero),
+    cooldownRemainingSeconds: result.cooldownRemainingSeconds,
+    message: logMsg
+  });
+});
+
+// 👁️ معاينة شكل المنشور الموحد قبل النشر
+dashboardRouter.get("/api/dashboard/broadcast/queue/preview", (req: Request, res: Response) => {
+  try {
+    const preview = getBroadcastQueuePreview();
+    res.json({ success: true, ...preview });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || String(err) });
+  }
+});
+
+// ❌ حذف عملة محددة من طابور التحديثات
+dashboardRouter.post("/api/dashboard/broadcast/queue/remove-item", (req: Request, res: Response) => {
+  const { id } = req.body || {};
+  if (!id) return res.status(400).json({ success: false, error: "معرف العملة مطلوب" });
+
+  const result = removeQueueItem(String(id));
+  if (result.success) {
+    addLog("info", "البث والنشر", `تم استبعاد [${result.removedName || id}] من طابور التحديثات`);
+    return res.json({ 
+      success: true, 
+      message: `تم استبعاد ${result.removedName || id} من الطابور بنجاح`, 
+      removedName: result.removedName,
+      remainingCount: result.remainingCount 
+    });
+  } else {
+    return res.status(404).json({ success: false, error: "العنصر غير موجود في الطابور أو تمت إزالته مسبقاً" });
+  }
 });
 
 dashboardRouter.post("/api/dashboard/broadcast/settings/save", async (req: Request, res: Response) => {
@@ -612,7 +678,10 @@ dashboardRouter.post("/api/dashboard/broadcast/settings/save", async (req: Reque
     hourlyPostLimit,
     smartConsolidatedPost,
     telegramAutoPost,
-    facebookAutoPost
+    facebookAutoPost,
+    quietHoursEnabled,
+    quietHoursStart,
+    quietHoursEnd
   } = req.body || {};
 
   if (minBroadcastIntervalMinutes !== undefined && !isNaN(Number(minBroadcastIntervalMinutes))) {
@@ -636,8 +705,18 @@ dashboardRouter.post("/api/dashboard/broadcast/settings/save", async (req: Reque
   if (facebookAutoPost !== undefined) {
     appConfig.facebookAutoPost = Boolean(facebookAutoPost);
   }
+  if (quietHoursEnabled !== undefined) {
+    appConfig.quietHoursEnabled = Boolean(quietHoursEnabled);
+  }
+  if (quietHoursStart !== undefined && typeof quietHoursStart === 'string' && quietHoursStart.includes(':')) {
+    appConfig.quietHoursStart = quietHoursStart.trim();
+  }
+  if (quietHoursEnd !== undefined && typeof quietHoursEnd === 'string' && quietHoursEnd.includes(':')) {
+    appConfig.quietHoursEnd = quietHoursEnd.trim();
+  }
 
-  addLog("info", "إعدادات النشر", `تم تحديث شروط النشر التلقائي: فاصل ${appConfig.minBroadcastIntervalMinutes}د | فارق ${appConfig.minPriceChangeThreshold}د.ل | تجميع ${appConfig.aggregationWindowSeconds}ث`);
+  const quietInfo = appConfig.quietHoursEnabled ? ` | صمت ليلي (${appConfig.quietHoursStart} - ${appConfig.quietHoursEnd})` : '';
+  addLog("info", "إعدادات النشر", `تم تحديث شروط النشر التلقائي: فاصل ${appConfig.minBroadcastIntervalMinutes}د | فارق ${appConfig.minPriceChangeThreshold}د.ل | تجميع ${appConfig.aggregationWindowSeconds}ث${quietInfo}`);
   await saveConfigToSupabase(appConfig);
 
   res.json({
@@ -650,7 +729,10 @@ dashboardRouter.post("/api/dashboard/broadcast/settings/save", async (req: Reque
       hourlyPostLimit: appConfig.hourlyPostLimit,
       smartConsolidatedPost: appConfig.smartConsolidatedPost,
       telegramAutoPost: appConfig.telegramAutoPost,
-      facebookAutoPost: appConfig.facebookAutoPost
+      facebookAutoPost: appConfig.facebookAutoPost,
+      quietHoursEnabled: appConfig.quietHoursEnabled,
+      quietHoursStart: appConfig.quietHoursStart,
+      quietHoursEnd: appConfig.quietHoursEnd
     }
   });
 });

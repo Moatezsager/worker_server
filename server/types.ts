@@ -64,6 +64,9 @@ export interface AppConfig {
   aggregationWindowSeconds?: number;
   smartConsolidatedPost?: boolean;
   hourlyPostLimit?: number;
+  quietHoursEnabled?: boolean;
+  quietHoursStart?: string;
+  quietHoursEnd?: string;
   apiConfig?: {
     enabled: boolean;
     rateLimitWindowMs: number;
