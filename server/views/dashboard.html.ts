@@ -3734,9 +3734,9 @@ export function renderDashboardHtml(initialState?: any): string {
             const isDown = item.diff < 0;
             const color = isUp ? '#34d399' : isDown ? '#f87171' : '#cbd5e1';
             const sign = isUp ? '+' : '';
-            const itemIdStr = item.id || item.name;
+            const itemIdStr = (item.id || item.name || '').replace(/"/g, '&quot;');
             html += '<div style="background:#1e293b; border:1px solid #334155; border-radius:6px; padding:6px 10px; font-size:11px; display:flex; align-items:center; gap:6px;">' +
-              '<button type="button" onclick="removeSingleQueueItem(\'' + itemIdStr + '\', event)" style="background:rgba(239,68,68,0.2); border:1px solid rgba(239,68,68,0.3); color:#fca5a5; border-radius:4px; width:18px; height:18px; display:inline-flex; align-items:center; justify-content:center; font-size:10px; cursor:pointer; padding:0; line-height:1; margin-left:2px;" title="استبعاد هذه العملة من الطابور">✕</button>' +
+              '<button type="button" data-id="' + itemIdStr + '" onclick="removeSingleQueueItem(this.dataset.id, event)" style="background:rgba(239,68,68,0.2); border:1px solid rgba(239,68,68,0.3); color:#fca5a5; border-radius:4px; width:18px; height:18px; display:inline-flex; align-items:center; justify-content:center; font-size:10px; cursor:pointer; padding:0; line-height:1; margin-left:2px;" title="استبعاد هذه العملة من الطابور">✕</button>' +
               '<span style="font-weight:700; color:#f1f5f9;">' + item.name + '</span>' +
               '<span class="font-num" style="color:#cbd5e1;">' + Number(item.newVal).toFixed(2) + '</span>' +
               '<span class="font-num" style="color:' + color + '; font-weight:700;">(' + sign + item.diff + ')</span>' +
@@ -3792,7 +3792,7 @@ export function renderDashboardHtml(initialState?: any): string {
           if (body) body.textContent = currentPreviewText;
           if (countEl) countEl.textContent = '📦 العملات: ' + (data.itemCount || 0);
           if (charsEl) charsEl.textContent = '📝 الأحرف: ' + (data.charactersCount || currentPreviewText.length);
-          if (linesEl) linesEl.textContent = '📏 الأسطر: ' + (data.linesCount || currentPreviewText.split('\n').length);
+          if (linesEl) linesEl.textContent = '📏 الأسطر: ' + (data.linesCount || (currentPreviewText ? currentPreviewText.split(String.fromCharCode(10)).length : 0));
         } else {
           if (body) body.textContent = '❌ تعذر توليد المعاينة: ' + (data.error || 'خطأ غير معروف');
         }
