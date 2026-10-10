@@ -10,7 +10,7 @@ export async function notifyWebServer(rates: Rates): Promise<void> {
   }
 
   try {
-    const response = await fetch(`${webUrl}/api/internal/notify`, {
+    const response = await fetch(`${webUrl}/api/internal/notify-rates-updated`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
