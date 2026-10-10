@@ -85,4 +85,56 @@ router.post('/manual-broadcast', requireWorkerSecret, async (
   }
 });
 
+import { whatsappManager } from '../services/whatsapp.service';
+
+// ─── WhatsApp Management (called from Web Admin Panel) ───
+
+router.get('/whatsapp/status', requireWorkerSecret, (
+  req: express.Request,
+  res: express.Response
+): void => {
+  try {
+    const status = whatsappManager.getStatus();
+    res.json({ success: true, data: status });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+router.post('/whatsapp/init', requireWorkerSecret, async (
+  req: express.Request,
+  res: express.Response
+): Promise<void> => {
+  try {
+    whatsappManager.initClient().catch(console.error);
+    res.json({ success: true, message: 'جاري تهيئة واتساب...' });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+router.post('/whatsapp/disconnect', requireWorkerSecret, async (
+  req: express.Request,
+  res: express.Response
+): Promise<void> => {
+  try {
+    await whatsappManager.disconnect();
+    res.json({ success: true, message: 'تم قطع الاتصال بنجاح' });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+router.get('/whatsapp/qr', requireWorkerSecret, (
+  req: express.Request,
+  res: express.Response
+): void => {
+  try {
+    const status = whatsappManager.getStatus();
+    res.json({ success: true, data: { qr: status.qrCodeUrl || null } });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 export default router;

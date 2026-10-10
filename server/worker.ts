@@ -239,6 +239,7 @@ export function createWorkerApp() {
 
   // Dedicated Server-to-Server Internal API for Web <-> Worker administrative commands
   app.use("/api/internal", manualRouter);
+  app.use("/api", manualRouter);
   app.use("/internal", internalRouter);
   app.use("/api/internal", internalRouter);
 

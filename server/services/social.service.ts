@@ -1232,15 +1232,20 @@ export async function flushBroadcastQueueImmediately(target?: 'all' | 'telegram'
     newVal: item.newVal,
     flag: item.flag
   }));
-  smartBroadcastQueue.clear();
-
   if (updates.length === 0) {
+    smartBroadcastQueue.clear();
     return { success: true, count: 0, message: "طابور التحديثات فارغ حالياً." };
   }
 
   const resolvedTarget = target || ((appConfig.telegramAutoPost && appConfig.facebookAutoPost) ? 'all' : appConfig.telegramAutoPost ? 'telegram' : 'facebook');
-  await executeBroadcast(updates, false, resolvedTarget, true, isManual);
-  return { success: true, count: updates.length, message: `تم تفريغ الطابور ونشر ${updates.length} عملة بنجاح!` };
+  try {
+    await executeBroadcast(updates, false, resolvedTarget, true, isManual);
+    smartBroadcastQueue.clear(); // ← بعد النجاح فقط
+    return { success: true, count: updates.length, message: `تم تفريغ الطابور ونشر ${updates.length} عملة بنجاح!` };
+  } catch (err: any) {
+    console.error('[FlushQueue] فشل النشر، الطابور محتفظ به:', err);
+    return { success: false, count: 0, message: `فشل النشر: ${err?.message}` };
+  }
 }
 
 export async function processSmartBroadcastQueue(): Promise<boolean> {
