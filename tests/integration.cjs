@@ -100,6 +100,7 @@ async function main() {
   console.log('PASS actual manual admin route commits only saved prices, with authorization and validation');
 
   let attempts = 0;
+  const notificationRequests = [];
   const notify = f.load('server/services/db.service.ts', {
     '../db': { db: noopDb, supabase: null, supabaseKey: '' }, '../state': { rates: f.rates, history: [] },
     '../config': { appConfig: f.config }, '../utils/helpers': f.helper,
@@ -107,12 +108,16 @@ async function main() {
   }, { process: { env: { WEB_SERVER_URL: 'https://fixture.invalid', WORKER_INTERNAL_SECRET: 'fixture-only' } },
     setTimeout: fn => { queueMicrotask(fn); return {}; },
     fetch: async (url, init) => {
-      attempts++; assert.equal(init.headers['x-worker-secret'], 'fixture-only'); assert.ok(init.signal);
+      attempts++; notificationRequests.push(init);
       if (attempts < 3) throw Error('fixture timeout');
       return { ok: true };
     }
   });
   await notify.notifyWebServers(); assert.equal(attempts, 3);
+  for (const init of notificationRequests) {
+    assert.equal(init.headers['x-worker-secret'], 'fixture-only'); assert.ok(init.signal);
+    assert.equal(init.headers['User-Agent'], 'Dollar-Price-Worker/1.0');
+  }
   console.log('PASS bounded Web notification retries and existing secret/header contract');
 
   const webRoot = process.env.WEB_PROJECT_PATH;
@@ -139,6 +144,10 @@ async function main() {
     const pass = (_req, _res, next) => next(), empty = () => express.Router();
     const security = Object.fromEntries(['ipBanMiddleware', 'suspiciousActivityMiddleware', 'userAgentMiddleware',
       'timeoutMiddleware', 'helmetMiddleware', 'permissionsPolicyMiddleware', 'apiLimiter', 'publicApiLimiter'].map(key => [key, pass]));
+    const webSecurity = w.load(path.join(webRoot, 'server/middleware/security.ts'), {
+      express, 'express-rate-limit': require('express-rate-limit'), helmet: require('helmet'), '../config': { appConfig: w.config }
+    });
+    security.userAgentMiddleware = webSecurity.userAgentMiddleware;
     const webAppModule = w.load(path.join(webRoot, 'server/app.ts'), {
       express, compression: require('compression'), fs: {}, vite: { createServer: async () => ({ middlewares: pass }) },
       './middleware/security': { ...security, apiStats: {} }, './routes/rates.routes': empty(),
@@ -157,16 +166,23 @@ async function main() {
       setTimeout: fn => { retryTimers.push(fn); return {}; } });
     const notifiedWeb = await listen(await webAppModule.createApp({}));
     const sendNotify = secret => fetch(notifiedWeb.url + '/api/internal/notify-rates-updated', {
-      method: 'POST', headers: secret ? { 'x-worker-secret': secret } : {}
+      method: 'POST', headers: { 'User-Agent': 'Dollar-Price-Worker/1.0', ...(secret ? { 'x-worker-secret': secret } : {}) }
     });
     async function waitFor(check) {
       for (let i = 0; i < 100 && !check(); i++) await new Promise(resolve => setTimeout(resolve, 5));
       assert.ok(check(), 'Fixture notification operation completed');
     }
     try {
+      assert.equal((await fetch(notifiedWeb.url + '/api/internal/notify-rates-updated', {
+        method: 'POST', headers: { 'User-Agent': 'node', 'x-worker-secret': 'fixture-only' }
+      })).status, 403); assert.equal(calls, 0);
       assert.equal((await sendNotify()).status, 401);
       assert.equal((await sendNotify('wrong')).status, 403); assert.equal(calls, 0);
-      assert.equal((await sendNotify('fixture-only')).status, 200);
+      const pairedNotify = f.load('server/services/db.service.ts', {
+        '../db': { db: noopDb, supabase: null, supabaseKey: '' }, '../state': { rates: f.rates, history: [] },
+        '../config': { appConfig: f.config }, '../utils/helpers': f.helper, './reporting.service': {}, '../utils/logger': {}
+      }, { process: { env: { WEB_SERVER_URL: notifiedWeb.url, WORKER_INTERNAL_SECRET: 'fixture-only' } }, fetch });
+      await pairedNotify.notifyWebServers(); assert.equal(calls, 1);
       await waitFor(() => retryTimers.length === 1); assert.equal(broadcasts, 0);
       for (let i = 0; i < 3; i++) assert.equal((await sendNotify('fixture-only')).status, 200);
       retryTimers.shift()(); await waitFor(() => calls === 2);
@@ -179,6 +195,31 @@ async function main() {
       assert.equal(broadcasts, 2); assert.equal(retryTimers.length, 0);
     } finally { await notifiedWeb.close(); }
     console.log('PASS paired Web notification HTTP: authentication, immediate acknowledgement, bounded DB retry and coalesced synchronization');
+    const workerSecurity = f.load('server/middleware/security.ts', {
+      express, 'express-rate-limit': require('express-rate-limit'), helmet: require('helmet'), '../config': { appConfig: f.config }
+    });
+    const workerApi = express(); workerApi.use(express.json()); workerApi.use(workerSecurity.userAgentMiddleware); workerApi.use('/api', manual);
+    const workerTarget = await listen(workerApi);
+    const proxy = w.load(path.join(webRoot, 'server/routes/admin/whatsapp.routes.ts'), { express }, {
+      process: { env: { WORKER_SERVER_URL: workerTarget.url, WORKER_INTERNAL_SECRET: 'fixture-only-secret' } }, fetch
+    }).default;
+    const proxyApp = express(); proxyApp.use(express.json()); proxyApp.use('/api/admin', proxy);
+    const proxyHttp = await listen(proxyApp);
+    try {
+      assert.equal((await fetch(workerTarget.url + '/api/whatsapp/status', {
+        headers: { 'User-Agent': 'node', 'x-worker-secret': 'fixture-only-secret' }
+      })).status, 403);
+      const status = await fetch(proxyHttp.url + '/api/admin/whatsapp/status');
+      assert.equal(status.status, 200); assert.equal((await status.json()).success, true);
+      const toggle = await fetch(proxyHttp.url + '/api/admin/whatsapp/toggle-auto', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: true })
+      });
+      assert.equal(toggle.status, 200); assert.equal(enabled, true);
+      assert.equal((await fetch(proxyHttp.url + '/api/admin/whatsapp/toggle-auto', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: 'false' })
+      })).status, 400); assert.equal(enabled, true);
+    } finally { await proxyHttp.close(); await workerTarget.close(); }
+    console.log('PASS actual Web WhatsApp proxy and Worker User-Agent protection: authenticated status/toggle requests and strict boolean validation');
   } else console.log('SKIP paired Web loader: set WEB_PROJECT_PATH to the separate checkout');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

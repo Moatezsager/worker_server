@@ -671,7 +671,7 @@ export function notifyWebServers(): Promise<void> {
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
           const response = await fetch(`${webUrl.replace(/\/$/, '')}/api/internal/notify-rates-updated`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json', 'x-worker-secret': secret },
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'x-worker-secret': secret, 'User-Agent': 'Dollar-Price-Worker/1.0' },
             signal: AbortSignal.timeout(5000)
           });
           if (response.ok) break;
