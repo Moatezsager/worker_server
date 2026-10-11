@@ -10,12 +10,12 @@ import {
   isTelegramFetchEnabled, setTelegramFetchEnabled, 
   isWhatsAppFetchEnabled, setWhatsAppFetchEnabled 
 } from "../services/scraper.service";
-import { cleanupOldData, saveToSupabase } from "../services/db.service";
+import { cleanupOldData, commitParallelRates } from "../services/db.service";
 import { cleanupUserLogs, monitorMemory } from "../services/maintenance.service";
 import { extractRatesWithAI } from "../services/ai.service";
 import { 
   broadcastToSocialMedia, 
-  executeBroadcast,
+  broadcastRateChanges,
   getBroadcastDisplayRank,
   getBroadcastQueueStatus, 
   flushBroadcastQueueImmediately, 
@@ -25,13 +25,13 @@ import {
   getBroadcastQueuePreview,
   isQuietHoursActive
 } from "../services/social.service";
-import { notifyWebServer } from "../utils/notify";
-import { updateStats } from "../services/reporting.service";
+
 import { activeClient, initializeTelegram } from "../../telegramClient";
 import { whatsappManager } from "../services/whatsapp.service";
 import { addLog, getRecentLogs, clearLogs } from "../utils/logger";
 import { renderDashboardHtml, renderLoginHtml } from "../views/dashboard.html";
 import { getRecentIngestedRecords } from "../services/ingestion.service";
+import { loginLimiter } from "../middleware/security";
 import {
   requireAdmin,
   validateAdminPassword,
@@ -48,8 +48,8 @@ const dashboardRouter = Router();
 
 // ─── 0. Public Authentication Endpoints (Rate Limited & Anti-Brute-Force) ───
 
-dashboardRouter.post("/api/auth/login", async (req: Request, res: Response) => {
-  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '') as string;
+dashboardRouter.post("/api/auth/login", loginLimiter, async (req: Request, res: Response) => {
+  const ip = req.ip || req.socket.remoteAddress || '';
   const userAgent = (req.headers['user-agent'] || '') as string;
   const { password } = req.body || {};
 
@@ -88,7 +88,7 @@ dashboardRouter.post("/api/auth/login", async (req: Request, res: Response) => {
   // Set secure cookie
   res.setHeader(
     'Set-Cookie',
-    `lyd_admin_token=${encodeURIComponent(session.token)}; Path=/; Max-Age=43200; SameSite=Lax; HttpOnly`
+    `lyd_admin_token=${encodeURIComponent(session.token)}; Path=/; Max-Age=43200; SameSite=Lax; HttpOnly${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`
   );
 
   return res.json({
@@ -117,7 +117,7 @@ dashboardRouter.get("/api/auth/verify", (req: Request, res: Response) => {
 });
 
 dashboardRouter.get("/api/auth/status", (req: Request, res: Response) => {
-  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '') as string;
+  const ip = req.ip || req.socket.remoteAddress || '';
   const lockout = getIpLockoutStatus(ip);
   return res.json({ success: true, ...lockout });
 });
@@ -134,7 +134,7 @@ dashboardRouter.get(["/", "/dashboard", "/admin"], (req: Request, res: Response)
     });
   }
 
-  const clientIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '') as string;
+  const clientIp = req.ip || req.socket.remoteAddress || '';
   const isAuthenticated = verifyAdminSessionFromReq(req);
 
   // If unauthenticated: render Ultra-Secure Login Shield Gateway (Zero state leakage)
@@ -313,7 +313,6 @@ dashboardRouter.post("/api/dashboard/trigger", async (req: Request, res: Respons
           async () => {
             await fetchParallelRatesFromTelegram();
             await fetchOfficialRates();
-            await saveToSupabase();
             return true;
           }
         );
@@ -371,7 +370,10 @@ dashboardRouter.post("/api/dashboard/trigger", async (req: Request, res: Respons
 
       case "broadcast_test": {
         addLog("info", "البث والنشر", "إرسال نشرة تجريبية إلى القنوات والمجموعات...");
-        const sampleMsg = `📢 *تجربة بث مباشر من لوحة التحكم*\n\n💵 الدولار: ${rates.parallel.usd.toFixed(2)} د.ل\n💶 اليورو: ${rates.parallel.eur.toFixed(2)} د.ل\n🕒 التوقيت: ${new Date().toLocaleTimeString('ar-LY')}`;
+        const usd = rates.parallel.USD || rates.parallel.usd;
+        const eur = rates.parallel.EUR || rates.parallel.eur;
+        if (!(usd > 0 && eur > 0)) throw new Error('لا توجد أسعار مؤكدة لاختبار النشرة');
+        const sampleMsg = `📢 *تجربة بث مباشر من لوحة التحكم*\n\n💵 الدولار: ${Number(usd).toFixed(2)} د.ل\n💶 اليورو: ${Number(eur).toFixed(2)} د.ل\n🕒 التوقيت: ${new Date().toLocaleTimeString('ar-LY')}`;
         const broadcastResult = await broadcastToSocialMedia(sampleMsg, true, 'all', true);
         return res.json({ success: true, message: "تم إرسال النشرة التجريبية", broadcastResult });
       }
@@ -390,50 +392,39 @@ dashboardRouter.post("/api/dashboard/update-rate", async (req: Request, res: Res
   const { code, rate } = req.body || {};
   const numRate = Number(rate);
 
-  if (!code || isNaN(numRate) || numRate <= 0) {
+  if (!code || !Number.isFinite(numRate) || numRate <= 0) {
     return res.status(400).json({ success: false, error: "كود العملة والقيمة مطلوبة ويجب أن تكون رقماً موجباً" });
   }
 
-  const normalizedCode = String(code).trim();
-  rates.parallel[normalizedCode] = numRate;
-  rates.parallel[normalizedCode.toUpperCase()] = numRate;
-  rates.parallel[normalizedCode.toLowerCase()] = numRate;
-  rates.lastUpdated = new Date().toISOString();
-
-  addLog("success", "تعديل يدوي", `تم تعديل سعر [${normalizedCode}] يدوياً إلى ${numRate} د.ل عبر لوحة التحكم`);
-
+  const normalizedCode = String(code).trim().toUpperCase() === 'GOLD'
+    ? 'GOLD_SCRAP_18' : String(code).trim().toUpperCase();
+  const term = appConfig.terms.find(t => t.id === normalizedCode && t.id !== 'OFFICIAL_USD');
+  if (!term || numRate < term.min || numRate > term.max) {
+    return res.status(400).json({ success: false, error: "العملة أو السعر خارج النطاق المسموح" });
+  }
   try {
-    await saveToSupabase();
-    return res.json({
-      success: true,
-      message: `تم تحديث سعر ${normalizedCode} بنجاح ومزامنته مع سوبابيس`,
-      code: normalizedCode,
-      rate: numRate,
-      lastUpdated: rates.lastUpdated
-    });
+    await commitParallelRates([{ code: normalizedCode, value: numRate, time: Date.now(), source: 'تعديل يدوي' }], true);
+    return res.json({ success: true, message: "تم حفظ السعر ومزامنته بنجاح",
+      code: normalizedCode, rate: numRate, lastUpdated: rates.lastUpdated });
   } catch (err: any) {
-    return res.json({
-      success: true,
-      message: `تم تحديث السعر محلياً (حدث خطأ في المزامنة: ${err?.message})`,
-      code: normalizedCode,
-      rate: numRate
-    });
+    return res.status(500).json({ success: false, error: "تعذر حفظ السعر، لم يتم تغيير البيانات" });
   }
 });
 
 // ─── 4b. Manual Batch Price Entry & Auto Broadcast (Currencies or Metals) ───
 dashboardRouter.post("/api/dashboard/manual-rates-batch", async (req: Request, res: Response) => {
   const { category = "currencies", items, autoBroadcast = true, broadcastTarget = "all" } = req.body || {};
+  if (!['currencies', 'metals'].includes(category) || typeof autoBroadcast !== 'boolean' ||
+      !['all', 'telegram', 'facebook'].includes(broadcastTarget)) {
+    return res.status(400).json({ success: false, error: "خيارات التحديث أو النشر غير صحيحة" });
+  }
 
-  if (!Array.isArray(items) || items.length === 0) {
+  if (!Array.isArray(items) || items.length === 0 || items.length > 100) {
     return res.status(400).json({ success: false, error: "قائمة العناصر المدخلة فارغة" });
   }
 
   // Filter only items that are selected and have a valid positive rate
-  const selectedItems = items.filter((item: any) => {
-    const rate = Number(item.newRate);
-    return Boolean(item.selected) && !isNaN(rate) && rate > 0;
-  });
+  const selectedItems = items.filter((item: any) => item && item.selected === true);
 
   if (selectedItems.length === 0) {
     return res.status(400).json({ success: false, error: "يرجى تحديد عنصر واحد على الأقل وإدخال سعر صحيح أكبر من الصفر" });
@@ -448,76 +439,31 @@ dashboardRouter.post("/api/dashboard/manual-rates-batch", async (req: Request, r
     `بدء تحديث يدوي لـ ${selectedItems.length} صنف من أصناف [${catLabelAr}] ${autoBroadcast ? 'مع النشر التلقائي الذكي' : 'بدون نشر'}`
   );
 
-  const updatedCodes: string[] = [];
-  const broadcastUpdates: Array<{ id: string; name: string; oldVal: number; newVal: number; flag: string }> = [];
-
-  for (const item of selectedItems) {
-    const rawCode = String(item.code || "").trim();
-    if (!rawCode) continue;
-
-    const newRate = Number(item.newRate);
-    const oldRate = (typeof item.oldRate === "number" && item.oldRate > 0) 
-      ? Number(item.oldRate) 
-      : (Number(rates.parallel[rawCode]) || newRate);
-
-    // Save previous and new rate
-    rates.previousParallel[rawCode] = oldRate;
-    rates.previousParallel[rawCode.toUpperCase()] = oldRate;
-    rates.previousParallel[rawCode.toLowerCase()] = oldRate;
-
-    rates.parallel[rawCode] = newRate;
-    rates.parallel[rawCode.toUpperCase()] = newRate;
-    rates.parallel[rawCode.toLowerCase()] = newRate;
-
-    // Handle key aliases
-    if (rawCode.toUpperCase() === "USD") {
-      rates.parallel.usd = newRate;
-      rates.previousParallel.usd = oldRate;
-    }
-    if (rawCode.toUpperCase() === "GOLD_SCRAP_18") {
-      rates.parallel.GOLD = newRate;
-      rates.parallel.gold = newRate;
-      rates.previousParallel.GOLD = oldRate;
-      rates.previousParallel.gold = oldRate;
-    }
-    if (rawCode.toUpperCase() === "GOLD") {
-      rates.parallel.GOLD_SCRAP_18 = newRate;
-      rates.previousParallel.GOLD_SCRAP_18 = oldRate;
-    }
-
-    if (!rates.lastChanged) rates.lastChanged = { official: {}, parallel: {} };
-    if (!rates.lastChanged.parallel) rates.lastChanged.parallel = {};
-    rates.lastChanged.parallel[rawCode] = new Date().toISOString();
-
-    updateStats(rawCode, newRate);
-    updatedCodes.push(rawCode);
-
-    // Determine flag and display name
-    const term = appConfig.terms.find(t => t.id === rawCode);
-    const flag = item.flag || term?.flag || (isMetals ? (rawCode.startsWith("SILVER") ? "silver" : "gold") : "us");
-    const displayName = item.name || term?.name || rawCode;
-
-    broadcastUpdates.push({
-      id: rawCode,
-      name: displayName,
-      oldVal: oldRate,
-      newVal: newRate,
-      flag
-    });
+  const entries = selectedItems.map((item: any) => {
+    const raw = String(item.code || '').trim().toUpperCase();
+    return { code: raw === 'GOLD' ? 'GOLD_SCRAP_18' : raw,
+      value: Number(item.newRate), time: Date.now(), source: 'تعديل يدوي جماعي' };
+  });
+  if (entries.some((entry: any) => {
+    const term = appConfig.terms.find(t => t.id === entry.code && t.id !== 'OFFICIAL_USD');
+    return !term || !Number.isFinite(entry.value) || entry.value < term.min || entry.value > term.max;
+  }) || new Set(entries.map((entry: any) => entry.code)).size !== entries.length) {
+    return res.status(400).json({ success: false, error: "تحقق من العملات والأسعار المحددة، دون تكرار" });
   }
-
-  rates.lastUpdated = new Date().toISOString();
-
-  // 1. Persist to Database (Supabase & SQLite)
-  let dbPersisted = false;
+  let broadcastUpdates: Array<{ id: string; name: string; oldVal: number; newVal: number; flag: string }>;
   try {
-    dbPersisted = await saveToSupabase('parallel');
-  } catch (err: any) {
-    console.error("[ManualBatch] Save to Supabase failed:", err);
+    const changes = await commitParallelRates(entries, true);
+    broadcastUpdates = entries.map((entry: any) => {
+      const change = changes.find(item => item.id === entry.code);
+      const term = appConfig.terms.find(item => item.id === entry.code)!;
+      return change || { id: entry.code, name: term.name, flag: term.flag || 'ly',
+        oldVal: entry.value, newVal: entry.value };
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, persisted: false, error: "تعذر حفظ الأسعار، لم يتم تغيير البيانات أو نشرها" });
   }
-
-  // 2. Notify Web Server
-  notifyWebServer(rates).catch(err => console.warn("[ManualBatch] Notify Web Server error:", err));
+  const updatedCodes = entries.map((entry: any) => entry.code);
+  const dbPersisted = true;
 
   // 3. Intelligent Professional Auto Broadcast
   let broadcastSuccess = false;
@@ -537,7 +483,7 @@ dashboardRouter.post("/api/dashboard/manual-rates-batch", async (req: Request, r
         : "all";
 
       console.log(`[ManualBatch] 📢 Broadcasting ${broadcastUpdates.length} ${catLabelAr} items to ${targetPlatform}...`);
-      await executeBroadcast(broadcastUpdates, false, targetPlatform, true, true, title);
+      await broadcastRateChanges(broadcastUpdates, false, targetPlatform, true, title);
       broadcastSuccess = true;
 
       addLog("success", "النشر التلقائي الذكي", `تم نشر نشرة [${catLabelAr}] بنجاح (${broadcastUpdates.length} صنف) على (${targetPlatform})`);
@@ -572,6 +518,10 @@ dashboardRouter.post("/api/dashboard/manual-rates-batch", async (req: Request, r
 // ─── 5. Custom Message Broadcast to Channels ───
 dashboardRouter.post("/api/dashboard/broadcast-custom", async (req: Request, res: Response) => {
   const { message, target = "all", isTest = false } = req.body || {};
+  if (!['all', 'telegram', 'facebook'].includes(target) || typeof isTest !== 'boolean' ||
+      typeof message !== 'string' || message.length > 4000) {
+    return res.status(400).json({ success: false, error: "تحقق من الرسالة ومنصة النشر" });
+  }
 
   if (!message || typeof message !== "string" || !message.trim()) {
     return res.status(400).json({ success: false, error: "نص الرسالة مطلوب" });
@@ -598,6 +548,9 @@ dashboardRouter.get("/api/dashboard/broadcast/queue", (req: Request, res: Respon
 
 dashboardRouter.post("/api/dashboard/broadcast/queue/flush", async (req: Request, res: Response) => {
   const { target = "all" } = req.body || {};
+  if (!['all', 'telegram', 'facebook'].includes(target)) {
+    return res.status(400).json({ success: false, error: "منصة النشر غير صحيحة" });
+  }
   addLog("info", "البث والنشر", "طلب المشرف تفريغ طابور التحديثات ونشره فوراً");
   try {
     const result = await flushBroadcastQueueImmediately(target as any, true);

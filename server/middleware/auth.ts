@@ -88,10 +88,10 @@ export function validateAdminPassword(candidate: string): boolean {
   const configuredPassword = (
     process.env.ADMIN_PASSWORD ||
     appConfig.adminPassword ||
-    'Admin@Lyd2026!'
+    ''
   ).trim();
 
-  return safeCompare(candidate.trim(), configuredPassword);
+  return configuredPassword.length > 0 && safeCompare(candidate.trim(), configuredPassword);
 }
 
 /**

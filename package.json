@@ -12,7 +12,7 @@
     "build": "esbuild src/worker.ts --bundle --platform=node --format=cjs --external:better-sqlite3 --external:node-cron --sourcemap --outfile=dist/worker.cjs",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "test": "tsx tests/cbl-service.test.ts && tsx tests/internal-api.test.ts && tsx tests/scheduler.test.ts",
+    "test": "node tests/regression.cjs && node tests/integration.cjs",
     "start": "node dist/worker.cjs",
     "postinstall": "npm run build"
   },
@@ -32,7 +32,6 @@
     "qrcode": "^1.5.4",
     "telegram": "^2.26.22",
     "tsx": "^4.21.0",
-    "web-push": "^3.6.7",
     "ws": "^8.19.0",
     "esbuild": "^0.28.1",
     "typescript": "~5.8.2"
@@ -42,7 +41,6 @@
     "@types/node": "^22.14.0",
     "@types/node-cron": "^3.0.11",
     "@types/qrcode": "^1.5.6",
-    "@types/web-push": "^3.6.4",
     "@types/ws": "^8.18.1"
   }
 }

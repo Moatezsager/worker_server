@@ -10,7 +10,7 @@ export function renderLoginHtml(options: LoginHtmlOptions = {}): string {
   const isLocked = Boolean(options.isLocked);
   const remainingSeconds = Number(options.remainingSeconds || 0);
   const attemptsLeft = options.attemptsLeft ?? 5;
-  const clientIp = options.clientIp || '';
+  const clientIp = escapeHtml(options.clientIp || '');
 
   return `<!DOCTYPE html>
 <html lang="ar" dir="rtl">
@@ -359,6 +359,10 @@ export function renderLoginHtml(options: LoginHtmlOptions = {}): string {
 </html>`;
 }
 
+function escapeHtml(value: unknown): string {
+  return String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
+}
+
 export function renderDashboardHtml(initialState?: any): string {
   const NAMES: Record<string, string> = {
     usd: 'الدولار الأمريكي (كاش)',
@@ -388,8 +392,8 @@ export function renderDashboardHtml(initialState?: any): string {
   const METAL_KEYS = ['GOLD', 'GOLD_EXT_18', 'GOLD_EXT_21', 'GOLD_SCRAP_18', 'GOLD_SCRAP_21', 'GOLD_CAST_18', 'GOLD_CAST_21', 'GOLD_CAST_24', 'GOLD_LIRA_8G', 'GOLD_LIRA_14G', 'GOLD_MUJARA_14G', 'SILVER_CAST_1000', 'SILVER_SCRAP'];
 
   // Calculate pre-rendered values
-  const usdParallel = Number(initialState?.rates?.parallel?.USD || initialState?.rates?.parallel?.usd || 10.8);
-  const usdCbl = Number(initialState?.rates?.official?.USD?.buy || initialState?.rates?.official?.USD?.rate || initialState?.rates?.official?.USD || 4.85);
+  const usdParallel = Number(initialState?.rates?.parallel?.USD || initialState?.rates?.parallel?.usd || 0);
+  const usdCbl = Number(initialState?.rates?.official?.USD?.buy || initialState?.rates?.official?.USD?.rate || initialState?.rates?.official?.USD || 0);
   const uptimeSec = Number(initialState?.uptimeSeconds || 0);
   const hrs = Math.floor(uptimeSec / 3600);
   const mins = Math.floor((uptimeSec % 3600) / 60);
@@ -412,11 +416,11 @@ export function renderDashboardHtml(initialState?: any): string {
       const card = `
         <div class="rate-card ${isMetal ? 'gold' : ''}">
           <div class="rate-header">
-            <span class="rate-name">${name}</span>
-            <span class="rate-code">${code}</span>
+            <span class="rate-name">${escapeHtml(name)}</span>
+            <span class="rate-code">${escapeHtml(code)}</span>
           </div>
           <div class="rate-price font-num">${num.toFixed(isMetal ? 2 : 3)} <span style="font-size: 11px; font-weight: normal; color: #94a3b8;">د.ل</span></div>
-          <button class="rate-btn-edit" onclick="openRateModal('${code}', '${name}', ${num})">✏️ تعديل السعر</button>
+          <button class="rate-btn-edit" onclick="openRateModal(${escapeHtml(JSON.stringify(code))}, ${escapeHtml(JSON.stringify(name))}, ${num})">✏️ تعديل السعر</button>
         </div>
       `;
 
@@ -437,8 +441,8 @@ export function renderDashboardHtml(initialState?: any): string {
       preCblHtml += `
         <div class="rate-card">
           <div class="rate-header">
-            <span class="rate-name">${name} (رسمي)</span>
-            <span class="rate-code">${code}</span>
+            <span class="rate-name">${escapeHtml(name)} (رسمي)</span>
+            <span class="rate-code">${escapeHtml(code)}</span>
           </div>
           <div class="rate-price font-num" style="color: #38bdf8;">${buy.toFixed(4)} <span style="font-size: 11px; font-weight: normal; color: #94a3b8;">د.ل</span></div>
           <div style="font-size: 10px; color: #94a3b8; display: flex; justify-content: space-between;">
@@ -1089,7 +1093,7 @@ export function renderDashboardHtml(initialState?: any): string {
 
   <!-- EMBEDDED INITIAL STATE -->
   <script id="initial-dashboard-state" type="application/json">
-    ${JSON.stringify(initialState || {})}
+    ${JSON.stringify(initialState || {}).replace(/</g, '\\u003c')}
   </script>
 
   <!-- HEADER -->
@@ -1122,8 +1126,8 @@ export function renderDashboardHtml(initialState?: any): string {
     <div class="kpi-grid">
       <div class="kpi-card">
         <div class="kpi-title">💵 الدولار الموازي</div>
-        <div class="kpi-val font-num" id="kpi-usd">${usdParallel.toFixed(2)} د.ل</div>
-        <div class="kpi-sub">المركزي: <span class="font-num" id="kpi-cbl">${usdCbl.toFixed(2)}</span></div>
+        <div class="kpi-val font-num" id="kpi-usd">${usdParallel > 0 ? usdParallel.toFixed(2) + ' د.ل' : 'غير متاح'}</div>
+        <div class="kpi-sub">المركزي: <span class="font-num" id="kpi-cbl">${usdCbl > 0 ? usdCbl.toFixed(2) : 'غير متاح'}</span></div>
       </div>
 
       <div class="kpi-card">
@@ -2101,6 +2105,12 @@ export function renderDashboardHtml(initialState?: any): string {
 
   <!-- CLIENT SCRIPTS -->
   <script>
+    function escapeHtml(value) {
+      const span = document.createElement('span');
+      span.textContent = String(value ?? '');
+      return span.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+    function jsArg(value) { return escapeHtml(JSON.stringify(String(value))); }
     // ─── AUTHENTICATED FETCH & SESSION INTERCEPTOR ───
     const originalFetch = window.fetch;
     window.fetch = async function(url, options = {}) {
@@ -2228,13 +2238,13 @@ export function renderDashboardHtml(initialState?: any): string {
           '<div style="display:flex; align-items:center; gap:8px;">' +
             '<span style="font-size:14px;">✈️</span>' +
             '<div>' +
-              '<div style="font-size:12px; font-weight:700; color:#e2e8f0;">@' + ch + '</div>' +
+              '<div style="font-size:12px; font-weight:700; color:#e2e8f0;">@' + escapeHtml(ch) + '</div>' +
               '<div style="font-size:10px; color:#94a3b8;">قناة تيليجرام جلب تلقائي</div>' +
             '</div>' +
           '</div>' +
           '<div style="display:flex; gap:4px;">' +
-            '<button class="btn btn-secondary btn-sm" onclick="editTgChannel(&quot;' + ch + '&quot;)" style="padding:2px 8px; font-size:10px;">✏️ تعديل</button>' +
-            '<button class="btn btn-danger btn-sm" onclick="deleteTgChannel(&quot;' + ch + '&quot;)" style="padding:2px 8px; font-size:10px;">🗑️ حذف</button>' +
+            '<button class="btn btn-secondary btn-sm" onclick="editTgChannel(' + jsArg(ch) + ')" style="padding:2px 8px; font-size:10px;">✏️ تعديل</button>' +
+            '<button class="btn btn-danger btn-sm" onclick="deleteTgChannel(' + jsArg(ch) + ')" style="padding:2px 8px; font-size:10px;">🗑️ حذف</button>' +
           '</div>' +
         '</div>';
       }).join('');
@@ -2316,7 +2326,7 @@ export function renderDashboardHtml(initialState?: any): string {
       (sources || []).forEach(s => mergedMap.set(s.jid, s));
       (reachableChats || []).forEach(c => {
         if (!mergedMap.has(c.id)) {
-          mergedMap.set(c.id, { jid: c.id, name: c.name, enabled: true, type: c.type });
+          mergedMap.set(c.id, { jid: c.id, name: c.name, enabled: false, type: c.type });
         }
       });
 
@@ -2330,22 +2340,22 @@ export function renderDashboardHtml(initialState?: any): string {
       }
 
       list.innerHTML = allItems.map(function(item) {
-        var isEnabled = item.enabled !== false;
+        var isEnabled = item.enabled === true;
         var icon = item.type === 'channel' ? '📢' : item.type === 'group' ? '👥' : '💬';
         return '<div style="display:flex; justify-content:space-between; align-items:center; background:#1e293b; border:1px solid #334155; border-radius:6px; padding:8px 12px; gap:8px;">' +
           '<div style="display:flex; align-items:center; gap:8px; flex:1; min-width:0;">' +
             '<span style="font-size:16px;">' + icon + '</span>' +
             '<div style="min-width:0; flex:1;">' +
-              '<div style="font-size:12px; font-weight:700; color:#e2e8f0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">' + (item.name || item.jid) + '</div>' +
-              '<div style="font-size:10px; color:#94a3b8; font-family:monospace;">' + item.jid + '</div>' +
+              '<div style="font-size:12px; font-weight:700; color:#e2e8f0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">' + escapeHtml(item.name || item.jid) + '</div>' +
+              '<div style="font-size:10px; color:#94a3b8; font-family:monospace;">' + escapeHtml(item.jid) + '</div>' +
             '</div>' +
           '</div>' +
           '<div style="display:flex; align-items:center; gap:8px;">' +
             '<label class="switch" style="transform:scale(0.85);" title="' + (isEnabled ? 'تعطيل الاستخراج' : 'تفعيل الاستخراج') + '">' +
-              '<input type="checkbox" onchange="toggleWhatsAppSource(&quot;' + item.jid + '&quot;, this.checked)" ' + (isEnabled ? 'checked' : '') + '>' +
+              '<input type="checkbox" onchange="toggleWhatsAppSource(' + jsArg(item.jid) + ', this.checked)" ' + (isEnabled ? 'checked' : '') + '>' +
               '<span class="slider"></span>' +
             '</label>' +
-            '<button class="btn btn-danger btn-sm" onclick="deleteWhatsAppSource(&quot;' + item.jid + '&quot;)" style="padding:2px 6px; font-size:10px;" title="حذف المصدر">🗑️</button>' +
+            '<button class="btn btn-danger btn-sm" onclick="deleteWhatsAppSource(' + jsArg(item.jid) + ')" style="padding:2px 6px; font-size:10px;" title="حذف المصدر">🗑️</button>' +
           '</div>' +
         '</div>';
       }).join('');
@@ -2468,9 +2478,9 @@ export function renderDashboardHtml(initialState?: any): string {
       }
       if (data.rates && data.rates.official) {
         const cblItem = data.rates.official.USD;
-        const cbl = typeof cblItem === 'object' ? (cblItem.buy || cblItem.rate || 4.85) : (cblItem || 4.85);
+        const cbl = cblItem && typeof cblItem === 'object' ? (cblItem.buy || cblItem.rate || 0) : (cblItem || 0);
         const cblEl = document.getElementById('kpi-cbl');
-        if (cblEl) cblEl.textContent = Number(cbl).toFixed(2);
+        if (cblEl) cblEl.textContent = Number(cbl) > 0 ? Number(cbl).toFixed(2) : 'غير متاح';
       }
       if (typeof data.uptimeSeconds === 'number') {
         const h = Math.floor(data.uptimeSeconds / 3600);
@@ -2538,14 +2548,14 @@ export function renderDashboardHtml(initialState?: any): string {
           
           jHtml += '<div style="background:#1e293b; border:1px solid #334155; border-radius:10px; padding:10px 12px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center;">' +
             '<div>' +
-              '<div style="font-size:12px; font-weight:700; color:#f1f5f9; margin-bottom:2px;">' + job.name + '</div>' +
+              '<div style="font-size:12px; font-weight:700; color:#f1f5f9; margin-bottom:2px;">' + escapeHtml(job.name) + '</div>' +
               '<div style="font-size:11px; color:#94a3b8; display:flex; gap:8px; flex-wrap:wrap;">' +
                 '<span>الحالة: <strong>' + badge + '</strong></span>' +
                 '<span>المدة: ' + (job.lastRunDurationMs ? job.lastRunDurationMs + 'ms' : '--') + '</span>' +
                 '<span>مرات التشغيل: #' + (job.runCount || 0) + '</span>' +
               '</div>' +
             '</div>' +
-            '<button class="btn btn-secondary btn-sm" onclick="triggerJobById(&quot;' + job.id + '&quot;, &quot;' + job.name + '&quot;)">تشغيل</button>' +
+            '<button class="btn btn-secondary btn-sm" onclick="triggerJobById(' + jsArg(job.id) + ', ' + jsArg(job.name) + ')">تشغيل</button>' +
           '</div>';
         }
         if (jContainer && jHtml) jContainer.innerHTML = jHtml;
@@ -2563,8 +2573,8 @@ export function renderDashboardHtml(initialState?: any): string {
 
           lHtml += '<div style="padding:3px 0; border-bottom:1px solid rgba(51,65,85,0.4); display:flex; gap:6px; word-break:break-all;">' +
             '<span style="color:#64748b;">' + time + '</span>' +
-            '<span style="color:' + color + '; font-weight:bold;">[' + log.category + ']:</span>' +
-            '<span>' + log.message + '</span>' +
+            '<span style="color:' + color + '; font-weight:bold;">[' + escapeHtml(log.category) + ']:</span>' +
+            '<span>' + escapeHtml(log.message) + '</span>' +
           '</div>';
         }
         if (lFeed && lHtml) lFeed.innerHTML = lHtml;
@@ -2870,21 +2880,21 @@ export function renderDashboardHtml(initialState?: any): string {
             let ratesHtml = '';
             if (isExtracted && msg.extractedRates && msg.extractedRates.length > 0) {
               ratesHtml = '<div style="margin-top:6px; display:flex; flex-wrap:wrap; gap:4px;">' + 
-                msg.extractedRates.map(r => '<span class="extracted-pill font-num">💵 ' + r.code + ': ' + Number(r.value).toFixed(2) + '</span>').join('') + 
+                msg.extractedRates.map(r => '<span class="extracted-pill font-num">💵 ' + escapeHtml(r.code) + ': ' + Number(r.value).toFixed(2) + '</span>').join('') +
                 '</div>';
             } else if (msg.ignoreReason) {
-              ratesHtml = '<div style="margin-top:4px; font-size:11px; color:#f43f5e;">سبب التجاهل: ' + msg.ignoreReason + '</div>';
+              ratesHtml = '<div style="margin-top:4px; font-size:11px; color:#f43f5e;">سبب التجاهل: ' + escapeHtml(msg.ignoreReason) + '</div>';
             }
 
             html += '<div class="feed-item">' +
               '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">' +
-                '<span style="font-weight:700; color:#38bdf8; font-size:12px;">' + msg.source + '</span>' +
+                '<span style="font-weight:700; color:#38bdf8; font-size:12px;">' + escapeHtml(msg.source) + '</span>' +
                 '<div style="display:flex; align-items:center; gap:6px;">' +
                   badge +
                   '<span style="color:#64748b; font-size:11px;" class="font-num">' + time + '</span>' +
                 '</div>' +
               '</div>' +
-              '<div style="font-size:12px; color:#cbd5e1; background:#0f172a; padding:8px; border-radius:6px; white-space:pre-wrap; word-break:break-all;">' + msg.rawText + '</div>' +
+              '<div style="font-size:12px; color:#cbd5e1; background:#0f172a; padding:8px; border-radius:6px; white-space:pre-wrap; word-break:break-all;">' + escapeHtml(msg.rawText) + '</div>' +
               ratesHtml +
             '</div>';
           }
@@ -3195,14 +3205,14 @@ export function renderDashboardHtml(initialState?: any): string {
           }
         }
 
-        html += '<div style="display:flex; align-items:center; justify-content:space-between; gap:10px; background:#1e293b; border:1px solid #334155; border-radius:8px; padding:10px 12px; transition:border 0.15s;" id="batch-row-' + item.code + '">' +
+        html += '<div style="display:flex; align-items:center; justify-content:space-between; gap:10px; background:#1e293b; border:1px solid #334155; border-radius:8px; padding:10px 12px; transition:border 0.15s;" id="batch-row-' + escapeHtml(item.code) + '">' +
           '<div style="display:flex; align-items:center; gap:10px; flex:1; min-width:0;">' +
-            '<input type="checkbox" id="batch-chk-' + item.code + '" ' + (item.selected ? 'checked' : '') + ' onchange="toggleBatchItemSelection(&quot;' + item.code + '&quot;, this.checked)" style="accent-color:#10b981; width:18px; height:18px; cursor:pointer;">' +
+            '<input type="checkbox" id="batch-chk-' + escapeHtml(item.code) + '" ' + (item.selected ? 'checked' : '') + ' onchange="toggleBatchItemSelection(' + jsArg(item.code) + ', this.checked)" style="accent-color:#10b981; width:18px; height:18px; cursor:pointer;">' +
             '<span style="font-size:18px;">' + flagIcon + '</span>' +
             '<div style="min-width:0; flex:1;">' +
               '<div style="display:flex; align-items:center; gap:6px;">' +
-                '<span style="font-size:13px; font-weight:700; color:#f8fafc;">' + item.name + '</span>' +
-                '<span style="font-size:10px; background:#0f172a; color:#94a3b8; border:1px solid #334155; border-radius:4px; padding:1px 5px; font-family:monospace;">' + item.code + '</span>' +
+                '<span style="font-size:13px; font-weight:700; color:#f8fafc;">' + escapeHtml(item.name) + '</span>' +
+                '<span style="font-size:10px; background:#0f172a; color:#94a3b8; border:1px solid #334155; border-radius:4px; padding:1px 5px; font-family:monospace;">' + escapeHtml(item.code) + '</span>' +
               '</div>' +
               '<div style="font-size:11px; color:#94a3b8; margin-top:2px;">' +
                 'السعر المسجل: <span class="font-num" style="color:#cbd5e1; font-weight:600;">' + (oldR > 0 ? oldR.toFixed(dec) : 'غير محدد') + ' د.ل</span>' +
@@ -3211,9 +3221,9 @@ export function renderDashboardHtml(initialState?: any): string {
           '</div>' +
 
           '<div style="display:flex; align-items:center; gap:8px;">' +
-            '<div id="batch-diff-' + item.code + '" style="min-width:70px; text-align:center;">' + diffHtml + '</div>' +
+            '<div id="batch-diff-' + escapeHtml(item.code) + '" style="min-width:70px; text-align:center;">' + diffHtml + '</div>' +
             '<div style="display:flex; align-items:center; gap:4px;">' +
-              '<input type="number" step="any" id="batch-input-' + item.code + '" value="' + (newR > 0 ? newR : '') + '" placeholder="' + (oldR > 0 ? oldR.toFixed(dec) : '0.00') + '" class="form-input font-num" style="width:115px; font-size:14px; font-weight:700; text-align:center; padding:6px 8px; border-color:#38bdf8;" oninput="onBatchItemPriceChange(&quot;' + item.code + '&quot;, this.value)">' +
+              '<input type="number" step="any" id="batch-input-' + escapeHtml(item.code) + '" value="' + (newR > 0 ? newR : '') + '" placeholder="' + (oldR > 0 ? oldR.toFixed(dec) : '0.00') + '" class="form-input font-num" style="width:115px; font-size:14px; font-weight:700; text-align:center; padding:6px 8px; border-color:#38bdf8;" oninput="onBatchItemPriceChange(' + jsArg(item.code) + ', this.value)">' +
               '<span style="font-size:11px; color:#94a3b8;">د.ل</span>' +
             '</div>' +
           '</div>' +
@@ -3502,16 +3512,16 @@ export function renderDashboardHtml(initialState?: any): string {
           ? '<span style="color:#10b981; font-weight:700; font-size:11px; background:rgba(16,185,129,0.15); padding:3px 8px; border-radius:9999px;">✓ محدد</span>'
           : '<span style="color:#64748b; font-size:11px; background:rgba(100,116,139,0.15); padding:3px 8px; border-radius:9999px;">✕ مستبعد</span>';
 
-        html += '<tr id="manual-tr-' + row.code + '" class="' + (row.selected ? 'manual-row-selected' : '') + '">' +
+        html += '<tr id="manual-tr-' + escapeHtml(row.code) + '" class="' + (row.selected ? 'manual-row-selected' : '') + '">' +
           '<td style="text-align:center;">' +
-            '<input type="checkbox" id="manual-row-chk-' + row.code + '" ' + (row.selected ? 'checked' : '') + ' onchange="toggleManualRow(&quot;' + row.code + '&quot;, this.checked)" style="accent-color:#10b981; width:18px; height:18px; cursor:pointer;">' +
+            '<input type="checkbox" id="manual-row-chk-' + escapeHtml(row.code) + '" ' + (row.selected ? 'checked' : '') + ' onchange="toggleManualRow(' + jsArg(row.code) + ', this.checked)" style="accent-color:#10b981; width:18px; height:18px; cursor:pointer;">' +
           '</td>' +
           '<td>' +
             '<div style="display:flex; align-items:center; gap:8px;">' +
               '<span style="font-size:20px;">' + flagIcon + '</span>' +
               '<div>' +
-                '<div style="font-size:13px; font-weight:700; color:#f8fafc;">' + row.name + '</div>' +
-                '<div style="font-size:10px; color:#94a3b8; font-family:monospace;">' + row.code + '</div>' +
+                '<div style="font-size:13px; font-weight:700; color:#f8fafc;">' + escapeHtml(row.name) + '</div>' +
+                '<div style="font-size:10px; color:#94a3b8; font-family:monospace;">' + escapeHtml(row.code) + '</div>' +
               '</div>' +
             '</div>' +
           '</td>' +
@@ -3521,14 +3531,14 @@ export function renderDashboardHtml(initialState?: any): string {
           '</td>' +
           '<td style="text-align:center;">' +
             '<div style="display:inline-flex; align-items:center; gap:6px;">' +
-              '<input type="number" step="any" id="manual-input-' + row.code + '" value="' + (newR > 0 ? newR : '') + '" placeholder="' + (oldR > 0 ? oldR.toFixed(dec) : '0.00') + '" class="manual-table-input font-num" oninput="onManualTablePriceChange(&quot;' + row.code + '&quot;, this.value)">' +
+              '<input type="number" step="any" id="manual-input-' + escapeHtml(row.code) + '" value="' + (newR > 0 ? newR : '') + '" placeholder="' + (oldR > 0 ? oldR.toFixed(dec) : '0.00') + '" class="manual-table-input font-num" oninput="onManualTablePriceChange(' + jsArg(row.code) + ', this.value)">' +
               '<span style="font-size:11px; color:#94a3b8;">د.ل</span>' +
             '</div>' +
           '</td>' +
-          '<td style="text-align:center;" id="manual-diff-' + row.code + '">' +
+          '<td style="text-align:center;" id="manual-diff-' + escapeHtml(row.code) + '">' +
             diffHtml +
           '</td>' +
-          '<td style="text-align:center;" id="manual-status-' + row.code + '">' +
+          '<td style="text-align:center;" id="manual-status-' + escapeHtml(row.code) + '">' +
             statusHtml +
           '</td>' +
         '</tr>';
@@ -3592,6 +3602,7 @@ export function renderDashboardHtml(initialState?: any): string {
     let isQuietHoursActiveState = false;
     let quietHoursEndStr = '08:30';
     let queueItemsCount = 0;
+    let currentQueueItems = [];
     let currentPreviewText = '';
 
     function formatTimeSeconds(totalSec) {
@@ -3606,6 +3617,24 @@ export function renderDashboardHtml(initialState?: any): string {
       const statusText = document.getElementById('queue-countdown-status-text');
       const badge = document.getElementById('queue-status-badge');
       const iconWrap = document.getElementById('queue-countdown-icon-wrap');
+      const failedItems = currentQueueItems.filter(function(item) { return item.lastError; });
+      if (failedItems.length) {
+        const blocked = failedItems.some(function(item) {
+          return (item.targets || []).some(function(platform) {
+            return !item.delivered?.[platform] && (item.attempts?.[platform] || 0) > 3;
+          });
+        });
+        if (clock) { clock.textContent = '—'; clock.style.color = '#fbbf24'; }
+        if (iconWrap) { iconWrap.textContent = '!'; iconWrap.style.borderColor = '#fbbf24'; }
+        if (statusText) statusText.textContent = blocked
+          ? 'تعذر إكمال النشر. راجع الخطأ ثم أعد المحاولة يدويًا؛ المنصات الناجحة لن تتكرر.'
+          : 'تعذر الإرسال لإحدى المنصات. إعادة المحاولة تلقائية ومحدودة، مع احترام ساعات الصمت.';
+        if (badge) {
+          badge.textContent = blocked ? 'يتطلب مراجعة (' + failedItems.length + ')' : 'بانتظار إعادة المحاولة';
+          badge.style.color = '#fbbf24'; badge.style.background = 'rgba(251,191,36,0.15)';
+        }
+        return;
+      }
 
       // 🌙 إذا كانت ساعات الصمت الليلي نشطة
       if (isQuietHoursActiveState) {
@@ -3708,6 +3737,7 @@ export function renderDashboardHtml(initialState?: any): string {
       isQuietHoursActiveState = Boolean(q.quietHours?.isActive);
       quietHoursEndStr = q.quietHours?.quietEnd || '08:30';
       queueItemsCount = Number(q.queueSize || 0);
+      currentQueueItems = q.items || [];
 
       if (q.nextBroadcastWaitSeconds !== undefined) {
         localRemainingSeconds = Number(q.nextBroadcastWaitSeconds);
@@ -3734,13 +3764,22 @@ export function renderDashboardHtml(initialState?: any): string {
             const isDown = item.diff < 0;
             const color = isUp ? '#34d399' : isDown ? '#f87171' : '#cbd5e1';
             const sign = isUp ? '+' : '';
-            const itemIdStr = (item.id || item.name || '').replace(/"/g, '&quot;');
-            html += '<div style="background:#1e293b; border:1px solid #334155; border-radius:6px; padding:6px 10px; font-size:11px; display:flex; align-items:center; gap:6px;">' +
-              '<button type="button" data-id="' + itemIdStr + '" onclick="removeSingleQueueItem(this.dataset.id, event)" style="background:rgba(239,68,68,0.2); border:1px solid rgba(239,68,68,0.3); color:#fca5a5; border-radius:4px; width:18px; height:18px; display:inline-flex; align-items:center; justify-content:center; font-size:10px; cursor:pointer; padding:0; line-height:1; margin-left:2px;" title="استبعاد هذه العملة من الطابور">✕</button>' +
-              '<span style="font-weight:700; color:#f1f5f9;">' + item.name + '</span>' +
+            const itemIdStr = escapeHtml(item.id || item.name || '');
+            html += '<div style="background:#1e293b; border:1px solid #334155; border-radius:6px; padding:8px 10px; font-size:12px; display:flex; flex-wrap:wrap; flex:1 1 260px; min-width:0; max-width:100%; align-items:center; gap:8px;">' +
+              '<button type="button" data-id="' + itemIdStr + '" onclick="removeSingleQueueItem(this.dataset.id, event)" style="background:rgba(239,68,68,0.2); border:1px solid rgba(239,68,68,0.3); color:#fca5a5; border-radius:4px; width:32px; height:32px; flex-shrink:0; display:inline-flex; align-items:center; justify-content:center; font-size:12px; cursor:pointer; padding:0; line-height:1;" aria-label="استبعاد العملة من الطابور" title="استبعاد هذه العملة من الطابور">✕</button>' +
+              '<span style="font-weight:700; color:#f1f5f9; flex:1 1 140px; min-width:0; overflow-wrap:anywhere;">' + escapeHtml(item.name) + '</span>' +
               '<span class="font-num" style="color:#cbd5e1;">' + Number(item.newVal).toFixed(2) + '</span>' +
-              '<span class="font-num" style="color:' + color + '; font-weight:700;">(' + sign + item.diff + ')</span>' +
-              '<span style="color:#64748b; font-size:10px;">(' + item.ageSeconds + 'ث)</span>' +
+              '<span class="font-num" style="color:' + color + '; font-weight:700;">(' + sign + Number(item.diff) + ')</span>' +
+              '<span style="color:#94a3b8; font-size:12px;">(' + Number(item.ageSeconds || 0) + 'ث)</span>' +
+              '<span style="font-size:12px; color:#e2e8f0; flex-basis:100%; min-width:0; line-height:1.6;">' +
+                (item.targets || []).map(function(platform) {
+                  var label = platform === 'telegram' ? 'Telegram' : 'Facebook';
+                  var state = item.delivered && item.delivered[platform] ? 'تم الإرسال' :
+                    item.attempts && item.attempts[platform] > 3 ? 'يتطلب إعادة محاولة يدوية' :
+                    item.attempts && item.attempts[platform] > 0 ? 'بانتظار إعادة المحاولة' : 'بانتظار النشر';
+                  return label + ': ' + state;
+                }).join(' · ') + '</span>' +
+              (item.lastError ? '<span style="color:#fca5a5; font-size:12px; flex-basis:100%; min-width:0; overflow-wrap:anywhere;">' + escapeHtml(item.lastError) + '</span>' : '') +
             '</div>';
           }
           html += '</div>';
@@ -3978,9 +4017,13 @@ export function renderDashboardHtml(initialState?: any): string {
     function setBroadcastText(type) {
       const input = document.getElementById('broadcast-input');
       if (!input) return;
-      const usd = currentRates?.parallel?.USD || currentRates?.parallel?.usd || 10.8;
-      const eur = currentRates?.parallel?.EUR || currentRates?.parallel?.eur || 12.17;
-      const gold = currentRates?.parallel?.GOLD || currentRates?.parallel?.GOLD_SCRAP_18 || 485;
+      const usd = currentRates?.parallel?.USD || currentRates?.parallel?.usd || 0;
+      const eur = currentRates?.parallel?.EUR || currentRates?.parallel?.eur || 0;
+      const gold = currentRates?.parallel?.GOLD || currentRates?.parallel?.GOLD_SCRAP_18 || 0;
+      if (type === 'rates' ? !(usd > 0 && eur > 0) : !(gold > 0)) {
+        showToast('لا توجد أسعار مؤكدة لهذا القالب بعد', true);
+        return;
+      }
       const time = new Date().toLocaleTimeString('ar-LY', { hour: '2-digit', minute: '2-digit' });
 
       if (type === 'rates') {
@@ -4075,16 +4118,16 @@ export function renderDashboardHtml(initialState?: any): string {
         const flagEmoji = getFlagEmoji(t.flag);
         const minVal = Number(t.min).toFixed(2);
         const maxVal = Number(t.max).toFixed(2);
-        const safeRegex = String(t.regex || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const safeRegex = escapeHtml(t.regex || '');
 
-        html += '<div class="term-card" id="term-card-' + t.id + '">' +
+        html += '<div class="term-card" id="term-card-' + escapeHtml(t.id) + '">' +
           '<div>' +
             '<div class="term-header">' +
               '<div class="term-title">' +
                 '<span style="font-size:18px;">' + flagEmoji + '</span>' +
-                '<span>' + t.name + '</span>' +
+                '<span>' + escapeHtml(t.name) + '</span>' +
               '</div>' +
-              '<span class="term-badge">' + t.id + '</span>' +
+              '<span class="term-badge">' + escapeHtml(t.id) + '</span>' +
             '</div>' +
             '<div style="margin: 8px 0 6px 0;">' +
               '<div style="font-size:10px; color:#94a3b8; margin-bottom:2px;">شرط قبول السعر (نطاق المطابقة):</div>' +
@@ -4102,9 +4145,9 @@ export function renderDashboardHtml(initialState?: any): string {
             '</div>' +
           '</div>' +
           '<div style="display:flex; gap:4px; margin-top:4px; border-top:1px solid #334155; padding-top:8px;">' +
-            '<button class="btn btn-secondary btn-sm" style="flex:1; font-size:11px;" onclick="openTermModal(&quot;' + t.id + '&quot;)">✏️ تعديل</button>' +
-            '<button class="btn btn-secondary btn-sm" style="flex:1; font-size:11px;" onclick="openTestTermModal(&quot;' + t.id + '&quot;)">🧪 تجربة</button>' +
-            '<button class="btn btn-danger btn-sm" style="padding:4px 8px; font-size:11px;" onclick="deleteTerm(&quot;' + t.id + '&quot;)" title="حذف العملة">🗑️</button>' +
+            '<button class="btn btn-secondary btn-sm" style="flex:1; font-size:11px;" onclick="openTermModal(' + jsArg(t.id) + ')">✏️ تعديل</button>' +
+            '<button class="btn btn-secondary btn-sm" style="flex:1; font-size:11px;" onclick="openTestTermModal(' + jsArg(t.id) + ')">🧪 تجربة</button>' +
+            '<button class="btn btn-danger btn-sm" style="padding:4px 8px; font-size:11px;" onclick="deleteTerm(' + jsArg(t.id) + ')" title="حذف العملة">🗑️</button>' +
           '</div>' +
         '</div>';
       }
@@ -4327,7 +4370,7 @@ export function renderDashboardHtml(initialState?: any): string {
       const resultBox = document.getElementById('test-term-result');
 
       if (infoEl) {
-        infoEl.innerHTML = 'اختبار عملة: <strong>' + activeTestTerm.name + ' (' + activeTestTerm.id + ')</strong> | ' +
+        infoEl.innerHTML = 'اختبار عملة: <strong>' + escapeHtml(activeTestTerm.name) + ' (' + escapeHtml(activeTestTerm.id) + ')</strong> | ' +
           'النطاق المشروط: <strong style="color:#34d399;">[' + activeTestTerm.min + ' - ' + activeTestTerm.max + '] د.ل</strong>';
       }
       if (textInput) {
@@ -4380,9 +4423,9 @@ export function renderDashboardHtml(initialState?: any): string {
           if (data.matched) {
             resultBox.style.background = data.withinRange ? 'rgba(16, 185, 129, 0.15)' : 'rgba(239, 68, 68, 0.15)';
             resultBox.style.border = data.withinRange ? '1px solid #10b981' : '1px solid #ef4444';
-            resultBox.innerHTML = '<div style="font-weight:700; margin-bottom:4px; color:' + (data.withinRange ? '#34d399' : '#f87171') + '">' + data.message + '</div>' +
-              '<div style="font-size:11px; color:#cbd5e1;">النص المطابق: <code>' + (data.fullMatch || '') + '</code></div>' +
-              '<div style="font-size:11px; color:#cbd5e1;">السعر المستخرج: <strong>' + data.capturedValue + '</strong> د.ل</div>' +
+            resultBox.innerHTML = '<div style="font-weight:700; margin-bottom:4px; color:' + (data.withinRange ? '#34d399' : '#f87171') + '">' + escapeHtml(data.message) + '</div>' +
+              '<div style="font-size:11px; color:#cbd5e1;">النص المطابق: <code>' + escapeHtml(data.fullMatch || '') + '</code></div>' +
+              '<div style="font-size:11px; color:#cbd5e1;">السعر المستخرج: <strong>' + Number(data.capturedValue) + '</strong> د.ل</div>' +
               '<div style="font-size:11px; color:#94a3b8;">شروط النطاق: [' + activeTestTerm.min + ' - ' + activeTestTerm.max + ']</div>';
           } else {
             resultBox.style.background = 'rgba(245, 158, 11, 0.15)';
@@ -4393,7 +4436,7 @@ export function renderDashboardHtml(initialState?: any): string {
         }
       } catch (err) {
         if (resultBox) {
-          resultBox.innerHTML = '<span style="color:#ef4444;">خطأ: ' + err.message + '</span>';
+          resultBox.innerHTML = '<span style="color:#ef4444;">خطأ: ' + escapeHtml(err.message) + '</span>';
         }
       }
     }

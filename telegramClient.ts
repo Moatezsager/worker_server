@@ -312,7 +312,8 @@ export class TelegramManager {
 
     try {
       const url = `https://api.telegram.org/bot${token}/sendMessage`;
-      const res = await fetch(url, {
+const res = await fetch(url, {
+        signal: AbortSignal.timeout(15000),
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -335,7 +336,8 @@ export class TelegramManager {
       // If markdown formatting failed, fallback to clean plain text
       if (data.description && /parse|markdown|entity/i.test(data.description)) {
         const plain = message.replace(/[*_`]/g, '');
-        const retryRes = await fetch(url, {
+const retryRes = await fetch(url, {
+          signal: AbortSignal.timeout(15000),
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

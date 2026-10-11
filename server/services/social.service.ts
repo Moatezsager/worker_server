@@ -102,37 +102,10 @@ const MIN_PRICE_CHANGE = 0.01;
 const MIN_PRICE_CHANGE_PCT_PRECIOUS = 0.005;
 // ───────────────────────────────────────────────────────────────────────────
 
-// ─── Pending Queue (تحديثات مُؤجَّلة بسبب حد الساعة) ──────────────────────
-interface PendingBroadcast {
-  updates: { id?: string; name: string; oldVal: number; newVal: number; flag: string }[];
-  target: 'all' | 'telegram' | 'facebook';
-  addedAt: number;
-}
-/** قائمة انتظار للتحديثات المرفوضة بسبب حد الساعة — تُعالَج بمجرد تحرر فتحة */
-const pendingBroadcastQueue: PendingBroadcast[] = [];
-
-/** أقصى عمر لتحديث في قائمة الانتظار = 3 ساعات، بعدها يُحذف */
-const MAX_PENDING_AGE_MS = 3 * 60 * 60 * 1000;
-
-/** watchdog timer للتحقق من قائمة الانتظار كل 5 دقائق */
-let pendingWatchdogTimer: NodeJS.Timeout | null = null;
-// ───────────────────────────────────────────────────────────────────────────
 
 // ─── Retry Engine (إعادة المحاولة عند فشل الإرسال) ────────────────────────
-interface RetryJob {
-  message: string;
-  target: 'all' | 'telegram' | 'facebook';
-  updates: { id?: string; name: string; newVal?: number; oldVal?: number; [key: string]: any }[];
-  attempts: number;
-  nextRetryAt: number;
-  startTime?: number;
-  lastError?: string;
-}
-/** قائمة مهام إعادة المحاولة بعد فشل الإرسال */
-const retryQueue: RetryJob[] = [];
-
 export function getRetryQueueCount(): number {
-  return retryQueue.length;
+  return [...smartBroadcastQueue.values()].filter(item => item.lastError).length;
 }
 
 /** الحد الأقصى لمحاولات الإعادة = 3 */
@@ -141,8 +114,7 @@ const MAX_RETRY_ATTEMPTS = 3;
 /** مضاعف التأخير بين المحاولات (Exponential Backoff) بالميللي ثانية */
 const RETRY_BASE_DELAY_MS = 30 * 1000; // 30 ثانية، 60، 120
 
-/** timer لمحرك إعادة المحاولة */
-let retryEngineTimer: NodeJS.Timeout | null = null;
+
 // ───────────────────────────────────────────────────────────────────────────
 
 
@@ -320,211 +292,8 @@ function recordBroadcast(updates: { id?: string; name: string; newVal?: number; 
   );
 }
 
-// ─── Retry Engine ───────────────────────────────────────────────────────────
-/**
- * يُضيف رسالة فاشلة إلى قائمة إعادة المحاولة مع Exponential Backoff.
- * المحاولة 1 → بعد 30 ثانية
- * المحاولة 2 → بعد 60 ثانية
- * المحاولة 3 → بعد 120 ثانية
- * بعد 3 فشل → يُحذف نهائياً مع تسجيل خطأ
- */
-function scheduleRetry(
-  message: string,
-  target: 'all' | 'telegram' | 'facebook',
-  updates: { id?: string; name: string; newVal?: number; oldVal?: number; [key: string]: any }[],
-  attemptNumber: number,
-  startTime: number = Date.now(),
-  lastError: string = ''
-): void {
-  if (attemptNumber > MAX_RETRY_ATTEMPTS) {
-    console.error(
-      `[RetryEngine] ❌ Giving up after ${MAX_RETRY_ATTEMPTS} attempts for: [${updates.map(u => u.id || u.name).join(', ')}]`
-    );
-    try {
-      const platform = target === 'all' ? 'both' : target;
-      const currencyIds = updates.map(u => u.id || u.name).filter(Boolean) as string[];
-      addBroadcastLog({
-        platform,
-        currency_ids: currencyIds,
-        status: 'failed',
-        attempts: 1 + MAX_RETRY_ATTEMPTS,
-        duration_ms: Date.now() - startTime,
-        error_message: lastError || `Exhausted ${MAX_RETRY_ATTEMPTS} retries`,
-        is_test: 0
-      });
-    } catch (logErr) {
-      console.error("[BroadcastLog] Failed to record give-up log:", logErr);
-    }
-    return;
-  }
-  const delayMs = RETRY_BASE_DELAY_MS * Math.pow(2, attemptNumber - 1);
-  const nextRetryAt = Date.now() + delayMs;
-  retryQueue.push({ message, target, updates, attempts: attemptNumber, nextRetryAt, startTime, lastError });
-  console.warn(
-    `[RetryEngine] ⏳ Scheduled retry #${attemptNumber} in ${delayMs / 1000}s for: [${updates.map(u => u.id || u.name).join(', ')}]`
-  );
-  startRetryEngine();
-}
-
-/**
- * محرك إعادة المحاولة — يعمل بدورة متكررة حتى تفرغ القائمة تماماً.
- * يُشغَّل تلقائياً عند إضافة أي مهمة retry.
- */
-function startRetryEngine(): void {
-  if (retryEngineTimer !== null) return; // يعمل بالفعل
-  retryEngineTimer = setTimeout(async () => {
-    retryEngineTimer = null;
-    const now = Date.now();
-    const due = retryQueue.filter(j => j.nextRetryAt <= now);
-    due.forEach(j => retryQueue.splice(retryQueue.indexOf(j), 1));
-
-    for (const job of due) {
-      console.log(`[RetryEngine] 🔁 Retrying attempt #${job.attempts} for: [${job.updates.map(u => u.id || u.name).join(', ')}]`);
-      try {
-        await broadcastToSocialMedia(job.message, false, job.target);
-        // نجاح → سجّل وقت النشر
-        recordBroadcast(job.updates);
-        console.log(`[RetryEngine] ✅ Retry #${job.attempts} succeeded for: [${job.updates.map(u => u.id || u.name).join(', ')}]`);
-
-        // تسجيل نجاح بعد إعادة المحاولة (Outcome 2)
-        try {
-          const platform = job.target === 'all' ? 'both' : job.target;
-          const currencyIds = job.updates.map(u => u.id || u.name).filter(Boolean) as string[];
-          addBroadcastLog({
-            platform,
-            currency_ids: currencyIds,
-            status: 'success_after_retry',
-            attempts: 1 + job.attempts,
-            duration_ms: Date.now() - (job.startTime || Date.now()),
-            error_message: null,
-            is_test: 0
-          });
-        } catch (logErr) {
-          console.error("[BroadcastLog] Failed to record retry success log:", logErr);
-        }
-      } catch (err: any) {
-        console.error(`[RetryEngine] ❌ Retry #${job.attempts} failed: ${err.message || err}`);
-        scheduleRetry(job.message, job.target, job.updates, job.attempts + 1, job.startTime || Date.now(), err.message || String(err));
-      }
-    }
-
-    if (retryQueue.length > 0) {
-      startRetryEngine(); // جدولة دورة قادمة إذا لا تزال هناك مهام
-    }
-  }, 5000); // فحص كل 5 ثوانٍ لمعرفة المهام المستحقة
-}
-// ─── Pending Queue Watchdog ─────────────────────────────────────────────────
-/**
- * يُضيف تحديثات مرفوضة (بسبب حد الساعة) إلى قائمة الانتظار.
- *
- * ✅ الإصلاح الجوهري:
- * الكود القديم كان يُضيف كل عملة كـ batch منفصل ← يتسبب في إرسال منشور لكل عملة على حدة.
- * الكود الجديد يجمع دائماً كل التحديثات في batch واحد يتراكم ويُحدَّث بدلاً من التكرار.
- * بهذا يُرسل الـ watchdog منشوراً واحداً يحتوي على جميع العملات المعلقة.
- */
-function addToPendingQueue(
-  updates: { id?: string; name: string; oldVal: number; newVal: number; flag: string }[],
-  target: 'all' | 'telegram' | 'facebook'
-): void {
-  if (updates.length === 0) return;
-
-  if (pendingBroadcastQueue.length === 0) {
-    // لا يوجد batch معلق بعد → أنشئ واحداً جديداً بكل التحديثات
-    pendingBroadcastQueue.push({ updates: [...updates], target, addedAt: Date.now() });
-  } else {
-    // يوجد batch معلق → ادمج التحديثات الجديدة فيه
-    // القاعدة: نفس العملة → نحتفظ بالـ oldVal الأصلي ونأخذ آخر newVal
-    const batch = pendingBroadcastQueue[pendingBroadcastQueue.length - 1];
-    for (const u of updates) {
-      const key = u.id || u.name;
-      const existingIdx = batch.updates.findIndex(pu => (pu.id || pu.name) === key);
-      if (existingIdx >= 0) {
-        // تحديث موجود → حدّث القيمة الجديدة فقط، احتفظ بالقيمة القديمة الأصلية
-        batch.updates[existingIdx] = { ...u, oldVal: batch.updates[existingIdx].oldVal };
-      } else {
-        // عملة جديدة → أضفها للـ batch نفسه
-        batch.updates.push({ ...u });
-      }
-    }
-    // حدّث الـ target للأشمل في حال اختلف
-    if (batch.target !== target && target === 'all') {
-      batch.target = 'all';
-    }
-  }
-
-  console.log(
-    `[PendingQueue] 📥 Merged ${updates.map(u => u.id || u.name).join(', ')} into pending batch ` +
-    `(batch size: ${pendingBroadcastQueue[0]?.updates.length ?? 0} currencies)`
-  );
-  startPendingWatchdog();
-}
-
-/**
- * يُشغّل الـ watchdog إذا لم يكن يعمل بالفعل.
- *
- * ✅ الإصلاح الجوهري:
- * الكود القديم يأخذ shift() عنصراً واحداً فقط في كل دورة → إرسال منشور منفرد لكل عملة.
- * الكود الجديد يستنزف كل العناصر المعلقة ويدمجها في منشور واحد شامل عند تحرر الفتحة.
- * كما تم تقليل الفترة من 5 دقائق إلى 90 ثانية للاستجابة الأسرع.
- */
-function startPendingWatchdog(): void {
-  if (pendingWatchdogTimer !== null) return;
-  pendingWatchdogTimer = setInterval(async () => {
-    const now = Date.now();
-
-    // حذف التحديثات منتهية الصلاحية (أكثر من 3 ساعات)
-    const expiredIdxs: number[] = [];
-    pendingBroadcastQueue.forEach((p, i) => {
-      if (now - p.addedAt > MAX_PENDING_AGE_MS) expiredIdxs.push(i);
-    });
-    for (let i = expiredIdxs.length - 1; i >= 0; i--) {
-      const [expired] = pendingBroadcastQueue.splice(expiredIdxs[i], 1);
-      console.warn(`[PendingQueue] 🗑 Expired pending update: [${expired.updates.map(u => u.id || u.name).join(', ')}]`);
-    }
-
-    if (pendingBroadcastQueue.length === 0) {
-      clearInterval(pendingWatchdogTimer!);
-      pendingWatchdogTimer = null;
-      return;
-    }
-
-    if (!canBroadcastNow()) return; // لا تزال الفتحة ممتلئة
-
-    // ✅ اجمع كل العناصر في القائمة في منشور واحد بدلاً من أخذ عنصر واحد فقط
-    // هذا يضمن: إذا تراكمت عملات متعددة في الـ pending، تُرسل جميعها في رسالة واحدة
-    const allPending = pendingBroadcastQueue.splice(0, pendingBroadcastQueue.length);
-    const mergedTarget = allPending.some(p => p.target === 'all') ? 'all' 
-      : allPending.some(p => p.target === 'telegram') ? 'telegram' : 'facebook';
-
-    // دمج جميع التحديثات مع معالجة التكرار (نفس العملة → نحتفظ بآخر سعر وأقدم oldVal)
-    const mergedMap = new Map<string, { id?: string; name: string; oldVal: number; newVal: number; flag: string }>();
-    for (const batch of allPending) {
-      for (const u of batch.updates) {
-        const key = u.id || u.name;
-        const existing = mergedMap.get(key);
-        if (existing) {
-          mergedMap.set(key, { ...u, oldVal: existing.oldVal }); // احتفظ بأقدم oldVal
-        } else {
-          mergedMap.set(key, { ...u });
-        }
-      }
-    }
-    const mergedUpdates = Array.from(mergedMap.values());
-
-    console.log(
-      `[PendingQueue] 🚀 Dispatching merged pending batch: [${mergedUpdates.map(u => u.id || u.name).join(', ')}] ` +
-      `(${mergedUpdates.length} currencies in 1 post)`
-    );
-
-    // إرسال الـ batch المدمج بدون فلاتر (لأنها اجتازتها مسبقاً)
-    executeBroadcast(mergedUpdates, false, mergedTarget, true).catch(e =>
-      console.error('[PendingQueue] ❌ Failed to process pending batch:', e)
-    );
-  }, 90 * 1000); // فحص كل 90 ثانية (تقليل من 5 دقائق للاستجابة الأسرع)
-}
-// ───────────────────────────────────────────────────────────────────────────
-
 export async function broadcastToSocialMedia(message: string, isTest: boolean = false, target: 'all' | 'telegram' | 'facebook' = 'all', isManual: boolean = false) {
+  const sentTargets: ('telegram' | 'facebook')[] = [];
 
   const manager = getOrInitTelegramManager();
 
@@ -614,6 +383,7 @@ export async function broadcastToSocialMedia(message: string, isTest: boolean = 
           lastSuccessTime: new Date().toISOString()
         };
         lastSocialBroadcastTime = Date.now();
+        sentTargets.push('telegram');
         console.log(`[Telegram Broadcast] Successfully sent message to ${tgChannel}`);
       }
     }
@@ -658,7 +428,8 @@ export async function broadcastToSocialMedia(message: string, isTest: boolean = 
             payload.link = linkToAttach;
           }
 
-          let fbRes = await fetch(url, {
+let fbRes = await fetch(url, {
+            signal: AbortSignal.timeout(15000),
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
@@ -669,7 +440,8 @@ export async function broadcastToSocialMedia(message: string, isTest: boolean = 
           if (fbData.error && payload.link) {
             console.log("[Facebook Broadcast] Retrying without link parameter...");
             delete payload.link;
-            const retryRes = await fetch(url, {
+const retryRes = await fetch(url, {
+              signal: AbortSignal.timeout(15000),
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(payload)
@@ -684,7 +456,8 @@ export async function broadcastToSocialMedia(message: string, isTest: boolean = 
           if (fbData.error && (fbData.error.code === 100 || fbData.error.message?.includes('global id'))) {
             console.log("[Facebook Broadcast] Trying fallback to /me/feed...");
             const fallbackUrl = `https://graph.facebook.com/v20.0/me/feed`;
-            const fallbackRes = await fetch(fallbackUrl, {
+const fallbackRes = await fetch(fallbackUrl, {
+              signal: AbortSignal.timeout(15000),
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ message: fbMessage, access_token: appConfig.facebookAccessToken })
@@ -712,6 +485,7 @@ export async function broadcastToSocialMedia(message: string, isTest: boolean = 
             }
           } else {
             postedSuccessfully = true;
+            sentTargets.push('facebook');
             console.log("[Facebook Broadcast] Successfully posted, ID:", fbData.id);
             facebookBroadcastStatus = { status: 'ok', lastError: '', lastErrorTime: facebookBroadcastStatus.lastErrorTime, lastSuccessTime: new Date().toISOString() };
             lastSocialBroadcastTime = Date.now();
@@ -720,7 +494,8 @@ export async function broadcastToSocialMedia(message: string, isTest: boolean = 
             try {
               const commentMessage = `📢 لمتابعة التحديثات لحظة بلحظة على تيليجرام:\n👉 https://tinyurl.com/m3m4jrd2\n\n🌐 والرسوم البيانية والتفاصيل الكاملة من هنا:\n👉 https://tinyurl.com/2j7667u2`;
               const commentUrl = `https://graph.facebook.com/v20.0/${fbData.id}/comments`;
-              const commentRes = await fetch(commentUrl, {
+const commentRes = await fetch(commentUrl, {
+                signal: AbortSignal.timeout(15000),
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ message: commentMessage, access_token: appConfig.facebookAccessToken })
@@ -751,20 +526,25 @@ export async function broadcastToSocialMedia(message: string, isTest: boolean = 
     }
   }
 
-  const hadAttempts = shouldPostTg || shouldPostFb;
-  const anySuccess = (shouldPostTg && telegramBroadcastStatus.status === 'ok') || (shouldPostFb && facebookBroadcastStatus.status === 'ok');
-
-  if (hadAttempts && !anySuccess) {
+  if ((shouldPostTg && !sentTargets.includes('telegram')) || (shouldPostFb && !sentTargets.includes('facebook'))) {
     const errorDetails: string[] = [];
     if (shouldPostTg) errorDetails.push(`تيليجرام: ${telegramBroadcastStatus.lastError || 'فشل الاتصال'}`);
     if (shouldPostFb) errorDetails.push(`فيسبوك: ${facebookBroadcastStatus.lastError || 'فشل الاتصال'}`);
-    throw new Error(`فشل النشر عبر الشبكات: ${errorDetails.join(' | ')}`);
+    throw Object.assign(new Error(`فشل النشر عبر الشبكات: ${errorDetails.join(' | ')}`), { sentTargets });
   }
+  return { sentTargets };
 }
 
-import { sendPushNotificationToAll } from './push.service';
 
 export let lastOfficialBroadcastDate = "";
+let officialSending = false;
+let officialDelivery: {
+  date: string;
+  delivered: Partial<Record<'telegram' | 'facebook', boolean>>;
+  attempts: Partial<Record<'telegram' | 'facebook', number>>;
+  retryAt: Partial<Record<'telegram' | 'facebook', number>>;
+  lastError?: string;
+} = { date: '', delivered: {}, attempts: {}, retryAt: {} };
 (async () => {
   try {
     if (db) {
@@ -826,19 +606,9 @@ const OFFICIAL_CURRENCIES_INFO: Record<string, { name: string; flag: string; ran
 
 export async function broadcastOfficialRates(
   isTest: boolean = false, 
-  target: 'all' | 'telegram' | 'facebook' = (appConfig.facebookAutoPost ? 'all' : 'telegram')
+  target: 'all' | 'telegram' | 'facebook' = 'all'
 ): Promise<boolean> {
-  const manager = getOrInitTelegramManager();
-  if (!appConfig.telegramPostChannel || !manager) {
-    console.warn("[Official Broadcast] Aborting broadcast: channel or telegram manager not ready.");
-    return false;
-  }
-
-  if (!isTest && !appConfig.telegramAutoPost) {
-    console.log("[Official Broadcast] Aborting official broadcast because telegramAutoPost is disabled in settings.");
-    return true; // Not an error condition; auto-post is disabled by choice
-  }
-
+  if (!Number.isFinite(rates.official.USD) || rates.official.USD <= 0) return false;
   const now = new Date();
   const libyaDateObj = new Date(now.toLocaleString('en-US', { timeZone: 'Africa/Tripoli' }));
   const yyyy = libyaDateObj.getFullYear();
@@ -888,39 +658,51 @@ export async function broadcastOfficialRates(
   message += `🔗 *لمزيد من التفاصيل والبيانات الحية:*\n🌐 https://tinyurl.com/2j7667u2\n`;
   message += `📱 *المصدر:* مصرف ليبيا المركزي`;
 
+  if (officialSending) return false;
+  officialSending = true;
   try {
-    console.log(`[Official Broadcast] Dispatching official bulletin (${officialEntries.length} currencies) to ${target}...`);
-    await broadcastToSocialMedia(message, typeof isTest !== "undefined" ? isTest : false, target, isTest);
-    if (!isTest) {
-      lastOfficialBroadcastDate = todayLibyaKey;
+    const required: ('telegram' | 'facebook')[] = ['telegram', 'facebook'].filter(platform =>
+      (target === 'all' || target === platform) && (isTest ||
+       (platform === 'telegram' ? appConfig.telegramAutoPost : appConfig.facebookAutoPost))) as ('telegram' | 'facebook')[];
+    if (!required.length) return true;
+    if (officialDelivery.date !== todayLibyaKey) officialDelivery = { date: todayLibyaKey, delivered: {}, attempts: {}, retryAt: {} };
+    for (const platform of required) {
+      if (!isTest && (officialDelivery.delivered[platform] ||
+          (officialDelivery.attempts[platform] || 0) > MAX_RETRY_ATTEMPTS ||
+          (officialDelivery.retryAt[platform] || 0) > Date.now())) continue;
       try {
-        if (db) {
-          db.prepare(`
-            INSERT INTO server_config (key, value) VALUES ('last_official_broadcast_date', ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-          `).run(todayLibyaKey);
-        }
-      } catch (dbErr) {
-        console.error("[Official Broadcast] Failed to persist date to SQLite:", dbErr);
+        await broadcastToSocialMedia(message, isTest, platform, isTest);
+        if (!isTest) officialDelivery.delivered[platform] = true;
+        addBroadcastLog({ platform, currency_ids: officialEntries.map(([id]) => 'OFFICIAL_' + id),
+          status: 'success', attempts: 1, is_test: isTest ? 1 : 0 });
+      } catch (err: any) {
+        if (isTest) throw err;
+        const attempt = (officialDelivery.attempts[platform] || 0) + 1;
+        officialDelivery.attempts[platform] = attempt;
+        officialDelivery.retryAt[platform] = Date.now() + RETRY_BASE_DELAY_MS * 2 ** Math.min(attempt - 1, 3);
+        officialDelivery.lastError = String(err?.message || err);
+        addBroadcastLog({ platform, currency_ids: officialEntries.map(([id]) => 'OFFICIAL_' + id),
+          status: 'failed', attempts: attempt, error_message: officialDelivery.lastError, is_test: 0 });
       }
-      if (supabase) {
-        supabase.from('server_config').upsert({
-          key: 'last_official_broadcast_date',
-          value: todayLibyaKey,
-          updated_at: new Date().toISOString()
-        }).then(({ error }) => {
-          if (error) console.error("[Official Broadcast] Failed to persist date to Supabase:", error);
-        }, err => {
-          console.error("[Official Broadcast] Supabase error:", err);
-        });
+      if (!isTest) {
+        persistBroadcastQueue();
+        await flushBroadcastQueueState();
       }
     }
-    console.log(`[Official Broadcast] Successfully posted daily official bulletin for ${todayLibyaKey}!`);
-    return true;
-  } catch(e) {
-    console.error("[Official Broadcast] Failed to broadcast official rates:", e);
-    return false;
-  }
+    const complete = isTest || required.every(platform => officialDelivery.delivered[platform]);
+    if (complete && !isTest) {
+      lastOfficialBroadcastDate = todayLibyaKey;
+      db?.prepare('INSERT OR REPLACE INTO server_config (key, value) VALUES (?, ?)').run('last_official_broadcast_date', todayLibyaKey);
+      if (supabase) {
+        const { error } = await supabase.from('server_config').upsert({
+          key: 'last_official_broadcast_date', value: todayLibyaKey, updated_at: new Date().toISOString()
+        });
+        if (error) console.error('[Official] Completion checkpoint failed:', error.message);
+      }
+      persistBroadcastQueue();
+    }
+    return complete;
+  } finally { officialSending = false; }
 }
 
 /**
@@ -1007,6 +789,12 @@ export interface QueuedRateUpdate {
   firstSeenAt: number;
   lastSeenAt: number;
   updateCount: number;
+  delivered?: Partial<Record<'telegram' | 'facebook', boolean>>;
+  attempts?: Partial<Record<'telegram' | 'facebook', number>>;
+  retryAt?: Partial<Record<'telegram' | 'facebook', number>>;
+  lastError?: string;
+  targets?: ('telegram' | 'facebook')[];
+  headerTitle?: string;
 }
 
 export let smartBroadcastQueue: Map<string, QueuedRateUpdate> = new Map();
@@ -1062,6 +850,7 @@ export function removeQueueItem(itemIdOrKey: string): { success: boolean; remove
 
   if (foundKey) {
     smartBroadcastQueue.delete(foundKey);
+    persistBroadcastQueue();
     if (smartBroadcastQueue.size === 0 && smartBroadcastAggregationTimer) {
       clearTimeout(smartBroadcastAggregationTimer);
       smartBroadcastAggregationTimer = null;
@@ -1154,7 +943,12 @@ export function getBroadcastQueueStatus() {
     diff: Number((item.newVal - item.oldVal).toFixed(3)),
     flag: item.flag,
     ageSeconds: Math.floor((now - item.firstSeenAt) / 1000),
-    updateCount: item.updateCount
+    updateCount: item.updateCount,
+    targets: item.targets || [],
+    delivered: item.delivered || {},
+    attempts: item.attempts || {},
+    retryAt: item.retryAt || {},
+    lastError: item.lastError || ''
   }));
 
   return {
@@ -1190,6 +984,7 @@ export function clearBroadcastQueue(resetCooldown: boolean = true): { count: num
   smartBroadcastAggregationTimerStartedAt = null;
   const count = smartBroadcastQueue.size;
   smartBroadcastQueue.clear();
+  persistBroadcastQueue();
 
   if (resetCooldown) {
     // تصفير وقت الانتظار وبدء العد التنازلي من جديد من اللحظة الحالية
@@ -1219,33 +1014,148 @@ export function resetBroadcastCooldown(toZero: boolean = false): { cooldownRemai
   }
 }
 
-export async function flushBroadcastQueueImmediately(target?: 'all' | 'telegram' | 'facebook', isManual = true) {
-  if (smartBroadcastAggregationTimer) {
-    clearTimeout(smartBroadcastAggregationTimer);
-    smartBroadcastAggregationTimer = null;
-  }
-  smartBroadcastAggregationTimerStartedAt = null;
-  const updates = Array.from(smartBroadcastQueue.values()).map(item => ({
-    id: item.id,
-    name: item.name,
-    oldVal: item.oldVal,
-    newVal: item.newVal,
-    flag: item.flag
-  }));
-  if (updates.length === 0) {
-    smartBroadcastQueue.clear();
-    return { success: true, count: 0, message: "طابور التحديثات فارغ حالياً." };
-  }
+let queueSending = false;
+let queueBackupTimer: NodeJS.Timeout | null = null;
+let queueBackupWrite: Promise<unknown> = Promise.resolve();
+function queueSnapshot() {
+  return JSON.stringify({ items: [...smartBroadcastQueue.entries()], official: officialDelivery,
+    lastSocialBroadcastTime, savedAt: Date.now() });
+}
+function persistBroadcastQueue() {
+  try { db?.prepare('INSERT OR REPLACE INTO server_config (key, value) VALUES (?, ?)').run('worker_broadcast_queue', queueSnapshot()); }
+  catch (err) { console.error('[Queue] Local checkpoint failed:', err); }
+  if (queueBackupTimer || !supabase) return;
+  queueBackupTimer = setTimeout(() => { void flushBroadcastQueueState(); }, 1000);
+}
+export async function flushBroadcastQueueState() {
+  if (queueBackupTimer) clearTimeout(queueBackupTimer);
+  queueBackupTimer = null;
+  if (!supabase) return;
+  const value = queueSnapshot();
+  queueBackupWrite = queueBackupWrite.catch(() => {}).then(async () => {
+    const { error } = await supabase.from('server_config').upsert({
+      key: 'worker_broadcast_queue', value, updated_at: new Date().toISOString()
+    });
+    if (error) console.error('[Queue] Remote checkpoint failed:', error.message);
+  }).catch(err => console.error('[Queue] Remote checkpoint failed:', err));
+  await queueBackupWrite;
+}
 
-  const resolvedTarget = target || ((appConfig.telegramAutoPost && appConfig.facebookAutoPost) ? 'all' : appConfig.telegramAutoPost ? 'telegram' : 'facebook');
+function validDeliveryProgress(state: any): boolean {
+  return ['delivered', 'attempts', 'retryAt'].every(field => {
+    const value = state?.[field];
+    if (value === undefined) return true;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    return Object.entries(value).every(([platform, entry]) =>
+      ['telegram', 'facebook'].includes(platform) && (field === 'delivered' ?
+        typeof entry === 'boolean' : typeof entry === 'number' && Number.isFinite(entry) && entry >= 0));
+  });
+}
+
+export async function loadBroadcastQueueState() {
+  let saved: any;
   try {
-    await executeBroadcast(updates, false, resolvedTarget, true, isManual);
-    smartBroadcastQueue.clear(); // ← بعد النجاح فقط
-    return { success: true, count: updates.length, message: `تم تفريغ الطابور ونشر ${updates.length} عملة بنجاح!` };
-  } catch (err: any) {
-    console.error('[FlushQueue] فشل النشر، الطابور محتفظ به:', err);
-    return { success: false, count: 0, message: `فشل النشر: ${err?.message}` };
+    const row = db?.prepare('SELECT value FROM server_config WHERE key = ?').get('worker_broadcast_queue') as {value: string} | undefined;
+    if (row?.value) {
+      try { saved = JSON.parse(row.value); }
+      catch { console.warn('[Queue] Ignoring malformed local checkpoint.'); }
+    }
+    if (supabase) {
+      const { data, error } = await supabase.from('server_config').select('value').eq('key', 'worker_broadcast_queue').single();
+      if (!error && data?.value) {
+        try {
+          const remote = JSON.parse(data.value);
+          if (Array.isArray(remote?.items) && (!saved || remote.savedAt > saved.savedAt)) saved = remote;
+        } catch { console.warn('[Queue] Ignoring malformed remote checkpoint.'); }
+      }
+    }
+    for (const entry of (Array.isArray(saved?.items) ? saved.items : []).slice(0, 100)) {
+      if (!Array.isArray(entry) || entry.length !== 2) continue;
+      const [key, item] = entry;
+      if (typeof key === 'string' && item?.id === key && typeof item.name === 'string' && typeof item.flag === 'string' &&
+          Number.isFinite(item.newVal) && item.newVal > 0 && Number.isFinite(item.oldVal) &&
+          Number.isFinite(item.firstSeenAt) && Number.isFinite(item.lastSeenAt) && Number.isFinite(item.updateCount) &&
+          (item.targets === undefined || Array.isArray(item.targets) && item.targets.length > 0 &&
+            item.targets.every((target: string) => ['telegram', 'facebook'].includes(target))) &&
+          (item.headerTitle === undefined || typeof item.headerTitle === 'string') &&
+          (item.lastError === undefined || typeof item.lastError === 'string') && validDeliveryProgress(item)) {
+        smartBroadcastQueue.set(key, item);
+      }
+    }
+    if (Number.isFinite(saved?.lastSocialBroadcastTime)) lastSocialBroadcastTime = saved.lastSocialBroadcastTime;
+    if (typeof saved?.official?.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(saved.official.date) &&
+        saved.official.delivered && saved.official.attempts && saved.official.retryAt && validDeliveryProgress(saved.official)) {
+      officialDelivery = saved.official;
+    }
+
+  } catch (err) { console.warn('[Queue] Restore failed:', err); }
+}
+
+async function deliverQueuedUpdates(
+  updates: { id?: string; name: string; oldVal: number; newVal: number; flag: string }[],
+  target: 'all' | 'telegram' | 'facebook',
+  isManual: boolean,
+  customHeaderTitle?: string
+) {
+  if (queueSending) return { success: false, count: 0, message: 'هناك نشر قيد التنفيذ، يرجى الانتظار.' };
+  queueSending = true;
+  const snapshot = [...smartBroadcastQueue.entries()].filter(([, item]) =>
+    updates.some(u => (u.id || u.name) === item.id));
+  const platforms: ('telegram' | 'facebook')[] = target === 'all' ? ['telegram', 'facebook'] : [target];
+  let failed = false;
+  try {
+    for (const platform of platforms) {
+      const pending = snapshot.filter(([, item]) => (!item.targets || item.targets.includes(platform)) && !item.delivered?.[platform] &&
+        (isManual || (item.attempts?.[platform] || 0) <= MAX_RETRY_ATTEMPTS &&
+         (item.retryAt?.[platform] || 0) <= Date.now()));
+      if (!pending.length) continue;
+      try {
+        const headers = new Set(pending.map(([, item]) => item.headerTitle));
+        const header = customHeaderTitle || (headers.size === 1 ? pending[0]?.[1].headerTitle : '📊 *مؤشر الدينار | نشرة الأسعار*');
+        const sent = await executeBroadcast(pending.map(([, item]) => item), false, platform, true, isManual, header);
+        if (!sent) { failed = true; continue; }
+        for (const [, item] of pending) item.delivered = { ...item.delivered, [platform]: true };
+      } catch (err: any) {
+        failed = true;
+        for (const [, item] of pending) {
+          const attempt = (item.attempts?.[platform] || 0) + 1;
+          item.attempts = { ...item.attempts, [platform]: attempt };
+          item.retryAt = { ...item.retryAt, [platform]: Date.now() + RETRY_BASE_DELAY_MS * 2 ** Math.min(attempt - 1, 3) };
+          item.lastError = String(err?.message || err);
+        }
+      }
+      persistBroadcastQueue();
+      await flushBroadcastQueueState();
+    }
+    let count = 0;
+    for (const [key, item] of snapshot) {
+      if ((item.targets || platforms).every(platform => item.delivered?.[platform])) {
+        if (smartBroadcastQueue.get(key) === item) smartBroadcastQueue.delete(key);
+        count++;
+      } else failed = true;
+    }
+    persistBroadcastQueue();
+    await flushBroadcastQueueState();
+    return { success: !failed, count, message: failed ?
+      'لم يكتمل النشر لكل المنصات. التحديثات غير المرسلة محفوظة في الطابور.' :
+      'تم نشر التحديثات بنجاح.' };
+  } finally { queueSending = false; }
+}
+
+export async function flushBroadcastQueueImmediately(target?: 'all' | 'telegram' | 'facebook', isManual = true) {
+  if (!smartBroadcastQueue.size) return { success: true, count: 0, message: 'طابور التحديثات فارغ حالياً.' };
+  if (smartBroadcastAggregationTimer) clearTimeout(smartBroadcastAggregationTimer);
+  smartBroadcastAggregationTimer = null;
+  smartBroadcastAggregationTimerStartedAt = null;
+  const resolved = target || (appConfig.telegramAutoPost && appConfig.facebookAutoPost ? 'all' :
+    appConfig.telegramAutoPost ? 'telegram' : appConfig.facebookAutoPost ? 'facebook' : null);
+  if (!resolved) return { success: false, count: 0, message: 'لم يتم تفعيل أي منصة للنشر.' };
+  if (isManual) {
+    const selected: ('telegram' | 'facebook')[] = resolved === 'all' ? ['telegram', 'facebook'] : [resolved];
+    for (const item of smartBroadcastQueue.values()) item.targets = [...new Set([...(item.targets || []), ...selected])];
+    persistBroadcastQueue();
   }
+  return deliverQueuedUpdates([...smartBroadcastQueue.values()], resolved, isManual);
 }
 
 export async function processSmartBroadcastQueue(): Promise<boolean> {
@@ -1259,6 +1169,17 @@ export async function processSmartBroadcastQueue(): Promise<boolean> {
     return false;
   }
 
+  const retryItems = [...smartBroadcastQueue.values()].filter(item => item.lastError &&
+    (['telegram', 'facebook'] as const).some(platform =>
+      (platform === 'telegram' ? appConfig.telegramAutoPost : appConfig.facebookAutoPost) &&
+      item.targets?.includes(platform) && !item.delivered?.[platform] &&
+      (item.attempts?.[platform] || 0) <= MAX_RETRY_ATTEMPTS &&
+      (item.retryAt?.[platform] || 0) <= Date.now()));
+  if (retryItems.length) {
+    const target = appConfig.telegramAutoPost && appConfig.facebookAutoPost ? 'all' :
+      appConfig.telegramAutoPost ? 'telegram' : 'facebook';
+    return (await deliverQueuedUpdates(retryItems, target, false)).success;
+  }
   const now = Date.now();
   const minIntervalMs = Math.max(1, appConfig.minBroadcastIntervalMinutes ?? 20) * 60 * 1000;
   const timeSinceLast = lastSocialBroadcastTime ? (now - lastSocialBroadcastTime) : 999999999;
@@ -1300,14 +1221,8 @@ export async function processSmartBroadcastQueue(): Promise<boolean> {
     : appConfig.telegramAutoPost ? 'telegram'
     : 'facebook';
 
-  try {
-    await executeBroadcast(toBroadcast, false, resolvedTarget, true, false);
-    smartBroadcastQueue.clear(); // ← يُمسح فقط بعد نجاح النشر
-  } catch (err) {
-    console.error('[SmartBroadcastQueue] executeBroadcast failed. Retaining queue items for next cycle.', err);
-    // Queue محتفظ به للمحاولة التالية عبر الـ watchdog
-  }
-  return true;
+  const result = await deliverQueuedUpdates(toBroadcast, resolvedTarget, false);
+  return result.success;
 }
 
 // Queue watchdog timer running every 30 seconds
@@ -1323,7 +1238,8 @@ export async function broadcastRateChanges(
   updates: {id?: string, name: string, oldVal: number, newVal: number, flag: string}[], 
   isTest: boolean = false, 
   target: 'all' | 'telegram' | 'facebook' = 'all',
-  isManual: boolean = false
+  isManual: boolean = false,
+  customHeaderTitle?: string
 ) {
   if (!isTest && !isManual && !appConfig.telegramAutoPost && !appConfig.facebookAutoPost) {
     return;
@@ -1332,19 +1248,35 @@ export async function broadcastRateChanges(
     return;
   }
 
-  if (isTest || isManual) {
+  if (isTest) {
     console.log(`[SmartBroadcast] ⚡ Executing IMMEDIATE broadcast for ${updates.length} items (isManual=${isManual}, bypassing cooldowns)`);
     await executeBroadcast(updates, isTest, target, true, isManual);
     return;
   }
 
+  updates = sanitizeBroadcastUpdates(updates, isManual);
+  const targets: ('telegram' | 'facebook')[] = target !== 'all' ? [target] :
+    (['telegram', 'facebook'] as const).filter(platform => isManual ||
+      (platform === 'telegram' ? appConfig.telegramAutoPost : appConfig.facebookAutoPost));
   const now = Date.now();
   for (const u of updates) {
     const key = (u.id || u.name).toUpperCase();
     const existing = smartBroadcastQueue.get(key);
+    if (existing && existing.newVal === u.newVal) {
+      existing.lastSeenAt = now;
+      existing.updateCount++;
+      existing.targets = [...new Set([...(existing.targets || []), ...targets])];
+      continue;
+    }
     if (existing) {
       smartBroadcastQueue.set(key, {
         ...existing,
+        targets,
+        headerTitle: customHeaderTitle,
+        delivered: u.newVal === existing.newVal ? existing.delivered : {},
+        attempts: u.newVal === existing.newVal ? existing.attempts : {},
+        retryAt: u.newVal === existing.newVal ? existing.retryAt : {},
+        lastError: u.newVal === existing.newVal ? existing.lastError : '',
         name: u.name || existing.name,
         newVal: u.newVal,
         flag: u.flag || existing.flag,
@@ -1354,6 +1286,8 @@ export async function broadcastRateChanges(
     } else {
       smartBroadcastQueue.set(key, {
         id: u.id || key,
+        targets,
+        headerTitle: customHeaderTitle,
         name: u.name,
         oldVal: u.oldVal,
         newVal: u.newVal,
@@ -1367,6 +1301,12 @@ export async function broadcastRateChanges(
 
   console.log(`[SmartBroadcastQueue] 📥 Buffered ${updates.length} items. Current queue size: ${smartBroadcastQueue.size} items.`);
 
+  persistBroadcastQueue();
+  if (isManual) {
+    const result = await deliverQueuedUpdates(updates, target, true, customHeaderTitle);
+    if (!result.success) throw new Error(result.message);
+    return;
+  }
   const aggWindowMs = Math.max(10, appConfig.aggregationWindowSeconds ?? 45) * 1000;
   if (!smartBroadcastAggregationTimer) {
     smartBroadcastAggregationTimerStartedAt = Date.now();
@@ -1525,116 +1465,44 @@ export function formatSmartBroadcastMessage(
 }
 
 export async function executeBroadcast(
-  updates: {id?: string, name: string, oldVal: number, newVal: number, flag: string}[], 
-  isTest: boolean = false, 
+  updates: {id?: string, name: string, oldVal: number, newVal: number, flag: string}[],
+  isTest = false,
   target: 'all' | 'telegram' | 'facebook' = 'all',
-  skipFilters: boolean = false,
-  isManual: boolean = false,
+  skipFilters = false,
+  isManual = false,
   customHeaderTitle?: string
 ) {
   updates = sanitizeBroadcastUpdates(updates, isManual);
-
-  const uniqueUpdatesMap = new Map<string, typeof updates[0]>();
-  for (const u of updates) {
-    const key = u.id || u.name;
-    const existing = uniqueUpdatesMap.get(key);
-    if (existing) {
-      uniqueUpdatesMap.set(key, { ...u, oldVal: existing.oldVal });
-    } else {
-      uniqueUpdatesMap.set(key, { ...u });
-    }
+  const unique = new Map<string, typeof updates[0]>();
+  for (const update of updates) {
+    const key = update.id || update.name;
+    unique.set(key, { ...update, oldVal: unique.get(key)?.oldVal ?? update.oldVal });
   }
-  updates = Array.from(uniqueUpdatesMap.values());
-
-  if (updates.length === 0) return;
-
+  updates = [...unique.values()];
+  if (!updates.length) return false;
   if (!isTest && !skipFilters && !isManual) {
-    const eligible = filterEligibleUpdates(updates);
-    if (eligible.length === 0) {
-      console.log('[SmartBroadcast] ⏭ All updates filtered out. No broadcast needed.');
-      return;
+    updates = filterEligibleUpdates(updates);
+    if (!updates.length) return false;
+    if (!canBroadcastNow()) {
+      await broadcastRateChanges(updates, false, target);
+      return false;
     }
-    if (pendingBroadcastQueue.length > 0 || !canBroadcastNow()) {
-      addToPendingQueue(eligible, target);
-      return;
-    }
-    updates = eligible;
   }
-
-  const message = formatSmartBroadcastMessage(updates, customHeaderTitle);
-
-  const startTime = Date.now();
-  const platform = target === 'all' ? 'both' : target;
-  const currencyIds = updates.map(u => u.id || u.name).filter(Boolean) as string[];
-
-  if (isTest || isManual) {
-    try {
-      await broadcastToSocialMedia(message, isTest, target, isManual);
-      recordBroadcast(updates);
-      try {
-        addBroadcastLog({
-          platform,
-          currency_ids: currencyIds,
-          status: 'success',
-          attempts: 1,
-          duration_ms: Date.now() - startTime,
-          error_message: null,
-          is_test: isTest ? 1 : 2
-        });
-      } catch (logErr) {
-        console.error("[BroadcastLog] Failed to log broadcast:", logErr);
-      }
-    } catch (err: any) {
-      try {
-        addBroadcastLog({
-          platform,
-          currency_ids: currencyIds,
-          status: 'failed',
-          attempts: 1,
-          duration_ms: Date.now() - startTime,
-          error_message: err.message || String(err),
-          is_test: isTest ? 1 : 2
-        });
-      } catch (logErr) {
-        console.error("[BroadcastLog] Failed to log failure:", logErr);
-      }
-      if (isTest) throw err;
-      console.error("[Manual Broadcast Error]:", err);
-    }
-  } else {
-    broadcastToSocialMedia(message, isTest, target, isManual)
-      .then(() => {
-        recordBroadcast(updates);
-        try {
-          addBroadcastLog({
-            platform,
-            currency_ids: currencyIds,
-            status: 'success',
-            attempts: 1,
-            duration_ms: Date.now() - startTime,
-            error_message: null,
-            is_test: 0
-          });
-        } catch (logErr) {
-          console.error("[BroadcastLog] Failed to record first-try success log:", logErr);
-        }
-      })
-      .catch(e => {
-        console.error("[Background Broadcast] Error:", e);
-        scheduleRetry(message, target, updates, 1, startTime, e.message || String(e));
-      });
-  }
-
-  // SEND PUSH NOTIFICATION
-  if (!isTest) {
-    const mainUpdates = updates.filter(u => u.id === 'USD' || u.id === 'EUR' || u.id === 'GOLD_CAST_24' || u.id === 'GOLD_CAST_18').slice(0, 2);
-    if (mainUpdates.length > 0) {
-      const pushTitle = 'تحديث جديد لأسعار السوق';
-      const pushBody = mainUpdates.map(u => `${u.name}: ${u.newVal.toFixed(3)}`).join(' | ');
-      sendPushNotificationToAll(pushTitle, pushBody);
-    } else {
-      sendPushNotificationToAll('تحديث جديد', 'تم تحديث أسعار السوق الموازي');
-    }
+  const start = Date.now();
+  try {
+    const result = await broadcastToSocialMedia(formatSmartBroadcastMessage(updates, customHeaderTitle), isTest, target, isManual);
+    if (!result.sentTargets.length) return false;
+    if (!isTest) recordBroadcast(updates);
+    for (const platform of result.sentTargets) addBroadcastLog({
+      platform, currency_ids: updates.map(u => u.id || u.name), status: 'success',
+      attempts: 1, duration_ms: Date.now() - start, error_message: null, is_test: isTest ? 1 : isManual ? 2 : 0
+    });
+    return true;
+  } catch (err: any) {
+    addBroadcastLog({ platform: target === 'all' ? 'both' : target,
+      currency_ids: updates.map(u => u.id || u.name), status: 'failed', attempts: 1,
+      duration_ms: Date.now() - start, error_message: err.message || String(err), is_test: isTest ? 1 : isManual ? 2 : 0 });
+    throw err;
   }
 }
 

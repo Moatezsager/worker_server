@@ -58,21 +58,6 @@ try {
   console.warn('[IngestionService] SQLite initialization warning:', e);
 }
 
-// Seed default initial message if empty
-if (memoryBuffer.length === 0) {
-  memoryBuffer.push({
-    id: 'cbl_init_' + Date.now(),
-    source: 'موقع مصرف ليبيا المركزي الرسمي (CBL)',
-    platform: 'cbl',
-    timestamp: new Date().toISOString(),
-    rawText: 'النشرة الرسمية لأسعار صرف العملات الأجنبية مقابل الدينار الليبي (دولار أمريكي: 4.85 د.ل، يورو: 5.25 د.ل)',
-    status: 'extracted',
-    extractedRates: [
-      { code: 'USD', name: 'الدولار الأمريكي', value: 4.85 },
-      { code: 'EUR', name: 'اليورو الأوروبي', value: 5.25 }
-    ]
-  });
-}
 
 /**
  * Perform smart cleanup on memory buffer and SQLite database:
@@ -189,8 +174,7 @@ export function recordIngestion(entry: Omit<IngestedMessageRecord, 'id'>): Inges
         fullRecord.rawText,
         fullRecord.status,
         fullRecord.extractedRates ? JSON.stringify(fullRecord.extractedRates) : null,
-        fullRecord.ignoreReason || null,
-        fullRecord.id
+        fullRecord.ignoreReason || null
       );
     }
   } catch (err) {

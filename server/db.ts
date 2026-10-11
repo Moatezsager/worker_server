@@ -131,6 +131,13 @@ if (!supabaseUrl || !supabaseKey) {
 
 export const supabase: SupabaseClient | null = (supabaseUrl && supabaseKey)
   ? createClient(supabaseUrl, supabaseKey, {
+      global: {
+        fetch: (input, init) => fetch(input, {
+          ...init, signal: init?.signal
+            ? AbortSignal.any([init.signal, AbortSignal.timeout(15000)])
+            : AbortSignal.timeout(15000)
+        })
+      },
       auth: {
         persistSession: false,
         autoRefreshToken: false,

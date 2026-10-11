@@ -1,8 +1,6 @@
 import { AppConfig } from './types';
 import { TelegramManager } from '../telegramClient';
 import { db, supabase, supabaseKey } from './db';
-import fs from 'fs';
-import path from 'path';
 
 export let appConfig: AppConfig = {
   channels: ["dollarr_ly", "musheermarket", "lydollar", "suqalmushir"],
@@ -277,21 +275,6 @@ export async function loadConfigFromSupabase() {
     } else if (data && data.config) {
       applyLoadedConfig(data.config as AppConfig, "Supabase");
 
-      // Auto-unpack WhatsApp credentials from Supabase cloud into local directory
-      if (data.config.whatsappAuth && Object.keys(data.config.whatsappAuth).length > 0) {
-        try {
-          const authDir = path.resolve(process.cwd(), 'whatsapp_auth');
-          if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
-          for (const [filename, content] of Object.entries(data.config.whatsappAuth)) {
-            if (typeof content === 'string') {
-              fs.writeFileSync(path.join(authDir, filename), content, 'utf8');
-            }
-          }
-          console.log(`[Config] Restored ${Object.keys(data.config.whatsappAuth).length} WhatsApp session files from Supabase app_config!`);
-        } catch (waErr) {
-          console.error("[Config] Error unpacking WhatsApp auth from Supabase:", waErr);
-        }
-      }
       
       try {
         db.prepare(`
@@ -303,51 +286,18 @@ export async function loadConfigFromSupabase() {
       }
     }
 
-    // أولاً: محاولة تحميل من app_config (المصدر الرئيسي الذي يكتب فيه Web Server)
-    if (supabase) {
-      try {
-        const { data: appConfigData } = await supabase
-          .from('app_config')
-          .select('config')
-          .eq('id', 1)
-          .single();
-
-        if (appConfigData?.config?.terms && Array.isArray(appConfigData.config.terms)
-            && appConfigData.config.terms.length > 0) {
-          console.log(`[Config] تحميل ${appConfigData.config.terms.length} term من app_config (Web Server)`);
-
-          // دمج مع القيم الافتراضية للحفاظ على أي terms جديدة
-          const mergedTerms = appConfig.terms.map(defaultTerm => {
-            const dbTerm = appConfigData.config.terms.find((t: any) => t.id === defaultTerm.id);
-            return dbTerm ? { ...defaultTerm, ...dbTerm } : defaultTerm;
-          });
-
-          appConfig.terms = mergedTerms;
-
-          // تحديث channels وإعدادات النشر أيضاً
-          if (Array.isArray(appConfigData.config.channels)) {
-            appConfig.channels = appConfigData.config.channels;
-          }
-          if (appConfigData.config.telegramAutoPost !== undefined) {
-            appConfig.telegramAutoPost = appConfigData.config.telegramAutoPost;
-          }
-          if (appConfigData.config.facebookAutoPost !== undefined) {
-            appConfig.facebookAutoPost = appConfigData.config.facebookAutoPost;
-          }
-
-          console.log('[Config] ✅ تم تحميل الإعدادات من app_config بنجاح');
-          return; // ← نجح التحميل، لا حاجة للجداول الأخرى
-        }
-      } catch (appConfigErr) {
-        console.warn('[Config] تعذّر التحميل من app_config، سيتم المحاولة من currency_terms:', appConfigErr);
+    try {
+      const { data: fetchState } = await supabase.from('server_config').select('value').eq('key', 'whatsapp_fetch_enabled').single();
+      if (fetchState?.value !== undefined) {
+        const { setWhatsAppFetchEnabled } = await import('./services/scraper.service');
+        setWhatsAppFetchEnabled(fetchState.value === 'true', false);
       }
-    }
+    } catch (err) { console.warn('[Config] Private Worker state could not be loaded.'); }
+    if (Array.isArray(data?.config?.terms) && data.config.terms.length) return;
 
     // Try loading directly from currency_terms table in Supabase if exists
     try {
-      try {
-        await supabase.from('currency_terms').delete().eq('id', 'OFFICIAL_USD');
-      } catch (e) {}
+
 
       const { data: dbTerms } = await supabase.from('currency_terms').select('*');
       if (dbTerms && Array.isArray(dbTerms) && dbTerms.length > 0) {
@@ -385,6 +335,7 @@ export async function loadConfigFromSupabase() {
 loadConfigFromStorage();
 
 export async function saveConfigToSupabase(newConfig: AppConfig) {
+  // shortcut: whole-row settings writes can race across services; use a verified DB-side atomic patch before concurrent administration.
   try {
     db.prepare(`
       INSERT INTO server_config (key, value) VALUES ('app_config', ?)

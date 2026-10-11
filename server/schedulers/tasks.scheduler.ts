@@ -1,6 +1,5 @@
 import { monitorMemory, cleanupUserLogs } from "../services/maintenance.service";
-import { notifyWebServer } from '../utils/notify';
-import { cleanupOldData, saveToSupabase, logErrorArabic, saveWorkerStateToSupabase } from "../services/db.service";
+import { cleanupOldData, logErrorArabic, saveWorkerStateToSupabase } from "../services/db.service";
 import { 
   fetchOfficialRates, 
   fetchParallelRatesFromTelegram, 
@@ -340,12 +339,7 @@ export function initBackgroundTasks(port: number) {
       const parallelChanged = await fetchParallelRatesFromTelegram();
       const officialChanged = await fetchOfficialRates();
 
-      if (parallelChanged || officialChanged) {
-        console.log("[Auto-Refresh] Changes detected! Persisting to Supabase database...");
-        const saveType = (parallelChanged && officialChanged) ? 'both' : (officialChanged ? 'official' : 'parallel');
-        await saveToSupabase(saveType);
-        await notifyWebServer(rates);
-      }
+      if (parallelChanged || officialChanged) console.log("[Auto-Refresh] Sources saved the updated rates.");
     }, { timeoutMs: 90000 }); // 90 seconds timeout for full scraper cycle
   }, 10 * 60 * 1000);
   activeIntervals.push(ratesAutoRefreshInterval);

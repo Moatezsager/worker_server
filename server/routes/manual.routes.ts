@@ -1,6 +1,6 @@
 import express from 'express';
 import crypto from 'crypto';
-import { executeBroadcast } from '../services/social.service';
+import { broadcastRateChanges } from '../services/social.service';
 
 const router = express.Router();
 
@@ -46,7 +46,11 @@ router.post('/manual-broadcast', requireWorkerSecret, async (
       target?: 'all' | 'telegram' | 'facebook';
     };
 
-    if (!updates || !Array.isArray(updates) || updates.length === 0) {
+    if (!Array.isArray(updates) || updates.length === 0 || updates.length > 100 ||
+        (target !== undefined && !['all', 'telegram', 'facebook'].includes(target)) ||
+        updates.some(u => !u || typeof u.id !== 'string' || typeof u.name !== 'string' ||
+          u.name.length > 200 || typeof u.flag !== 'string' ||
+          !Number.isFinite(u.oldVal) || !Number.isFinite(u.newVal) || u.newVal <= 0)) {
       if (!res.headersSent) {
         res.status(400).json({ success: false, message: 'لا توجد تحديثات للنشر' });
       }
@@ -58,12 +62,11 @@ router.post('/manual-broadcast', requireWorkerSecret, async (
     console.log(`[Manual Broadcast] طلب نشر يدوي: ${updates.length} عملة/معدن على ${resolvedTarget}`);
 
     // نشر فوري بدون شروط (isManual = true)
-    await executeBroadcast(
+    await broadcastRateChanges(
       updates,
       false,       // isTest
       resolvedTarget,
-      true,        // isManual — يتجاوز جميع شروط التصفية
-      false        // skipBroadcastLog
+      true         // isManual
     );
 
     console.log(`[Manual Broadcast] ✅ تم النشر بنجاح على ${resolvedTarget}`);
@@ -88,6 +91,14 @@ router.post('/manual-broadcast', requireWorkerSecret, async (
 import { whatsappManager } from '../services/whatsapp.service';
 
 // ─── WhatsApp Management (called from Web Admin Panel) ───
+router.post('/whatsapp/toggle-auto', requireWorkerSecret, (req, res) => {
+  if (typeof req.body?.enabled !== 'boolean') {
+    res.status(400).json({ success: false, error: 'enabled must be boolean' });
+    return;
+  }
+  whatsappManager.setAutoProcess(req.body.enabled);
+  res.json({ success: true, data: whatsappManager.getStatus() });
+});
 
 router.get('/whatsapp/status', requireWorkerSecret, (
   req: express.Request,

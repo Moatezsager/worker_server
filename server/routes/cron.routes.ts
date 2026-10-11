@@ -2,8 +2,6 @@ import express from "express";
 import { rates } from "../state";
 import { supabase, supabaseAnonKey } from "../db";
 import { fetchParallelRatesFromTelegram, fetchOfficialRates } from "../services/scraper.service";
-import { saveToSupabase } from "../services/db.service";
-import { notifyWebServer } from '../utils/notify';
 import { 
   extractProvidedCronKey, 
   isValidCronSecret, 
@@ -42,8 +40,6 @@ router.get("/refresh-parallel", cronParallelLimiter, async (req: express.Request
     
     if (parallelUpdate === true) {
       console.log(`[Cron-Job] Fetch completed (Changes: ${parallelUpdate}). Syncing with database...`);
-      await saveToSupabase('parallel');
-      await notifyWebServer(rates);
     } else if (parallelUpdate === false) {
       console.log("[Cron-Job] No changes detected. Database sync skipped.");
     } else {
@@ -102,8 +98,6 @@ router.get("/refresh-official", cronOfficialLimiter, async (req: express.Request
     
     if (officialUpdate === true) {
       console.log(`[Cron-Job-Official] Fetch completed (Changes: ${officialUpdate}). Syncing with database...`);
-      await saveToSupabase('official');
-      await notifyWebServer(rates);
     } else {
       console.log("[Cron-Job-Official] No changes detected. Database sync skipped.");
     }

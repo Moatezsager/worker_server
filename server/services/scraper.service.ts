@@ -2,7 +2,7 @@ import { RateMap, LiveFeedMessage, ChannelStatusInfo } from '../types';
 import { rates, history } from '../state';
 import { appConfig } from '../config';
 import { db, supabase } from '../db';
-import { logErrorArabic, logPriceChange, saveToSupabase, syncCheckRates, saveWorkerStateToSupabase } from './db.service';
+import { logErrorArabic, logPriceChange, saveToSupabase, syncCheckRates, saveWorkerStateToSupabase, commitParallelRates } from './db.service';
 import { extractRatesWithAI } from './ai.service';
 import { broadcastOfficialRates, broadcastRateChanges, getOrInitTelegramManager, lastBroadcastState, lastOfficialBroadcastDate } from './social.service';
 import { fetchPublicChannelMessages } from '../../telegramClient';
@@ -42,8 +42,10 @@ export function setTelegramFetchEnabled(enabled: boolean) {
   console.log(`[Scraper] Telegram auto-fetch set to: ${enabled}`);
 }
 
-export function setWhatsAppFetchEnabled(enabled: boolean) {
+export function setWhatsAppFetchEnabled(enabled: boolean, persist = true) {
+  if (isWhatsAppFetchEnabled === enabled) return;
   isWhatsAppFetchEnabled = enabled;
+  if (persist) void saveWorkerStateToSupabase('whatsapp_fetch_enabled', enabled);
   console.log(`[WhatsApp] WhatsApp auto-fetch set to: ${enabled}`);
 }
 
@@ -433,7 +435,15 @@ export function getCblStatusInfo() {
   };
 }
 
-export async function fetchOfficialRates(force: boolean = false, isManualAdmin: boolean = false): Promise<boolean> {
+let officialFetchInFlight: Promise<boolean> | null = null;
+let lastCblAttemptTime = 0;
+export function fetchOfficialRates(force = false, isManualAdmin = false): Promise<boolean> {
+  if (officialFetchInFlight) return officialFetchInFlight;
+  officialFetchInFlight = fetchOfficialRatesJob(force, isManualAdmin).finally(() => { officialFetchInFlight = null; });
+  return officialFetchInFlight;
+}
+
+async function fetchOfficialRatesJob(force: boolean, isManualAdmin: boolean): Promise<boolean> {
   console.log(`[CBL] ${CBL_STATUS.STARTED}: Initiating official rates check (force=${force}, isManualAdmin=${isManualAdmin})...`);
 
   const now = new Date();
@@ -467,18 +477,18 @@ export async function fetchOfficialRates(force: boolean = false, isManualAdmin: 
       console.log(`[CBL] Before work start time (09:00 AM Libya time). Current hour: ${currentLibyaHour}:00. Skipping automatic fetch.`);
       return false;
     }
-    if (currentLibyaHour >= 11) {
-      console.log(`[CBL] Outside fetch window (after 11:00 AM Libya time). Current hour: ${currentLibyaHour}:00. Skipping automatic fetch. Will retry tomorrow.`);
-      return false;
-    }
 
     // 3. Check if today's official rates have already been successfully fetched and completed
     if (lastOfficialFetchDate === currentLibyaDate) {
+      if (lastOfficialBroadcastDate !== currentLibyaDate) await broadcastOfficialRates(false);
       console.log(`[CBL] Today's official bulletin (${currentLibyaDate}) has already been successfully fetched. Skipping duplicate fetch.`);
       return false;
     }
   }
 
+  if (!force && !isManualAdmin && currentLibyaHour >= 11 &&
+      lastCblAttemptTime > 0 && Date.now() - lastCblAttemptTime < 3600000) return false;
+  lastCblAttemptTime = Date.now();
   // 1. FETCH from CBL website (Sequential Await)
   const cblResult = await fetchFromCBL();
   if (!cblResult) {
@@ -500,8 +510,8 @@ export async function fetchOfficialRates(force: boolean = false, isManualAdmin: 
     return false;
   }
 
-  // In automatic mode, verify that CBL data is strictly for today (never publish stale data as today's rates!)
-  if (!isManualAdmin && !force && cblDate !== currentLibyaDate) {
+  // Manual forcing may bypass scheduling, never the source date validation.
+  if (cblDate !== currentLibyaDate) {
     console.warn(`[CBL] ${CBL_STATUS.VALIDATION_FAILED}: Stale data rejected. CBL bulletin date (${cblDate}) does not match Libya current date (${currentLibyaDate}). Automatic publishing rejected.`);
     return false;
   }
@@ -534,7 +544,10 @@ export async function fetchOfficialRates(force: boolean = false, isManualAdmin: 
 
   // 5. SAVE TO SUPABASE (Persistence Check BEFORE modifying in-memory state!)
   try {
-    const saveSuccess = await saveToSupabase('official', candidateOfficialRates);
+    const saveSuccess = await saveToSupabase('official', candidateOfficialRates, {
+      ...rates, lastUpdated: new Date().toISOString(),
+      lastChanged: { ...rates.lastChanged, official: { ...rates.lastChanged.official, ...candidateLastChanged } }
+    });
     if (!saveSuccess) {
       console.error(`[CBL] ${CBL_STATUS.SAVE_FAILED}: saveToSupabase reported database failure. In-memory state and success timestamps NOT updated.`);
       await logErrorArabic("فشل حفظ أسعار المصرف المركزي في قاعدة البيانات", "مصرف ليبيا المركزي");
@@ -551,6 +564,7 @@ export async function fetchOfficialRates(force: boolean = false, isManualAdmin: 
   rates.official = candidateOfficialRates;
   rates.previousOfficial = { ...rates.previousOfficial, ...candidatePreviousOfficial };
   rates.lastChanged.official = { ...rates.lastChanged.official, ...candidateLastChanged };
+  rates.lastUpdated = new Date().toISOString();
 
   if (anyChanged) {
     console.log(`[Official] Rates updated via CBL Scraper (USD: ${rates.official.USD})`);
@@ -593,9 +607,6 @@ export async function fetchOfficialRates(force: boolean = false, isManualAdmin: 
       console.log(`[CBL] Social broadcast completed successfully.`);
     } else {
       console.warn(`[CBL] Social broadcast did not complete successfully.`);
-      if (!isManualAdmin) {
-        return false;
-      }
     }
   } else {
     console.log(`[CBL] Broadcast skipped (already broadcasted today).`);
@@ -993,99 +1004,12 @@ export async function fetchParallelRatesFromTelegram(isManual: boolean = false):
       if (foundKeys.length > 0) {
         console.log(`[Scraper] Scrape check completed. Found rates for: ${foundKeys.join(', ')}`);
         
-        let anyChanged = false;
-        const collectedUpdates: { id?: string; name: string; oldVal: number; newVal: number; flag: string }[] = [];
-
-        for (const term of appConfig.terms) {
-          if (term.id.startsWith('GOLD') || term.id.startsWith('SILVER')) continue;
-          const currentVal = rates.parallel[term.id];
-          const newValFromTelegram = latestRates[term.id];
-          const newValTime = latestTimes[term.id];
-          
-          const currentLastChanged = rates.lastChanged.parallel[term.id];
-          const currentTime = currentLastChanged ? new Date(currentLastChanged).getTime() : 0;
-
-          if (newValFromTelegram !== undefined) {
-            if (newValTime < currentTime) {
-              console.log(`[Scraper] Skipping update for ${term.id}: Scraped price is older than current memory state.`);
-              continue;
-            }
-
-            if (currentVal !== undefined && currentVal > 0) {
-              const deviation = Math.abs(newValFromTelegram - currentVal) / currentVal;
-              const allowedDeviation = (term.id === 'TND' || term.id === 'EGP') ? 1.0 : 0.25;
-              if (deviation > allowedDeviation) {
-                const sourceName = latestSources[term.id] || 'غير معروف';
-                const msg = `تم رفض تحديث سعر ${term.name} (${term.id}) من المصدر (${sourceName}) بسبب قفزة غير منطقية من ${currentVal} إلى ${newValFromTelegram} (تغيير بنسبة ${(deviation*100).toFixed(1)}%)`;
-                console.warn(`[Scraper] ${msg}`);
-                await logErrorArabic(msg, "حماية البيانات");
-                continue;
-              }
-            }
-
-            if (isSignificantChange(currentVal, newValFromTelegram)) {
-              console.log(`[Scraper] Price update: ${term.id} (${currentVal} -> ${newValFromTelegram}) Source: ${latestSources[term.id]}`);
-              
-              collectedUpdates.push({
-                id: term.id,
-                name: term.name,
-                oldVal: currentVal || newValFromTelegram,
-                newVal: newValFromTelegram,
-                flag: term.flag || 'ly'
-              });
-
-              rates.previousParallel[term.id] = currentVal || newValFromTelegram;
-              rates.parallel[term.id] = newValFromTelegram;
-              rates.lastChanged.parallel[term.id] = new Date().toISOString();
-              anyChanged = true;
-              
-              updateStats(term.id, newValFromTelegram);
-
-              history.push({
-                time: new Date().toISOString(),
-                usdParallel: rates.parallel.USD || newValFromTelegram,
-                usdOfficial: rates.official.USD,
-                ratesParallel: { ...rates.parallel },
-                ratesOfficial: { ...rates.official }
-              });
-              if (history.length > 500) {
-                history.shift();
-              }
-              
-              const changeLog = {
-                id: Math.random().toString(36).substring(2, 9),
-                currencyCode: term.id,
-                currencyName: term.name,
-                oldPrice: currentVal || 0,
-                newPrice: newValFromTelegram,
-                source: latestSources[term.id] || "Telegram",
-                timestamp: new Date().toISOString()
-              };
-              await logPriceChange(changeLog);
-            } else {
-              rates.parallel[term.id] = newValFromTelegram;
-            }
-          }
-        }
-
-        for (const term of appConfig.terms) {
-          const key = term.id;
-          if (previousRates[key] && latestRates[key] && Math.abs(previousRates[key] - latestRates[key]) < (latestRates[key] * 0.2)) {
-            if (!rates.previousParallel[key]) rates.previousParallel[key] = previousRates[key];
-          }
-        }
-
-        const synced = await syncCheckRates("كاشط تيليجرام");
-        if (synced) anyChanged = true;
-
-        if (newestMessageTime > 0) {
-          rates.lastUpdated = new Date(newestMessageTime).toISOString();
-        } else {
-          rates.lastUpdated = new Date().toISOString();
-        }
-
+        const collectedUpdates = await commitParallelRates(foundKeys.map(code => ({
+          code, value: latestRates[code], time: latestTimes[code],
+          source: latestSources[code] || 'Telegram'
+        })));
+        const anyChanged = collectedUpdates.length > 0;
         if (anyChanged) {
-          await saveToSupabase('parallel');
           if (collectedUpdates.length > 0) {
             // توحيد الصكوك: استبعاد صكوك الجمهورية والتجاري من النشر، والاكتفاء بنشر دولار صكوك فقط
             const sanitizedUpdates: typeof collectedUpdates = [];
@@ -1114,7 +1038,8 @@ export async function fetchParallelRatesFromTelegram(isManual: boolean = false):
                 name: 'دولار أمريكي (صكوك)',
                 oldVal: checkOldPrice ?? rates.previousParallel['USD_CHECKS'] ?? checkPrice,
                 newVal: checkPrice,
-                flag: 'us'
+                flag: 'us',
+                source: 'Telegram'
               });
             }
 
@@ -1175,7 +1100,7 @@ export async function processWhatsAppMessage(
     const startOfTodayLibya = new Date(`${libyaDateStrWA}T00:00:00+02:00`).getTime();
     // ─────────────────────────────────────────────────────────────────────────────
 
-    if (msgTime < startOfTodayLibya) {
+    if (!Number.isFinite(msgTime) || msgTime < startOfTodayLibya || msgTime > Date.now() + 300000) {
       return { processed: false, extractedCount: 0 };
     }
 
@@ -1234,94 +1159,12 @@ export async function processWhatsAppMessage(
       return { processed: true, extractedCount: 0 };
     }
 
-    // 5. Validate extracted rates against sanity boundaries & max deviation
-    const collectedUpdates: { id?: string; name: string; oldVal: number; newVal: number; flag: string }[] = [];
-    let anyChanged = false;
-
-    for (const res of extracted) {
-      if (res.code === 'OFFICIAL_USD') continue;
-      const term = appConfig.terms.find(t => t.id === res.code);
-      if (!term || term.id === 'OFFICIAL_USD') continue;
-
-      const currentVal = rates.parallel[term.id];
-      const newVal = res.value;
-
-      // Check min/max boundary
-      if (newVal < term.min || newVal > term.max) {
-        console.warn(`[WhatsApp Scraper] Rate ${res.code} (${newVal}) outside boundaries [${term.min}, ${term.max}], rejected.`);
-        continue;
-      }
-
-      // Check sudden spike deviation (max 25% for USD/EUR, 100% for TND/EGP)
-      if (currentVal !== undefined && currentVal > 0) {
-        const deviation = Math.abs(newVal - currentVal) / currentVal;
-        const allowedDeviation = (term.id === 'TND' || term.id === 'EGP') ? 1.0 : 0.25;
-        if (deviation > allowedDeviation) {
-          const msg = `تم رفض تحديث سعر ${term.name} (${term.id}) من واتساب (${chatName}) بسبب قفزة غير منطقية من ${currentVal} إلى ${newVal} (تغيير بنسبة ${(deviation * 100).toFixed(1)}%)`;
-          console.warn(`[WhatsApp Scraper] ${msg}`);
-          await logErrorArabic(msg, 'حماية بيانات واتساب');
-          continue;
-        }
-      }
-
-      const lastBroadcast = (term.id && lastBroadcastState[term.id]) || (term.name && lastBroadcastState[term.name]);
-      const hoursSinceBroadcast = lastBroadcast?.time ? (Date.now() - lastBroadcast.time) / (1000 * 60 * 60) : 999;
-      const isPriceShift = isSignificantChange(currentVal, newVal);
-      const isStaleBroadcast = hoursSinceBroadcast >= 3 && (term.id === 'USD' || term.id === 'EUR' || term.id === 'USD_CHECKS');
-
-      // If price has significantly changed OR if it's been > 3 hours (or since yesterday) since last broadcast
-      if (isPriceShift || isStaleBroadcast) {
-        console.log(`[WhatsApp Scraper] Rate update: ${term.id} (${currentVal} -> ${newVal}) [Shift: ${isPriceShift}, Stale: ${isStaleBroadcast}, Hours: ${hoursSinceBroadcast.toFixed(1)}] Source: ${chatName}`);
-
-        collectedUpdates.push({
-          id: term.id,
-          name: term.name,
-          oldVal: lastBroadcast?.price ?? currentVal ?? newVal,
-          newVal,
-          flag: term.flag || 'ly'
-        });
-
-        if (isPriceShift) {
-          rates.previousParallel[term.id] = currentVal || newVal;
-          rates.parallel[term.id] = newVal;
-          rates.lastChanged.parallel[term.id] = new Date(msgTime).toISOString();
-
-          updateStats(term.id, newVal);
-
-          history.push({
-            time: new Date().toISOString(),
-            usdParallel: rates.parallel.USD || newVal,
-            usdOfficial: rates.official.USD,
-            ratesParallel: { ...rates.parallel },
-            ratesOfficial: { ...rates.official }
-          });
-          if (history.length > 500) history.shift();
-
-          const changeLog = {
-            id: Math.random().toString(36).substring(2, 9),
-            currencyCode: term.id,
-            currencyName: term.name,
-            oldPrice: currentVal || 0,
-            newPrice: newVal,
-            source: `واتساب - ${chatName}`,
-            timestamp: new Date().toISOString()
-          };
-          await logPriceChange(changeLog);
-        }
-
-        anyChanged = true;
-      }
-    }
-
-    if (anyChanged) {
-      rates.lastUpdated = new Date().toISOString();
+    const collectedUpdates = await commitParallelRates(extracted.map(entry => ({
+      ...entry, time: msgTime, source: 'واتساب - ' + chatName
+    })));
+    if (collectedUpdates.length) {
       lastSuccessfulFetchTime = Date.now();
-      await saveToSupabase('parallel');
-
-      // Broadcast changes across channels if needed
-      if (collectedUpdates.length > 0) {
-        broadcastRateChanges(collectedUpdates).catch(e => console.error('[WhatsApp Scraper] Broadcast error:', e));
-      }
+      await broadcastRateChanges(collectedUpdates);
     }
 
     return { processed: true, extractedCount: extracted.length, rates: extracted };

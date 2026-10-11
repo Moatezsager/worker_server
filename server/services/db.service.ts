@@ -22,17 +22,16 @@ export function clearDbCache() {
 }
 
 export async function saveWorkerStateToSupabase(key: string, value: any): Promise<void> {
+  const stringVal = typeof value === 'string' ? value : JSON.stringify(value);
+  try { db?.prepare('INSERT OR REPLACE INTO server_config (key, value) VALUES (?, ?)').run(key, stringVal); }
+  catch (err) { console.warn('[WorkerState] Local checkpoint failed:', key); }
   if (!supabase || !supabaseKey || supabaseKey.includes('dummy')) return;
   try {
-    const stringVal = typeof value === 'string' ? value : JSON.stringify(value);
-    await supabase.from('server_config').upsert({
-      key,
-      value: stringVal,
-      updated_at: new Date().toISOString()
+    const { error } = await supabase.from('server_config').upsert({
+      key, value: stringVal, updated_at: new Date().toISOString()
     });
-  } catch (err) {
-    console.warn(`[WorkerState] Error saving state '${key}' to Supabase:`, err);
-  }
+    if (error) console.warn('[WorkerState] Remote checkpoint failed:', key, error.message);
+  } catch (err) { console.warn('[WorkerState] Remote checkpoint failed:', key); }
 }
 
 export async function loadWorkerStateFromSupabase<T = any>(key: string): Promise<T | null> {
@@ -242,139 +241,143 @@ export async function initializeRatesFromDB(force = false) {
 
 export async function saveToSupabase(
   type: 'parallel' | 'official' | 'both' = 'both',
-  customOfficialRates?: RateMap
+  customOfficialRates?: RateMap,
+  snapshot: typeof rates = rates
 ): Promise<boolean> {
-  if (!supabase || !supabaseKey || supabaseKey.includes('dummy')) {
-    console.warn("[DB] Supabase not initialized or using dummy key. Skipping save.");
-    return false; 
-  }
-  
+  if (!supabase || !supabaseKey || supabaseKey.includes('dummy')) return false;
+  const saved = structuredClone(snapshot);
+  if (customOfficialRates) saved.official = { ...customOfficialRates };
+  delete saved.parallel.OFFICIAL_USD;
+  delete saved.parallel.official_usd;
+  delete saved.lastChanged.parallel.OFFICIAL_USD;
+  delete saved.lastChanged.parallel.official_usd;
+  const now = new Date().toISOString();
+  const recordedAt = saved.lastUpdated || now;
   try {
-    const results = [];
-    const now = new Date().toISOString();
-    
-    delete rates.parallel.OFFICIAL_USD;
-    delete (rates.parallel as any).official_usd;
-    delete rates.previousParallel.OFFICIAL_USD;
-    delete (rates.previousParallel as any).official_usd;
-    if (rates.lastChanged.parallel) {
-      delete rates.lastChanged.parallel.OFFICIAL_USD;
-      delete (rates.lastChanged.parallel as any).official_usd;
-    }
-
+    // Confirm authoritative saves before writing compatibility copies.
     if (type === 'parallel' || type === 'both') {
-      if (rates.parallel.USD >= 5.5) {
-        console.log(`[DB] Saving parallel rates to Supabase (USD: ${rates.parallel.USD})...`);
-        results.push(supabase.from('parallel_rates').insert([{
-          usd: rates.parallel.USD,
-          rates: rates.parallel,
-          last_changed: rates.lastChanged.parallel,
-          recorded_at: rates.lastUpdated || now
-        }]));
-      }
+      if (!Number.isFinite(saved.parallel.USD) || saved.parallel.USD < 5.5) return false;
+      const { error } = await supabase.from('parallel_rates').insert([{
+        usd: saved.parallel.USD, rates: saved.parallel,
+        last_changed: saved.lastChanged.parallel, recorded_at: recordedAt
+      }]);
+      if (error) throw error;
     }
-    
-    const officialToSave = customOfficialRates || rates.official;
     if (type === 'official' || type === 'both') {
-      if (officialToSave.USD > 0) {
-        console.log(`[DB] Saving official rates to Supabase (USD: ${officialToSave.USD})...`);
-        results.push(supabase.from('official_rates').insert([{
-          usd: officialToSave.USD,
-          rates: officialToSave,
-          recorded_at: now
-        }]));
-      }
+      if (!Number.isFinite(saved.official.USD) || saved.official.USD <= 0) return false;
+      const { error } = await supabase.from('official_rates').insert([{
+        usd: saved.official.USD, rates: saved.official, recorded_at: now
+      }]);
+      if (error) throw error;
     }
-
-    if (type === 'parallel' || type === 'both') {
-      const metalRates: Record<string, number> = {};
-      const metalChanges: Record<string, string> = {};
-      let hasMetals = false;
-      
-      METAL_IDS.forEach(id => {
-        if (rates.parallel[id]) {
-          metalRates[id] = rates.parallel[id];
-          metalChanges[id] = rates.lastChanged.parallel[id];
-          hasMetals = true;
-        }
-      });
-
-      if (hasMetals) {
-        results.push(supabase.from('metal_rates').insert([{
-          rates: metalRates,
-          last_changed: metalChanges,
-          recorded_at: rates.lastUpdated || now
-        }]));
-      }
-    }
-
-    if (rates.parallel.USD > 0 && officialToSave.USD > 0) {
-      const legacyRecord = { 
-        usd_parallel: rates.parallel.USD, 
-        usd_official: officialToSave.USD,
-        rates_parallel: rates.parallel,
-        rates_official: officialToSave,
-        last_changed: rates.lastChanged,
-        recorded_at: rates.lastUpdated || now
-      };
-      results.push(supabase.from('exchange_rates').insert([legacyRecord]));
-    }
-
-    if (results.length === 0) {
-      console.warn(`[DB] No records met validation criteria for ${type} rates. Save skipped.`);
-      return false;
-    }
-
-    const settled = await Promise.allSettled(results);
-    let hasError = false;
-    let errorMessage = '';
-    
-    settled.forEach((res, i) => {
-      if (res.status === 'rejected') {
-        console.error(`[DB] Save error for source ${i}:`, res.reason);
-        hasError = true;
-        errorMessage = String(res.reason);
-      } else {
-        const val = res.value as any;
-        if (val && val.error) {
-          console.error(`[DB] Supabase error in source ${i}:`, val.error.message);
-          hasError = true;
-          errorMessage = val.error.message;
-        } else {
-          console.log(`[DB] Successfully saved source ${i} to Supabase.`);
-        }
-      }
-    });
-
-    if (hasError) {
-      await logErrorArabic(`فشل حفظ ${type === 'parallel' ? 'الموازي' : 'الرسمي'} في Supabase: ${errorMessage}`, "قاعدة البيانات");
-      return false;
-    }
-
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    const cutoff30 = thirtyDaysAgo.toISOString();
-    
-    await Promise.allSettled([
-      supabase.from('parallel_rates').delete().lt('recorded_at', cutoff30),
-      supabase.from('official_rates').delete().lt('recorded_at', cutoff30),
-      supabase.from('exchange_rates').delete().lt('recorded_at', cutoff30),
-      supabase.from('metal_rates').delete().lt('recorded_at', cutoff30)
-    ]);
-        
-    clearDbCache();
-    
-    const typeLabel = type === 'parallel' ? 'سوق موازي' : type === 'official' ? 'رسمي' : 'متكامل';
-    console.log(`[DB] Successfully saved ${typeLabel} rates to database`);
-    // Notify the Web Server so it can broadcast the changes via Socket.IO
-    await notifyWebServers();
-    
-    return true;
   } catch (err) {
-    console.error("Supabase unified save error:", err);
-    await logErrorArabic(`فشل حفظ البيانات في قاعدة البيانات: ${type === 'parallel' ? 'موازي' : 'رسمي'}`, "حفظ البيانات", String(err));
+    await logErrorArabic('فشل حفظ الأسعار في قاعدة البيانات', 'حفظ البيانات', String(err));
     return false;
   }
+  const copies = [];
+  if (type === 'parallel' || type === 'both') {
+    const metals = Object.fromEntries(METAL_IDS.filter(id => saved.parallel[id] > 0).map(id => [id, saved.parallel[id]]));
+    if (Object.keys(metals).length) copies.push(supabase.from('metal_rates').insert([{
+      rates: metals,
+      last_changed: Object.fromEntries(Object.keys(metals).map(id => [id, saved.lastChanged.parallel[id]])),
+      recorded_at: recordedAt
+    }]));
+  }
+  if (saved.parallel.USD > 0 && saved.official.USD > 0) copies.push(supabase.from('exchange_rates').insert([{
+    usd_parallel: saved.parallel.USD, usd_official: saved.official.USD,
+    rates_parallel: saved.parallel, rates_official: saved.official,
+    last_changed: saved.lastChanged, recorded_at: type === 'official' ? now : recordedAt
+  }]));
+  for (const result of await Promise.allSettled(copies)) {
+    const error = result.status === 'rejected' ? result.reason : result.value.error;
+    if (error) console.warn('[DB] Compatibility copy failed after authoritative save:', String(error?.message || error));
+  }
+  clearDbCache();
+  void notifyWebServers();
+  return true;
+}
+
+let parallelWrite: Promise<unknown> = Promise.resolve();
+const lastObserved: Record<string, number> = {};
+
+export function commitParallelRates(extracted: { code: string; value: number; time: number; source: string }[], isManual = false) {
+  const write = parallelWrite.then(async () => {
+    const candidate = structuredClone(rates);
+    const observed: Record<string, number> = {};
+    const changes: { id: string; name: string; oldVal: number; newVal: number; flag: string; source: string }[] = [];
+    for (const entry of extracted) {
+      const term = appConfig.terms.find(t => t.id === entry.code);
+      if (!term || term.id === 'OFFICIAL_USD' || !Number.isFinite(entry.value) ||
+          entry.value < term.min || entry.value > term.max || !Number.isFinite(entry.time) ||
+          entry.time <= 0 || entry.time > Date.now() + 300000) {
+        if (isManual) throw new Error('Invalid manual price or currency');
+        continue;
+      }
+      const lastTime = Math.max(Date.parse(candidate.lastChanged.parallel[term.id] || '') || 0,
+        observed[term.id] || lastObserved[term.id] || 0);
+      if (!isManual && entry.time < lastTime) continue;
+      const oldVal = candidate.parallel[term.id];
+      const maxDeviation = term.id === 'TND' || term.id === 'EGP' ? 1 : 0.25;
+      if (!isManual && oldVal > 0 && Math.abs(entry.value - oldVal) / oldVal > maxDeviation) {
+        await logErrorArabic('تم رفض قفزة غير منطقية في سعر ' + term.id, 'حماية البيانات');
+        continue;
+      }
+      observed[term.id] = entry.time;
+      if (!isSignificantChange(oldVal, entry.value)) continue;
+      candidate.previousParallel[term.id] = oldVal || entry.value;
+      candidate.parallel[term.id] = entry.value;
+      candidate.lastChanged.parallel[term.id] = new Date(entry.time).toISOString();
+      if (isManual) {
+        candidate.parallel[term.id.toLowerCase()] = entry.value;
+        candidate.previousParallel[term.id.toLowerCase()] = oldVal || entry.value;
+        if (term.id === 'GOLD_SCRAP_18') {
+          candidate.parallel.GOLD = entry.value;
+          candidate.parallel.gold = entry.value;
+          candidate.previousParallel.GOLD = oldVal || entry.value;
+          candidate.previousParallel.gold = oldVal || entry.value;
+        }
+      }
+      changes.push({ id: term.id, name: term.name, oldVal: oldVal || entry.value,
+        newVal: entry.value, flag: term.flag || 'ly', source: entry.source });
+    }
+    if (!changes.length && !isManual) {
+      Object.assign(lastObserved, observed);
+      return changes;
+    }
+    const checkChange = changes.filter(u => CHECK_TRIO.includes(u.id as typeof CHECK_TRIO[number]))
+      .sort((a, b) => Date.parse(candidate.lastChanged.parallel[b.id]) - Date.parse(candidate.lastChanged.parallel[a.id]))[0];
+    if (checkChange && Math.abs(checkChange.newVal - candidate.parallel.USD) >= 0.05) {
+      const changedAt = candidate.lastChanged.parallel[checkChange.id];
+      for (const id of CHECK_TRIO) {
+        if (Date.parse(candidate.lastChanged.parallel[id] || '') > Date.parse(changedAt)) continue;
+        if (candidate.parallel[id] !== checkChange.newVal) {
+          candidate.previousParallel[id] = candidate.parallel[id] || checkChange.newVal;
+          candidate.parallel[id] = checkChange.newVal;
+          candidate.lastChanged.parallel[id] = changedAt;
+        }
+      }
+    }
+    for (const change of changes) change.newVal = candidate.parallel[change.id];
+    candidate.lastUpdated = new Date().toISOString();
+    if (!await saveToSupabase('parallel', undefined, candidate)) throw new Error('Parallel rates were not saved');
+    rates.parallel = candidate.parallel;
+    rates.previousParallel = candidate.previousParallel;
+    rates.lastChanged.parallel = candidate.lastChanged.parallel;
+    rates.lastUpdated = candidate.lastUpdated;
+    Object.assign(lastObserved, observed);
+    history.push({ time: candidate.lastUpdated, usdParallel: rates.parallel.USD,
+      usdOfficial: rates.official.USD, ratesParallel: { ...rates.parallel }, ratesOfficial: { ...rates.official } });
+    if (history.length > 500) history.shift();
+    for (const change of changes) {
+      updateStats(change.id, change.newVal);
+      await logPriceChange({ id: Math.random().toString(36).slice(2, 9), currencyCode: change.id,
+        currencyName: change.name, oldPrice: change.oldVal, newPrice: change.newVal,
+        source: change.source, timestamp: candidate.lastUpdated });
+    }
+    return changes;
+  });
+  parallelWrite = write.catch(() => {});
+  return write;
 }
 
 export async function fetchHistoryFromSupabase() {
@@ -560,63 +563,40 @@ export async function syncCheckRates(source: string = "تزامن تلقائي",
 
 export async function downsampleTable(tableName: string) {
   try {
-    if (!supabase) return;
-    const sevenDaysAgo = new Date();
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-    const cutoff = sevenDaysAgo.toISOString();
-
-    const { data, error } = await supabase
-      .from(tableName)
-      .select('id, recorded_at, usd')
-      .lt('recorded_at', cutoff)
-      .order('recorded_at', { ascending: true })
-      .limit(10000);
-
-    if (error || !data || data.length === 0) return;
-
-    const groupedByDay: Record<string, any[]> = {};
+    if (!supabase || !['parallel_rates', 'official_rates'].includes(tableName)) return;
+    const cutoff = new Date(Date.now() - 7 * 86400000).toISOString();
+    const { data, error } = await supabase.from(tableName)
+      .select('id, recorded_at, usd, rates').lt('recorded_at', cutoff)
+      .order('recorded_at', { ascending: true }).limit(10000);
+    if (error || !data?.length) return;
+    const days = new Map<string, any[]>();
     for (const row of data) {
-      if (!row.recorded_at) continue;
-      const day = row.recorded_at.split('T')[0];
-      if (!groupedByDay[day]) groupedByDay[day] = [];
-      groupedByDay[day].push(row);
+      const day = String(row.recorded_at).split('T')[0];
+      days.set(day, [...(days.get(day) || []), row]);
     }
-
-    let idsToDelete: any[] = [];
-    for (const day in groupedByDay) {
-      const records = groupedByDay[day];
-      if (records.length <= 3) continue;
-
-      let highId = records[0].id;
-      let lowId = records[0].id;
-      let highUsd = records[0].usd || 0;
-      let lowUsd = records[0].usd || 999999;
-      const closeId = records[records.length - 1].id;
-
-      for (const row of records) {
-        const usd = row.usd || 0;
-        if (usd > highUsd) { highUsd = usd; highId = row.id; }
-        if (usd < lowUsd) { lowUsd = usd; lowId = row.id; }
+    const finalDay = String(data[data.length - 1].recorded_at).split('T')[0];
+    const ids: any[] = [];
+    for (const [day, rows] of days) {
+      // The final day may be truncated by the query limit or cutoff.
+      if (day === finalDay || rows.length <= 4) continue;
+      const keep = new Set([rows[0].id, rows[rows.length - 1].id]);
+      const codes = new Set(rows.flatMap(row => Object.keys(row.rates || {})));
+      codes.add('USD');
+      for (const code of codes) {
+        const points = rows.filter(row => Number.isFinite(code === 'USD' ? row.usd : row.rates?.[code]));
+        if (!points.length) continue;
+        const value = (row: any) => code === 'USD' ? row.usd : row.rates[code];
+        keep.add(points.reduce((a, b) => value(a) < value(b) ? a : b).id);
+        keep.add(points.reduce((a, b) => value(a) > value(b) ? a : b).id);
       }
-
-      const keepIds = new Set([highId, lowId, closeId]);
-      for (const row of records) {
-        if (!keepIds.has(row.id)) idsToDelete.push(row.id);
-      }
+      for (const row of rows) if (!keep.has(row.id)) ids.push(row.id);
     }
-
-    const chunkSize = 200;
-    for (let i = 0; i < idsToDelete.length; i += chunkSize) {
-      const chunk = idsToDelete.slice(i, i + chunkSize);
-      await supabase.from(tableName).delete().in('id', chunk);
+    for (let i = 0; i < ids.length; i += 200) {
+      const { error } = await supabase.from(tableName).delete().in('id', ids.slice(i, i + 200));
+      if (error) throw error;
     }
-    
-    if (idsToDelete.length > 0) {
-      console.log(`[Cleanup] Downsampled ${tableName}: deleted ${idsToDelete.length} redundant historical records.`);
-    }
-  } catch (err) {
-    console.error(`[Cleanup] Error downsampling ${tableName}:`, err);
-  }
+    if (ids.length) console.log(`[Cleanup] Downsampled ${tableName}: ${ids.length} redundant rows.`);
+  } catch (err) { console.error(`[Cleanup] Error downsampling ${tableName}:`, err); }
 }
 
 export const cleanupOldData = async (onUserLogsCleanup?: () => void) => {
@@ -677,34 +657,35 @@ export const cleanupOldData = async (onUserLogsCleanup?: () => void) => {
  * Notifies the Web Server that rates have been updated in Supabase.
  * The Web Server will then reload rates and broadcast to Socket.IO clients.
  */
-export async function notifyWebServers() {
+let webNotification: Promise<void> | null = null;
+let notificationPending = false;
+export function notifyWebServers(): Promise<void> {
   const webUrl = process.env.WEB_SERVER_URL;
   const secret = process.env.WORKER_INTERNAL_SECRET;
-
-  if (!webUrl || !secret) {
-    console.log("[NotifyWebServers] Skipping notification — WEB_SERVER_URL or WORKER_INTERNAL_SECRET not configured.");
-    return;
-  }
-
-  try {
-    const notifyUrl = `${webUrl.replace(/\/$/, '')}/api/internal/notify-rates-updated`;
-    console.log(`[NotifyWebServers] Pinging Web Server at ${notifyUrl} ...`);
-    
-    const res = await fetch(notifyUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-worker-secret": secret
-      },
-      signal: AbortSignal.timeout(5000) // 5 seconds timeout
-    });
-
-    if (res.ok) {
-      console.log(`[NotifyWebServers] ✅ Successfully notified Web Server.`);
-    } else {
-      console.error(`[NotifyWebServers] ⚠️ Web Server responded with status: ${res.status}`);
+  if (!webUrl || !secret) return Promise.resolve();
+  notificationPending = true;
+  if (webNotification) return webNotification;
+  webNotification = (async () => {
+    while (notificationPending) {
+      notificationPending = false;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const response = await fetch(`${webUrl.replace(/\/$/, '')}/api/internal/notify-rates-updated`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'x-worker-secret': secret },
+            signal: AbortSignal.timeout(5000)
+          });
+          if (response.ok) break;
+          if (response.status < 500 && ![408, 429].includes(response.status)) {
+            console.error('[Notify] Web rejected update notification:', response.status);
+            break;
+          }
+          throw new Error('HTTP ' + response.status);
+        } catch (err: any) {
+          if (attempt === 2) console.error('[Notify] Web notification failed after 3 attempts:', err.message);
+          else await new Promise(resolve => setTimeout(resolve, 1000 * 2 ** attempt));
+        }
+      }
     }
-  } catch (err: any) {
-    console.error(`[NotifyWebServers] ❌ Failed to notify Web Server:`, err.message);
-  }
+  })().finally(() => { webNotification = null; });
+  return webNotification;
 }

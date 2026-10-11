@@ -3,7 +3,6 @@ import crypto from "crypto";
 import rateLimit from "express-rate-limit";
 import { runJobSafely, isJobRunning, getWorkerJobsStatus } from "../schedulers/tasks.scheduler";
 import { fetchOfficialRates, fetchParallelRatesFromTelegram } from "../services/scraper.service";
-import { saveToSupabase } from "../services/db.service";
 import { cleanupOldData } from "../services/db.service";
 import { cleanupUserLogs, monitorMemory } from "../services/maintenance.service";
 import { extractRatesWithAI } from "../services/ai.service";
@@ -132,9 +131,6 @@ function triggerJob(jobKey: AllowedJob, res: Response) {
     case 'telegram':
       runJobSafely(lockId, 'مزامنة أسعار تيليجرام عبر Internal API', async () => {
         const changed = await fetchParallelRatesFromTelegram();
-        if (changed) {
-          await saveToSupabase('parallel');
-        }
         return changed;
       }, { timeoutMs: 90000 });
       break;
@@ -143,10 +139,6 @@ function triggerJob(jobKey: AllowedJob, res: Response) {
       runJobSafely(lockId, 'تحديث شامل للأسعار ومزامنة Supabase عبر Internal API', async () => {
         const officialChanged = await fetchOfficialRates(true, true);
         const parallelChanged = await fetchParallelRatesFromTelegram();
-        if (officialChanged || parallelChanged) {
-          const saveType = (officialChanged && parallelChanged) ? 'both' : (officialChanged ? 'official' : 'parallel');
-          await saveToSupabase(saveType);
-        }
         return { officialChanged, parallelChanged };
       }, { timeoutMs: 120000 });
       break;

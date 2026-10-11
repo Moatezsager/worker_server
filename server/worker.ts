@@ -14,18 +14,16 @@ import {
 import { 
   initializeRatesFromDB, 
   loadLatestRatesFromSupabase, 
-  saveToSupabase,
   logErrorArabic 
 } from "./services/db.service";
 import { loadConfigFromSupabase } from "./config";
-import { loadRecentBroadcastTimestamps } from "./services/social.service";
+import { loadRecentBroadcastTimestamps, loadBroadcastQueueState, flushBroadcastQueueState } from "./services/social.service";
 import { initStatsIfEmpty } from "./services/reporting.service";
 import { fetchOfficialRates, fetchParallelRatesFromTelegram, loadCblStateFromSupabase } from "./services/scraper.service";
-import { whatsappManager, hasSavedSession } from "./services/whatsapp.service";
+import { whatsappManager, restoreAuthFromStorage, backupAuthToStorage } from "./services/whatsapp.service";
 import { activeClient, initializeTelegram } from "../telegramClient";
 import { rates } from "./state";
 import { db } from "./db";
-import { notifyWebServer } from './utils/notify';
 
 // Middlewares
 import {
@@ -129,6 +127,10 @@ export const gracefulShutdown = async (signal: string = 'SIGTERM') => {
     }
   }
 
+  await Promise.race([
+    Promise.all([flushBroadcastQueueState(), backupAuthToStorage()]),
+    new Promise(resolve => setTimeout(resolve, 5000))
+  ]);
   // 5. Close local SQLite database cleanly
   try {
     if (db) {
@@ -262,6 +264,7 @@ export async function startWorkerServer() {
   await loadConfigFromSupabase();
   await loadBroadcastStateFromStorageAndSupabase();
   await loadCblStateFromSupabase();
+  await loadBroadcastQueueState();
 
   // 2. Initialize HTTP server for Worker Health / Admin
   const PORT = Number(process.env.PORT) || 3000;
@@ -300,12 +303,7 @@ export async function startWorkerServer() {
           const officialChanged = await fetchOfficialRates();
           const parallelChanged = await fetchParallelRatesFromTelegram();
 
-          if (officialChanged || parallelChanged) {
-            console.log("[Worker Startup] Initial changes detected! Saving to Supabase database...");
-            const saveType = (officialChanged && parallelChanged) ? "both" : (officialChanged ? "official" : "parallel");
-            await saveToSupabase(saveType);
-            await notifyWebServer(rates);
-          }
+          if (officialChanged || parallelChanged) console.log("[Worker Startup] Sources saved updated rates.");
         }
       }, { timeoutMs: 60000 });
     })();
@@ -323,9 +321,8 @@ export async function startWorkerServer() {
     // Auto-reconnect WhatsApp if session exists
     (async () => {
       try {
-        await loadConfigFromSupabase();
-        if (hasSavedSession()) {
-          console.log("[WhatsApp] Found permanent session credentials in Supabase cloud. Auto-connecting...");
+        if (await restoreAuthFromStorage()) {
+          console.log("[WhatsApp] Restored saved credentials. Auto-connecting...");
           await whatsappManager.initClient();
         } else {
           console.log("[WhatsApp] No saved session in Supabase cloud. Awaiting user QR pairing in admin panel.");
