@@ -1,6 +1,6 @@
 import { RateMap, LiveFeedMessage, ChannelStatusInfo } from '../types';
 import { rates, history } from '../state';
-import { appConfig } from '../config';
+import { appConfig, refreshExtractionTerms } from '../config';
 import { db, supabase } from '../db';
 import { logErrorArabic, logPriceChange, saveToSupabase, syncCheckRates, saveWorkerStateToSupabase, commitParallelRates } from './db.service';
 import { extractRatesWithAI } from './ai.service';
@@ -14,6 +14,7 @@ export let lastOfficialFetchDate = "";
 export let isCblFetchEnabled = true;
 export let isTelegramFetchEnabled = true;
 export let isWhatsAppFetchEnabled = true;
+let cblStateLoaded = false;
 
 export function setCblFetchEnabled(enabled: boolean) {
   isCblFetchEnabled = enabled;
@@ -59,6 +60,7 @@ export const CBL_STATUS = {
 
 // Load lastOfficialFetchDate and isCblFetchEnabled from SQLite + Supabase on startup
 export async function loadCblStateFromSupabase(): Promise<void> {
+  cblStateLoaded = false;
   try {
     if (db) {
       const row = db.prepare(
@@ -79,12 +81,13 @@ export async function loadCblStateFromSupabase(): Promise<void> {
     }
 
     if (supabase) {
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from('server_config')
         .select('value')
         .eq('key', 'last_official_fetch_date')
         .single();
-      if (data?.value) {
+      if (error && error.code !== 'PGRST116') throw error;
+      if (data?.value && data.value > lastOfficialFetchDate) {
         lastOfficialFetchDate = data.value;
         console.log(`[Official] Loaded lastOfficialFetchDate from Supabase server_config: ${data.value}`);
         if (db) {
@@ -95,25 +98,29 @@ export async function loadCblStateFromSupabase(): Promise<void> {
             `).run(data.value);
           } catch {}
         }
-      } else if (!lastOfficialFetchDate) {
-        // Fallback: Infer from latest record in official_rates
-        const { data: officialRows } = await supabase
+      }
+      {
+        // The saved price row remains authoritative if the separate daily marker failed to save.
+        const { data: officialRows, error: officialError } = await supabase
           .from('official_rates')
           .select('recorded_at')
           .order('recorded_at', { ascending: false })
           .limit(1);
+        if (officialError) throw officialError;
         if (officialRows && officialRows.length > 0 && officialRows[0].recorded_at) {
-          const recordedDate = officialRows[0].recorded_at.split('T')[0];
-          lastOfficialFetchDate = recordedDate;
+          const recordedDate = new Date(officialRows[0].recorded_at).toLocaleDateString('en-CA', { timeZone: 'Africa/Tripoli' });
+          if (!Number.isFinite(Date.parse(officialRows[0].recorded_at))) throw new Error('Invalid saved official rate timestamp');
+          if (recordedDate > lastOfficialFetchDate) lastOfficialFetchDate = recordedDate;
           console.log(`[Official] Inferred lastOfficialFetchDate from official_rates table: ${recordedDate}`);
         }
       }
 
-      const { data: enabledData } = await supabase
+      const { data: enabledData, error: enabledError } = await supabase
         .from('server_config')
         .select('value')
         .eq('key', 'cbl_fetch_enabled')
         .single();
+      if (enabledError && enabledError.code !== 'PGRST116') throw enabledError;
       if (enabledData?.value !== undefined) {
         isCblFetchEnabled = enabledData.value === 'true';
         console.log(`[Official] Loaded isCblFetchEnabled from Supabase: ${isCblFetchEnabled}`);
@@ -141,13 +148,11 @@ export async function loadCblStateFromSupabase(): Promise<void> {
         }
       }
     }
+    cblStateLoaded = true;
   } catch (e) {
     console.warn('[Official] Could not load CBL settings on startup:', e);
   }
 }
-
-// Initial fire-and-forget load for module initialization, also called explicitly in worker.ts
-loadCblStateFromSupabase().catch(() => {});
 
 export let lastSuccessfulFetchTime = Date.now();
 export let isScraping = false;
@@ -199,21 +204,20 @@ export async function fetchFromCBL(maxRetries: number = 3): Promise<{ cblDate: s
   console.log(`[CBL] ${CBL_STATUS.STARTED}: Initiating HTTP fetch from Central Bank of Libya website (maxRetries=${maxRetries})...`);
   
   while (attempt < maxRetries) {
+    const status = getCblStatusInfo();
+    if (!status.enabled || !status.isInActiveWindow || status.isTodayFetched) return null;
+    const remainingMs = (11 - status.currentLibyaHour) * 3600000 - Number(status.currentLibyaTime.slice(3)) * 60000 - Date.now() % 60000;
     attempt++;
     const startTime = Date.now();
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 15000); // Strict 15s timeout
-      
       const response = await fetch('https://cbl.gov.ly/currency-exchange-rates/', { 
-        signal: controller.signal,
+        signal: AbortSignal.timeout(Math.max(1, Math.min(15000, remainingMs))),
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           'Accept-Language': 'ar,en-US;q=0.7,en;q=0.3'
         }
       });
-      clearTimeout(timeoutId);
       
       const durationMs = Date.now() - startTime;
       
@@ -228,6 +232,7 @@ export async function fetchFromCBL(maxRetries: number = 3): Promise<{ cblDate: s
       }
       
       const html = await response.text();
+      if (!getCblStatusInfo().isInActiveWindow) return null;
       console.log(`[CBL] ${CBL_STATUS.SUCCESS}: Received HTTP ${response.status} in ${durationMs}ms (${html.length} bytes downloaded).`);
       
       // Parse without logging full HTML (protect against leaking sensitive content or massive log bloat)
@@ -415,7 +420,7 @@ export function getCblStatusInfo() {
   const currentLibyaDate = `${yyyy}-${mm}-${dd}`;
 
   const isWeekend = isLibyanHoliday(currentLibyaDate, dayIndex);
-  const isInActiveWindow = !isWeekend && (currentLibyaHour >= 9);
+  const isInActiveWindow = !isWeekend && currentLibyaHour >= 9 && currentLibyaHour < 11;
   const isTodayFetched = (lastOfficialFetchDate === currentLibyaDate);
 
   const timeFormatted = `${String(currentLibyaHour).padStart(2, '0')}:${String(currentLibyaMinute).padStart(2, '0')}`;
@@ -436,7 +441,6 @@ export function getCblStatusInfo() {
 }
 
 let officialFetchInFlight: Promise<boolean> | null = null;
-let lastCblAttemptTime = 0;
 export function fetchOfficialRates(force = false, isManualAdmin = false): Promise<boolean> {
   if (officialFetchInFlight) return officialFetchInFlight;
   officialFetchInFlight = fetchOfficialRatesJob(force, isManualAdmin).finally(() => { officialFetchInFlight = null; });
@@ -446,49 +450,31 @@ export function fetchOfficialRates(force = false, isManualAdmin = false): Promis
 async function fetchOfficialRatesJob(force: boolean, isManualAdmin: boolean): Promise<boolean> {
   console.log(`[CBL] ${CBL_STATUS.STARTED}: Initiating official rates check (force=${force}, isManualAdmin=${isManualAdmin})...`);
 
-  const now = new Date();
-  const libyaDateObj = new Date(now.toLocaleString('en-US', { timeZone: 'Africa/Tripoli' }));
-  const dayIndex = libyaDateObj.getDay();
-  const currentLibyaHour = libyaDateObj.getHours();
-
-  const yyyy = libyaDateObj.getFullYear();
-  const mm = String(libyaDateObj.getMonth() + 1).padStart(2, '0');
-  const dd = String(libyaDateObj.getDate()).padStart(2, '0');
-  const currentLibyaDate = `${yyyy}-${mm}-${dd}`;
+  const { currentLibyaDate, currentLibyaHour, isWeekend, isInActiveWindow } = getCblStatusInfo();
 
   console.log(`[CBL] Libya today date = ${currentLibyaDate}, Hour = ${currentLibyaHour}:00 (lastOfficialFetchDate = '${lastOfficialFetchDate || 'none'}')`);
 
-  // When not manual admin force, enforce business hours and holiday rules
-  if (!force && !isManualAdmin) {
-    // 0. Check if CBL auto-fetch is enabled
-    if (!isCblFetchEnabled) {
-      console.log("[CBL] Skipping fetch. CBL auto-fetch function is disabled in Admin settings.");
-      return false;
-    }
-
-    // 1. Check holidays & weekends (Friday & Saturday + official holidays)
-    if (isLibyanHoliday(currentLibyaDate, dayIndex)) {
-      console.log("[CBL] Skipping fetch. CBL is closed today (Weekend or Official Holiday).");
-      return false;
-    }
-
-    // 2. Check work window: Only fetch between 09:00 AM and 10:59 AM Libya time
-    if (currentLibyaHour < 9) {
-      console.log(`[CBL] Before work start time (09:00 AM Libya time). Current hour: ${currentLibyaHour}:00. Skipping automatic fetch.`);
-      return false;
-    }
-
-    // 3. Check if today's official rates have already been successfully fetched and completed
-    if (lastOfficialFetchDate === currentLibyaDate) {
-      if (lastOfficialBroadcastDate !== currentLibyaDate) await broadcastOfficialRates(false);
-      console.log(`[CBL] Today's official bulletin (${currentLibyaDate}) has already been successfully fetched. Skipping duplicate fetch.`);
-      return false;
-    }
+  // All callers, including manual jobs, obey the owner's daily collection window.
+  if (!isCblFetchEnabled) {
+    console.log("[CBL] Skipping fetch. CBL auto-fetch function is disabled in Admin settings.");
+    return false;
+  }
+  if (isWeekend) {
+    console.log("[CBL] Skipping fetch. CBL is closed today (Weekend or Official Holiday).");
+    return false;
+  }
+  if (!isInActiveWindow) {
+    console.log(`[CBL] Outside the 09:00-11:00 Libya collection window. Skipping fetch.`);
+    return false;
+  }
+  if (!cblStateLoaded) await loadCblStateFromSupabase();
+  if (!cblStateLoaded) return false;
+  if (lastOfficialFetchDate === currentLibyaDate) {
+    if (lastOfficialBroadcastDate !== currentLibyaDate) await broadcastOfficialRates(false);
+    console.log(`[CBL] Today's official bulletin (${currentLibyaDate}) has already been successfully fetched. Skipping duplicate fetch.`);
+    return false;
   }
 
-  if (!force && !isManualAdmin && currentLibyaHour >= 11 &&
-      lastCblAttemptTime > 0 && Date.now() - lastCblAttemptTime < 3600000) return false;
-  lastCblAttemptTime = Date.now();
   // 1. FETCH from CBL website (Sequential Await)
   const cblResult = await fetchFromCBL();
   if (!cblResult) {
@@ -816,6 +802,7 @@ export async function fetchParallelRatesFromTelegram(isManual: boolean = false):
   
   const scraperPromise = (async () => {
     try {
+      await refreshExtractionTerms();
       const priceHistory: Record<string, { value: number, time: number, channel: string }[]> = {};
       for (const term of appConfig.terms) {
         priceHistory[term.id] = [];
@@ -1104,6 +1091,7 @@ export async function processWhatsAppMessage(
       return { processed: false, extractedCount: 0 };
     }
 
+    await refreshExtractionTerms();
     // 2. Extract rates using regex rules (Gold is handled manually by Admin)
     let extracted = extractRatesFromText(rawText).filter(r => !r.code.startsWith('GOLD_') && r.code !== 'GOLD');
 

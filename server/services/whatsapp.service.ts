@@ -47,10 +47,19 @@ let lastSavedAuthHash: string | null = null;
 let lastSavedAuthTime = 0;
 let authBackupWrite: Promise<void> = Promise.resolve();
 let authBackupPaused = false;
+let authFileWrite: Promise<void> = Promise.resolve();
+let checkpointError: string | null = null;
+let checkpointFailures = 0;
+
+function isRegisteredSession(content: unknown): boolean {
+  if (typeof content !== 'string') return false;
+  try { return JSON.parse(content)?.registered === true; }
+  catch { return false; }
+}
 
 /**
  * Backs up all session authentication files from disk to local SQLite and Supabase cloud.
- * Includes SHA-256 deduplication and change verification so identical files are NEVER re-uploaded.
+ * Hashes the complete bundle to suppress duplicate uploads within the checkpoint window.
  */
 export function backupAuthToStorage(): Promise<void> {
   if (authBackupPaused) return Promise.resolve();
@@ -59,6 +68,7 @@ export function backupAuthToStorage(): Promise<void> {
 }
 
 async function backupAuthJob(): Promise<void> {
+  await authFileWrite;
   if (authBackupPaused) return;
   try {
     if (!fs.existsSync(AUTH_DIR)) return;
@@ -70,14 +80,16 @@ async function backupAuthJob(): Promise<void> {
     for (const file of files) {
       try {
         const filePath = path.join(AUTH_DIR, file);
-        if (fs.statSync(filePath).isFile()) {
-          bundle[file] = fs.readFileSync(filePath, 'utf8');
+        if (/^[a-zA-Z0-9_@.-]+\.json$/.test(file) && fs.statSync(filePath).isFile()) {
+          const content = fs.readFileSync(filePath, 'utf8');
+          JSON.parse(content);
+          bundle[file] = content;
         }
-      } catch (e) {}
+      } catch { return; } // Never replace a complete checkpoint with a partial read.
     }
 
     // Only backup if valid credentials exist
-    if (!bundle['creds.json']) return;
+    if (!isRegisteredSession(bundle['creds.json'])) return;
 
     // Session keys can change without changing creds.json.
     const currentHash = crypto.createHash('sha256').update(JSON.stringify(bundle)).digest('hex');
@@ -106,17 +118,24 @@ async function backupAuthJob(): Promise<void> {
       try {
         const { error } = await supabase
           .from('server_config')
-          .upsert({ key: 'worker_whatsapp_auth', value: JSON.stringify(bundle), updated_at: new Date().toISOString() });
+          .upsert({ key: 'worker_whatsapp_auth', value: JSON.stringify(bundle), updated_at: new Date().toISOString() })
+          .abortSignal(AbortSignal.timeout(10000));
         if (error) {
-          console.error('[WhatsApp] Failed to save private session checkpoint:', error.message);
+          throw new Error('Checkpoint write failed');
         } else {
+          checkpointError = null;
+          checkpointFailures = 0;
           lastSavedAuthHash = currentHash;
           lastSavedAuthTime = now;
           console.log(`[WhatsApp] Successfully saved ${Object.keys(bundle).length} auth files to Supabase cloud (new credentials saved).`);
         }
-      } catch (sbErr) {
-        console.error('[WhatsApp] Supabase save exception:', sbErr);
+      } catch {
+        checkpointError = 'تعذر حفظ جلسة واتساب سحابياً. تحقق من صلاحيات server_config قبل إعادة نشر السيرفر.';
+        console.error('[WhatsApp] Private session checkpoint failed; local session preserved.');
+        if (++checkpointFailures <= 3) queueAuthBackup();
       }
+    } else {
+      checkpointError = 'الحفظ السحابي لجلسة واتساب غير متاح. تحقق من إعدادات Supabase قبل إعادة نشر السيرفر.';
     }
 
   } catch (err) {
@@ -129,10 +148,12 @@ async function backupAuthJob(): Promise<void> {
  */
 export function queueAuthBackup(): void {
   if (authBackupPaused) return;
-  if (backupDebounceTimer) clearTimeout(backupDebounceTimer);
+  if (backupDebounceTimer) return;
   backupDebounceTimer = setTimeout(() => {
+    backupDebounceTimer = null;
     backupAuthToStorage().catch(console.error);
-  }, 30000); // 30 seconds debounce
+  }, 30000); // Fixed window: continuous key activity must not postpone persistence.
+  backupDebounceTimer.unref();
 }
 
 /**
@@ -142,7 +163,6 @@ export async function restoreAuthFromStorage(): Promise<boolean> {
   if (authBackupPaused) return false;
   try {
     if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
-    if (fs.existsSync(path.join(AUTH_DIR, 'creds.json'))) return true;
     let bundle: Record<string, string> | undefined;
     try {
       const row = db.prepare('SELECT value FROM server_config WHERE key = ?').get('whatsapp_session_backup') as {value: string} | undefined;
@@ -151,8 +171,17 @@ export async function restoreAuthFromStorage(): Promise<boolean> {
         if (!bundle?.['creds.json']) return false;
       }
     } catch {}
+    if (fs.existsSync(path.join(AUTH_DIR, 'creds.json'))) {
+      try {
+        if (isRegisteredSession(fs.readFileSync(path.join(AUTH_DIR, 'creds.json'), 'utf8'))) return true;
+      } catch {}
+    }
     if (supabase && supabaseKey && !supabaseKey.includes('dummy')) {
-      const { data, error } = await supabase.from('server_config').select('value').eq('key', 'worker_whatsapp_auth').single();
+      const { data, error } = await supabase.from('server_config').select('value').eq('key', 'worker_whatsapp_auth')
+        .abortSignal(AbortSignal.timeout(10000)).single();
+      if (error && error.code !== 'PGRST116' && !bundle) {
+        throw new Error('Saved WhatsApp session is temporarily unavailable; retry before pairing.');
+      }
       if (!error && data?.value) {
         bundle = JSON.parse(data.value);
         if (!bundle?.['creds.json']) return false; // A private tombstone prevents restoring a logged-out legacy session.
@@ -165,34 +194,39 @@ export async function restoreAuthFromStorage(): Promise<boolean> {
       } catch {}
     }
     bundle ||= appConfig.whatsappAuth;
-    if (!bundle?.['creds.json']) return false;
+    if (!isRegisteredSession(bundle?.['creds.json'])) return false;
     for (const [filename, content] of Object.entries(bundle)) {
-      if (!/^[a-zA-Z0-9_.-]+\.json$/.test(filename) || typeof content !== 'string') return false;
+      if (!/^[a-zA-Z0-9_@.-]+\.json$/.test(filename) || typeof content !== 'string') return false;
+      JSON.parse(content);
     }
-    for (const [filename, content] of Object.entries(bundle)) fs.writeFileSync(path.join(AUTH_DIR, filename), content, 'utf8');
+    // Commit credentials last so a failed key restore cannot look like a complete session.
+    const entries = Object.entries(bundle).sort(([a], [b]) => Number(a === 'creds.json') - Number(b === 'creds.json'));
+    for (const [filename, content] of entries) fs.writeFileSync(path.join(AUTH_DIR, filename), content, { encoding: 'utf8', mode: 0o600 });
     return true;
-  } catch (err) {
-    console.error('[WhatsApp] Restore failed:', err);
-    return false;
+  } catch {
+    console.error('[WhatsApp] Saved-session restore failed; credentials were not exposed.');
+    throw new Error('Unable to restore saved WhatsApp session safely. Retry connection later.');
   }
 }
 
 /**
- * Checks if a saved WhatsApp session exists in Supabase cloud, appConfig, or disk.
+ * Checks local saved-session evidence without making a cloud request.
  */
 export function hasSavedSession(): boolean {
-  if (appConfig.whatsappAuth && appConfig.whatsappAuth['creds.json']) return true;
-  if (fs.existsSync(path.join(AUTH_DIR, 'creds.json'))) return true;
+  if (authBackupPaused) return false;
   try {
-    const row = db.prepare('SELECT 1 FROM whatsapp_auth WHERE filename = ?').get('creds.json');
-    if (row) return true;
+    const row = db.prepare('SELECT value FROM server_config WHERE key = ?').get('whatsapp_session_backup') as {value: string} | undefined;
+    if (row?.value && !JSON.parse(row.value)?.['creds.json']) return false;
+    if (fs.existsSync(path.join(AUTH_DIR, 'creds.json')) && isRegisteredSession(fs.readFileSync(path.join(AUTH_DIR, 'creds.json'), 'utf8'))) return true;
+    if (row?.value && isRegisteredSession(JSON.parse(row.value)?.['creds.json'])) return true;
   } catch (e) {}
-  return false;
+  return isRegisteredSession(appConfig.whatsappAuth?.['creds.json']);
 }
 
 let cachedBaileysVersion: [number, number, number] | null = null;
 
 class WhatsAppManager {
+  private closing = false;
   private sock: WASocket | null = null;
   private status: WhatsAppServiceStatus['status'] = 'disconnected';
   private qrCodeUrl: string | null = null;
@@ -231,7 +265,7 @@ class WhatsAppManager {
       userName: this.userName,
       connectedAt: this.connectedAt,
       lastMessageTime: this.lastMessageTime,
-      lastError: this.lastError,
+      lastError: this.lastError || checkpointError,
       messagesReceivedCount: this.messagesReceivedCount,
       ratesExtractedCount: this.ratesExtractedCount,
       autoProcessEnabled: isWhatsAppFetchEnabled,
@@ -269,6 +303,7 @@ class WhatsAppManager {
   }
 
   private async doInitClient(): Promise<void> {
+    this.closing = false;
     this.isInitializing = true;
     this.status = 'connecting';
     this.lastError = null;
@@ -277,9 +312,20 @@ class WhatsAppManager {
       console.log('[WhatsApp] Initializing Baileys client with Supabase cloud persistent session...');
       
       // Step 1: Restore session files from Supabase cloud into container folder
+      await authFileWrite.catch(() => {});
       await restoreAuthFromStorage();
 
       const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+      const persist = (write: () => Promise<void>): Promise<void> => {
+        const operation = authFileWrite.catch(() => {}).then(write);
+        authFileWrite = operation;
+        return operation;
+      };
+      const setKeys = state.keys.set.bind(state.keys);
+      state.keys.set = async (data) => {
+        await persist(() => setKeys(data));
+        queueAuthBackup();
+      };
       if (!cachedBaileysVersion) {
         const result = await fetchLatestBaileysVersion().catch(() => ({
           version: [2, 3000, 1015901307] as [number, number, number],
@@ -295,6 +341,7 @@ class WhatsAppManager {
       // Step 2: Clean up previous socket if exists before creating new one
       if (this.sock) {
         try {
+          this.sock.ev.removeAllListeners('connection.update');
           this.sock.end(undefined);
         } catch (e) {}
         this.sock = null;
@@ -322,8 +369,9 @@ class WhatsAppManager {
       // Step 4: Handle credentials update and mirror directly to Supabase cloud
       this.sock.ev.on('creds.update', async () => {
         try {
-          await saveCreds();
-          queueAuthBackup();
+          await persist(saveCreds);
+          if (state.creds.registered && !lastSavedAuthHash) await backupAuthToStorage();
+          else queueAuthBackup();
         } catch (err) {
           console.error('[WhatsApp] Error in creds.update handler:', err);
         }
@@ -331,6 +379,7 @@ class WhatsAppManager {
 
       // Step 5: Handle connection updates
       this.sock.ev.on('connection.update', async (update) => {
+        if (this.closing || authBackupPaused) return;
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
@@ -371,7 +420,7 @@ class WhatsAppManager {
           // 2. Handle 401: Logged Out
           if (statusCode === 401 || statusCode === DisconnectReason.loggedOut) {
             console.warn('[WhatsApp] Disconnect reason 401 (loggedOut): Session was logged out. Halting auto-reconnect.');
-            this.status = 'disconnected';
+            this.status = 'error';
             this.lastError = 'تم تسجيل الخروج من جلسة واتساب. يرجى مسح رمز الاستجابة السريعة (QR) من جديد.';
             return;
           }
@@ -415,6 +464,8 @@ class WhatsAppManager {
               console.log('[WhatsApp] Connection has remained stable for 5 minutes. Reconnect attempts counter reset.');
             }
           }, 5 * 60 * 1000);
+          await persist(saveCreds);
+          await backupAuthToStorage();
         }
       });
 
@@ -544,6 +595,9 @@ class WhatsAppManager {
   }
 
   public closeOnly(): void {
+    this.closing = true;
+    if (backupDebounceTimer) clearTimeout(backupDebounceTimer);
+    backupDebounceTimer = null;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -562,10 +616,12 @@ class WhatsAppManager {
   }
 
   public async disconnect(): Promise<void> {
+    this.closing = true;
     authBackupPaused = true;
     if (backupDebounceTimer) clearTimeout(backupDebounceTimer);
     backupDebounceTimer = null;
     await authBackupWrite;
+    await authFileWrite.catch(() => {});
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -588,6 +644,8 @@ class WhatsAppManager {
       try { await this.clearAuthFromSupabaseAndDisk(); }
       catch (error) { cleanupError = error instanceof Error ? error : new Error(String(error)); }
       lastSavedAuthHash = null;
+      checkpointError = null;
+      checkpointFailures = 0;
       this.status = 'disconnected';
       this.qrCodeUrl = null;
       this.phoneNumber = null;
@@ -606,7 +664,8 @@ class WhatsAppManager {
     appConfig.whatsappAuth = {};
     if (supabase && supabaseKey && !supabaseKey.includes('dummy')) {
       try {
-        const { error } = await supabase.from('server_config').upsert({ key: 'worker_whatsapp_auth', value: '{}', updated_at: new Date().toISOString() });
+        const { error } = await supabase.from('server_config').upsert({ key: 'worker_whatsapp_auth', value: '{}', updated_at: new Date().toISOString() })
+          .abortSignal(AbortSignal.timeout(10000));
         if (error) throw error;
         console.log('[WhatsApp] Session removed from Supabase cloud.');
       } catch (e) { failed = true; }

@@ -19,7 +19,7 @@ import {
 import { loadConfigFromSupabase } from "./config";
 import { loadRecentBroadcastTimestamps, loadBroadcastQueueState, flushBroadcastQueueState } from "./services/social.service";
 import { initStatsIfEmpty } from "./services/reporting.service";
-import { fetchOfficialRates, fetchParallelRatesFromTelegram, loadCblStateFromSupabase } from "./services/scraper.service";
+import { fetchParallelRatesFromTelegram, loadCblStateFromSupabase } from "./services/scraper.service";
 import { whatsappManager, restoreAuthFromStorage, backupAuthToStorage } from "./services/whatsapp.service";
 import { activeClient, initializeTelegram } from "../telegramClient";
 import { rates } from "./state";
@@ -300,10 +300,9 @@ export async function startWorkerServer() {
           console.log(`[Worker Startup] Skipping initial scrape during quiet hours (Hour ${currentLibyaHour} Libya Time).`);
         } else {
           console.log("[Worker Startup] Triggering initial rates verification...");
-          const officialChanged = await fetchOfficialRates();
           const parallelChanged = await fetchParallelRatesFromTelegram();
 
-          if (officialChanged || parallelChanged) console.log("[Worker Startup] Sources saved updated rates.");
+          if (parallelChanged) console.log("[Worker Startup] Sources saved updated rates.");
         }
       }, { timeoutMs: 60000 });
     })();
@@ -320,15 +319,23 @@ export async function startWorkerServer() {
 
     // Auto-reconnect WhatsApp if session exists
     (async () => {
-      try {
-        if (await restoreAuthFromStorage()) {
-          console.log("[WhatsApp] Restored saved credentials. Auto-connecting...");
-          await whatsappManager.initClient();
-        } else {
-          console.log("[WhatsApp] No saved session in Supabase cloud. Awaiting user QR pairing in admin panel.");
+      for (let attempt = 0; attempt < 3 && !isShuttingDown; attempt++) {
+        try {
+          if (await restoreAuthFromStorage()) {
+            if (isShuttingDown) break;
+            console.log("[WhatsApp] Restored saved credentials. Auto-connecting...");
+            await whatsappManager.initClient();
+          } else {
+            console.log("[WhatsApp] No saved session in Supabase cloud. Awaiting user QR pairing in admin panel.");
+          }
+          break;
+        } catch {
+          console.warn("[WhatsApp] Saved-session restore failed; pairing was not started.");
+          if (attempt < 2) await new Promise<void>(resolve => {
+            const timer = setTimeout(resolve, 30000 * (attempt + 1));
+            timer.unref();
+          });
         }
-      } catch (waBootErr) {
-        console.warn("[WhatsApp] Boot check warning:", waBootErr);
       }
     })();
   });

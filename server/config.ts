@@ -102,36 +102,8 @@ export function setTelegramManager(manager: TelegramManager | null) {
 }
 
 export function applyLoadedConfig(loadedConfig: AppConfig, source: string) {
-  const existingIds = new Set<string>();
-  const mergedTerms = loadedConfig.terms.map(dbTerm => {
-    existingIds.add(dbTerm.id);
-    const defaultTerm = appConfig.terms.find(t => t.id === dbTerm.id);
-    const isMetal = (defaultTerm && (defaultTerm.flag === "gold" || defaultTerm.flag === "silver")) ||
-      dbTerm.id.startsWith("GOLD_") || dbTerm.id.startsWith("SILVER_");
-    const isOutdatedOrNarrow = !dbTerm.regex || isMetal || 
-      ["USD", "EUR", "GBP", "USD_CHECKS", "USD_JBANK", "USD_BCD", "USD_NCB", "USD_AB", "USD_WB", "TRY", "USD_TR", "USD_AE", "AED", "USD_CN", "CNY", "SAR", "JOD", "BHD", "KWD", "QAR"].includes(dbTerm.id) ||
-      (dbTerm.id === "TND" && (dbTerm.max > 3.8 || dbTerm.min < 2.5)) ||
-      (dbTerm.id === "EGP" && (dbTerm.max > 0.28 || dbTerm.min < 0.13));
-
-    return {
-      id: dbTerm.id,
-      name: (isMetal && defaultTerm) ? defaultTerm.name : (dbTerm.name || defaultTerm?.name || dbTerm.id),
-      regex: (isOutdatedOrNarrow && defaultTerm?.regex) ? defaultTerm.regex : (dbTerm.regex || defaultTerm?.regex || ""),
-      min: (isOutdatedOrNarrow && defaultTerm) ? defaultTerm.min : ((typeof dbTerm.min === 'number' && !isNaN(dbTerm.min) && (!defaultTerm || dbTerm.min <= defaultTerm.min)) ? dbTerm.min : (defaultTerm?.min ?? 0)),
-      max: (isOutdatedOrNarrow && defaultTerm) ? defaultTerm.max : ((typeof dbTerm.max === 'number' && !isNaN(dbTerm.max) && (!defaultTerm || dbTerm.max >= defaultTerm.max)) ? dbTerm.max : (defaultTerm?.max ?? 10000)),
-      isInverse: typeof dbTerm.isInverse === 'boolean' ? dbTerm.isInverse : (defaultTerm?.isInverse ?? false),
-      flag: (dbTerm.flag && dbTerm.flag !== "undefined" && dbTerm.flag !== "null") ? dbTerm.flag : (defaultTerm?.flag || "ly")
-    };
-  });
-
-  for (const defaultTerm of appConfig.terms) {
-    if (!existingIds.has(defaultTerm.id)) {
-      mergedTerms.push(defaultTerm);
-      console.log(`[Migration] Added new missing currency term: ${defaultTerm.id}`);
-    }
-  }
-  // Filter out any obsolete gold/silver categories and ensure OFFICIAL_USD is permanently removed
-  loadedConfig.terms = mergedTerms.filter(t => t.id !== "GOLD" && t.id !== "GOLD_CAST_21" && t.id !== "SILVER_SCRAP" && t.id !== "OFFICIAL_USD");
+  if (Array.isArray(loadedConfig.terms)) loadedConfig.terms = normalizeExtractionTerms(loadedConfig.terms);
+  else loadedConfig.terms = appConfig.terms;
 
   if (!Array.isArray(loadedConfig.channels) || loadedConfig.channels.length === 0) {
     loadedConfig.channels = ["dollarr_ly", "musheermarket", "lydollar", "suqalmushir"];
@@ -174,6 +146,50 @@ export function applyLoadedConfig(loadedConfig: AppConfig, source: string) {
   console.log(`[Config] Config loaded & applied successfully from ${source}`);
 }
 
+function normalizeExtractionTerms(terms: any[]): AppConfig['terms'] {
+  return terms.flatMap(term => {
+    if (!term || typeof term.id !== 'string' || term.id === 'OFFICIAL_USD' ||
+        (term.is_active !== undefined && ![true, 1, '1', 'true'].includes(term.is_active))) return [];
+    const fallback = appConfig.terms.find(item => item.id === term.id);
+    const regex = term.regex ?? fallback?.regex ?? '';
+    const min = Number(term.min ?? fallback?.min ?? 0);
+    const max = Number(term.max ?? fallback?.max ?? 10000);
+    try {
+      if (typeof regex !== 'string' || !regex || !Number.isFinite(min) || !Number.isFinite(max) || min < 0 || min > max) throw new Error('Invalid term');
+      new RegExp(regex, 'i');
+    } catch {
+      console.warn('[Config] Skipping an invalid currency extraction rule.');
+      return [];
+    }
+    const inverse = term.isInverse ?? term.is_inverse ?? fallback?.isInverse ?? false;
+    return [{ id: term.id, name: term.name || fallback?.name || term.id, regex, min, max,
+      isInverse: [true, 1, '1', 'true'].includes(inverse), flag: term.flag || fallback?.flag || 'ly' }];
+  });
+}
+
+let lastTermsRefresh = 0;
+let termsRefresh: Promise<void> | null = null;
+export function refreshExtractionTerms(): Promise<void> {
+  if (!supabase || !supabaseKey || supabaseKey.includes('dummy')) return Promise.resolve();
+  if (termsRefresh) return termsRefresh;
+  if (lastTermsRefresh && Date.now() - lastTermsRefresh < 5 * 60 * 1000) return Promise.resolve();
+  lastTermsRefresh = Date.now();
+  termsRefresh = (async () => {
+    try {
+      const { data, error } = await supabase.from('app_config').select('config').eq('id', 1).single();
+      if (error) throw error;
+      if (!Array.isArray(data?.config?.terms)) return;
+      appConfig.terms = normalizeExtractionTerms(data.config.terms);
+      syncTermsToDatabase(appConfig.terms);
+      db.prepare(`INSERT INTO server_config (key, value) VALUES ('app_config', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(JSON.stringify(appConfig));
+    } catch {
+      console.warn('[Config] Could not refresh extraction rules; retaining the last loaded rules.');
+    }
+  })().finally(() => { termsRefresh = null; });
+  return termsRefresh;
+}
+
 export function syncTermsToDatabase(terms: AppConfig['terms']) {
   try {
     const cleanTerms = terms.filter(t => t && t.id !== 'OFFICIAL_USD');
@@ -195,6 +211,7 @@ export function syncTermsToDatabase(terms: AppConfig['terms']) {
         updated_at = CURRENT_TIMESTAMP
     `);
     const tx = db.transaction((items: AppConfig['terms']) => {
+      db.prepare('UPDATE currency_terms SET is_active = 0').run();
       for (const t of items) {
         if (t.id === 'OFFICIAL_USD') continue;
         stmt.run(t.id, t.name, t.regex, t.min, t.max, t.isInverse ? 1 : 0, t.flag || 'ly');
@@ -218,6 +235,8 @@ export function loadConfigFromStorage() {
       if (parsedConfig && Array.isArray(parsedConfig.terms) && Array.isArray(parsedConfig.channels)) {
         parsedConfig.terms = parsedConfig.terms.filter(t => t && t.id !== 'OFFICIAL_USD');
         applyLoadedConfig(parsedConfig, "SQLite");
+        syncTermsToDatabase(appConfig.terms);
+        return;
       }
     }
 
@@ -267,13 +286,13 @@ export async function loadConfigFromSupabase() {
       .single();
       
     if (error) {
-      if (error.code === 'PGRST116') {
-        await supabase.from('app_config').insert([{ id: 1, config: appConfig }]);
-      } else if (!error.message.includes('relation "app_config" does not exist')) {
+      if (error.code !== 'PGRST116' && !error.message.includes('relation "app_config" does not exist')) {
         console.error("Error loading config from Supabase:", error);
       }
     } else if (data && data.config) {
       applyLoadedConfig(data.config as AppConfig, "Supabase");
+      syncTermsToDatabase(appConfig.terms);
+      lastTermsRefresh = Date.now();
 
       
       try {
@@ -293,7 +312,7 @@ export async function loadConfigFromSupabase() {
         setWhatsAppFetchEnabled(fetchState.value === 'true', false);
       }
     } catch (err) { console.warn('[Config] Private Worker state could not be loaded.'); }
-    if (Array.isArray(data?.config?.terms) && data.config.terms.length) return;
+    if (Array.isArray(data?.config?.terms)) return;
 
     // Try loading directly from currency_terms table in Supabase if exists
     try {
@@ -302,25 +321,7 @@ export async function loadConfigFromSupabase() {
       const { data: dbTerms } = await supabase.from('currency_terms').select('*');
       if (dbTerms && Array.isArray(dbTerms) && dbTerms.length > 0) {
         console.log(`[Config] Syncing ${dbTerms.length} currency terms from Supabase currency_terms table...`);
-        for (const row of dbTerms) {
-          if (row.id === 'OFFICIAL_USD') continue;
-          const idx = appConfig.terms.findIndex(t => t.id === row.id);
-          const termObj = {
-            id: row.id,
-            name: row.name,
-            regex: row.regex,
-            min: Number(row.min),
-            max: Number(row.max),
-            isInverse: Boolean(row.is_inverse || row.isInverse),
-            flag: row.flag || 'ly'
-          };
-          if (idx >= 0) {
-            appConfig.terms[idx] = termObj;
-          } else {
-            appConfig.terms.push(termObj);
-          }
-        }
-        appConfig.terms = appConfig.terms.filter(t => t && t.id !== 'OFFICIAL_USD');
+        appConfig.terms = normalizeExtractionTerms(dbTerms);
         syncTermsToDatabase(appConfig.terms);
       }
     } catch (termsErr) {

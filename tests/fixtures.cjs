@@ -49,7 +49,7 @@ function fakeSupabase(perform) {
   return { from(table) {
     const query = { table, op: 'select', args: {} };
     const chain = {};
-    for (const method of ['select', 'insert', 'upsert', 'delete', 'eq', 'lt', 'in', 'order', 'limit', 'single']) {
+    for (const method of ['select', 'insert', 'upsert', 'delete', 'eq', 'lt', 'in', 'order', 'limit', 'single', 'abortSignal']) {
       chain[method] = (...args) => {
         query.args[method] = args;
         if (['insert', 'upsert', 'delete'].includes(method)) query.op = method;
@@ -68,4 +68,3 @@ function cblHtml(date, usd = 6.45) {
     ).join('') + '</tbody></table>';
 }
 module.exports = { fixture, fakeSupabase, noopDb, cblHtml, root, silent };
-
