@@ -293,7 +293,8 @@ export async function saveToSupabase(
     if (error) console.warn('[DB] Compatibility copy failed after authoritative save:', String(error?.message || error));
   }
   clearDbCache();
-  void notifyWebServers();
+  // A saved price remains authoritative even if Web is temporarily unavailable.
+  await notifyWebServers(saved, type);
   return true;
 }
 
@@ -657,24 +658,68 @@ export const cleanupOldData = async (onUserLogsCleanup?: () => void) => {
  * Notifies the Web Server that rates have been updated in Supabase.
  * The Web Server will then reload rates and broadcast to Socket.IO clients.
  */
-let webNotification: Promise<void> | null = null;
+let webNotification: Promise<boolean> | null = null;
 let notificationPending = false;
-export function notifyWebServers(): Promise<void> {
+let notificationSnapshot: typeof rates | undefined;
+let notificationMarket: 'parallel' | 'official' | 'both' = 'both';
+let confirmedWebRevision = '';
+let confirmedWebAt = 0;
+let failedWebRevision = '';
+let failedWebAt = 0;
+function webRevision(snapshot: typeof rates) {
+  return JSON.stringify([snapshot.lastUpdated, snapshot.parallel.USD || null,
+    snapshot.parallel.EUR || null, snapshot.official.USD || null, snapshot.official.EUR || null]);
+}
+
+export async function ensureWebRatesReady(): Promise<boolean> {
+  const snapshot = structuredClone(rates), revision = webRevision(snapshot);
+  if (confirmedWebRevision === revision && Date.now() - confirmedWebAt < 30000) return true;
+  if (failedWebRevision === revision && Date.now() - failedWebAt < 30000) return false;
+  const synchronized = await notifyWebServers(snapshot);
+  return synchronized && confirmedWebRevision === revision && webRevision(rates) === revision;
+}
+
+export function notifyWebServers(snapshot?: typeof rates, market: 'parallel' | 'official' | 'both' = 'both'): Promise<boolean> {
   const webUrl = process.env.WEB_SERVER_URL;
   const secret = process.env.WORKER_INTERNAL_SECRET;
-  if (!webUrl || !secret) return Promise.resolve();
+  if (!webUrl || !secret) return Promise.resolve(false);
   notificationPending = true;
+  if (snapshot) { notificationSnapshot = structuredClone(snapshot); notificationMarket = market; }
   if (webNotification) return webNotification;
   webNotification = (async () => {
+    let synchronized = false;
     while (notificationPending) {
       notificationPending = false;
+      const expected = notificationSnapshot;
+      const expectedMarket = notificationMarket;
+      notificationSnapshot = undefined;
+      synchronized = false;
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          const response = await fetch(`${webUrl.replace(/\/$/, '')}/api/internal/notify-rates-updated`, {
+          const response = await fetch(`${webUrl.replace(/\/$/, '')}/api/internal/notify-rates-updated${expected ? '?wait=true' : ''}`, {
             method: 'POST', headers: { 'Content-Type': 'application/json', 'x-worker-secret': secret, 'User-Agent': 'Dollar-Price-Worker/1.0' },
-            signal: AbortSignal.timeout(5000)
+            signal: AbortSignal.timeout(expected ? 20000 : 5000)
           });
-          if (response.ok) break;
+          if (response.ok) {
+            if (expected) {
+              const result: any = await response.json();
+              const parallelMatches = result.parallel?.USD === (expected.parallel.USD || null) &&
+                result.parallel?.EUR === (expected.parallel.EUR || null);
+              const officialMatches = result.official?.USD === (expected.official.USD || null) &&
+                result.official?.EUR === (expected.official.EUR || null);
+              if (result.status !== 'synchronized' ||
+                  !(Date.parse(result.lastUpdated) >= Date.parse(expected.lastUpdated)) ||
+                  (expectedMarket !== 'official' && !parallelMatches) ||
+                  (expectedMarket !== 'parallel' && !officialMatches)) {
+                throw new Error('Web has not confirmed the saved prices and preview');
+              }
+              confirmedWebRevision = parallelMatches && officialMatches ? webRevision(expected) : '';
+              confirmedWebAt = Date.now();
+              failedWebRevision = '';
+            }
+            synchronized = true;
+            break;
+          }
           if (response.status < 500 && ![408, 429].includes(response.status)) {
             console.error('[Notify] Web rejected update notification:', response.status);
             break;
@@ -685,7 +730,13 @@ export function notifyWebServers(): Promise<void> {
           else await new Promise(resolve => setTimeout(resolve, 1000 * 2 ** attempt));
         }
       }
+      if (expected && !synchronized) {
+        failedWebRevision = webRevision(expected);
+        failedWebAt = Date.now();
+        confirmedWebRevision = '';
+      }
     }
+    return synchronized;
   })().finally(() => { webNotification = null; });
   return webNotification;
 }

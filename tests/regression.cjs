@@ -23,7 +23,7 @@ function scraper(f, db, social = {}, fetch = async () => { throw Error('Unexpect
 }
 function socialFixture(f, options = {}) {
   const counts = { telegram: 0, facebook: 0 };
-  let failFB = true, failTG = false, delayed;
+  let failFB = true, failTG = false, delayed, webReady = true;
   const checkpoints = new Map();
   const db = { ...noopDb, prepare: sql => ({
     run: (key, value) => { if (sql.includes('server_config')) checkpoints.set(key, value); },
@@ -34,19 +34,23 @@ function socialFixture(f, options = {}) {
       sendMessage: async () => { counts.telegram++; return delayed ? await delayed : !failTG; }, lastError: 'Fixture TG failure'
     }) },
     './telegramSession.service': { getTelegramCredentials: () => ({ apiId: 1, apiHash: 'fixture', sessionString: 'fixture' }) },
+    './db.service': { ensureWebRatesReady: async () => webReady },
     '../config': { appConfig: f.config, setTelegramManager() {} }, '../state': { rates: f.rates },
     '../db': { db, supabase: null, supabaseKey: '' }, './broadcastLog.service': { addBroadcastLog() {} },
     '../utils/helpers': { ...f.helper, delay: async () => {} }
   };
   const extra = { fetch: async url => {
     assert.ok(url.startsWith('https://graph.facebook.com/'));
+    if (url.endsWith('/v20.0/')) return { ok: !failFB, json: async () => failFB
+      ? { error: { code: 190 } } : { og_object: { title: `دولار: ${f.rates.parallel.USD.toFixed(2)} | يورو: ${f.rates.parallel.EUR.toFixed(2)}` } } };
     if (url.endsWith('/comments')) return { json: async () => ({ id: 'fixture-comment' }) };
     counts.facebook++;
     return { json: async () => failFB ? { error: { code: 190, message: 'Fixture FB failure' } } : { id: 'fixture-post' } };
   } };
   return { social: f.load('server/services/social.service.ts', mocks, extra), counts, checkpoints,
     restore: () => f.load('server/services/social.service.ts', mocks, extra),
-    failFB: v => { failFB = v; }, failTG: v => { failTG = v; }, delayTG: p => { delayed = p; } };
+    failFB: v => { failFB = v; }, failTG: v => { failTG = v; }, delayTG: p => { delayed = p; },
+    webReady: v => { webReady = v; } };
 }
 const update = { id: 'USD', name: 'Dollar', flag: 'us', oldVal: 9.7, newVal: 9.8 };
 test('Database failure cannot commit RAM, history or publish; same price can retry', async () => {
@@ -86,6 +90,87 @@ test('Concurrent price writes serialize and preserve both currencies', async () 
   }])));
   assert.equal(f.rates.parallel.USD, 9.8); assert.equal(f.rates.parallel.EUR, 10.6);
 });
+test('Source saves prices before waiting for Web synchronization, then queues publishing', async () => {
+  const f = fixture(), steps = [];
+  let saved, release, notificationStarted = false;
+  const pending = new Promise(resolve => { release = resolve; });
+  const db = dbService(f, q => {
+    if (q.table === 'parallel_rates' && q.op === 'insert') {
+      saved = q.args.insert[0][0]; steps.push('saved');
+    }
+    return { data: [], error: null };
+  }, { process: { env: { WEB_SERVER_URL: 'https://fixture.invalid', WORKER_INTERNAL_SECRET: 'fixture-only' } },
+    fetch: async url => {
+      assert.ok(saved); assert.ok(url.endsWith('?wait=true')); notificationStarted = true;
+      await pending; steps.push('Web synchronized');
+      return { ok: true, json: async () => ({ status: 'synchronized', lastUpdated: saved.recorded_at,
+        parallel: { USD: saved.rates.USD, EUR: saved.rates.EUR }, official: { USD: f.rates.official.USD, EUR: f.rates.official.EUR } }) };
+    } });
+  const source = scraper(f, db, { broadcastRateChanges: async () => { steps.push('queued'); } });
+  const extraction = source.processWhatsAppMessage('fixture', 'USD 9.80', f.now());
+  for (let i = 0; i < 100 && !notificationStarted; i++) await Promise.resolve();
+  assert.ok(notificationStarted); assert.deepEqual(steps, ['saved']);
+  release(); assert.equal((await extraction).processed, true);
+  assert.deepEqual(steps, ['saved', 'Web synchronized', 'queued']);
+  assert.equal(await db.ensureWebRatesReady(), true);
+});
+test('Web failure cannot undo saved prices or send a queued post; recovery preserves delivery', async () => {
+  const f = fixture(), env = socialFixture(f);
+  env.webReady(false); env.failFB(false);
+  let requests = 0;
+  const db = dbService(f, () => ({ data: [], error: null }), {
+    process: { env: { WEB_SERVER_URL: 'https://fixture.invalid', WORKER_INTERNAL_SECRET: 'fixture-only' } },
+    setTimeout: fn => { queueMicrotask(fn); return {}; },
+    fetch: async () => { requests++; return { ok: false, status: 503 }; }
+  });
+  const source = scraper(f, db, env.social);
+  assert.equal((await source.processWhatsAppMessage('fixture', 'USD 9.80', f.now())).processed, true);
+  assert.equal(f.rates.parallel.USD, 9.8); assert.equal(requests, 3);
+  assert.equal((await env.social.flushBroadcastQueueImmediately('all', true)).success, false);
+  assert.equal(env.social.smartBroadcastQueue.size, 1);
+  assert.deepEqual(env.counts, { telegram: 0, facebook: 0 });
+  env.webReady(true);
+  assert.equal((await env.social.flushBroadcastQueueImmediately('all', true)).success, true);
+  assert.equal(env.social.smartBroadcastQueue.size, 0);
+  assert.deepEqual(env.counts, { telegram: 1, facebook: 1 });
+});
+test('Publishing readiness rejects old acknowledgements and stale EUR, with bounded cached retries', async () => {
+  const f = fixture(); let requests = 0, mode = 'accepted';
+  const db = dbService(f, undefined, {
+    process: { env: { WEB_SERVER_URL: 'https://fixture.invalid', WORKER_INTERNAL_SECRET: 'fixture-only' } },
+    setTimeout: fn => { queueMicrotask(fn); return {}; },
+    fetch: async () => { requests++; return { ok: true, json: async () => ({ status: mode === 'stale' ? 'synchronized' : mode,
+      lastUpdated: f.rates.lastUpdated, parallel: { USD: 9.7, EUR: mode === 'stale' ? 10.4 : 10.5 },
+      official: { USD: 6.4, EUR: 7.1 } }) }; }
+  });
+  assert.equal(await db.ensureWebRatesReady(), false); assert.equal(requests, 3);
+  assert.equal(await db.ensureWebRatesReady(), false); assert.equal(requests, 3);
+  f.advance(30001); mode = 'stale';
+  assert.equal(await db.ensureWebRatesReady(), false); assert.equal(requests, 6);
+  f.advance(30001); mode = 'synchronized';
+  assert.equal(await db.ensureWebRatesReady(), true); assert.equal(requests, 7);
+  assert.equal(await db.ensureWebRatesReady(), true); assert.equal(requests, 7);
+});
+test('Concurrent official/parallel notifications verify their own saved market before final publishing readiness', async () => {
+  const f = fixture(); let requests = 0, release;
+  const pending = new Promise(resolve => { release = resolve; });
+  const db = dbService(f, undefined, {
+    process: { env: { WEB_SERVER_URL: 'https://fixture.invalid', WORKER_INTERNAL_SECRET: 'fixture-only' } },
+    setTimeout: fn => { queueMicrotask(fn); return {}; },
+    fetch: async () => {
+      requests++; await pending;
+      return { ok: true, json: async () => ({ status: 'synchronized', lastUpdated: f.rates.lastUpdated,
+        parallel: { USD: 9.8, EUR: 10.5 }, official: { USD: 6.45, EUR: 7.1 } }) };
+    }
+  });
+  const parallel = structuredClone(f.rates), official = structuredClone(f.rates);
+  parallel.parallel.USD = 9.8; official.official.USD = 6.45;
+  const first = db.notifyWebServers(parallel, 'parallel');
+  const second = db.notifyWebServers(official, 'official');
+  release(); assert.equal(await first, true); assert.equal(await second, true); assert.equal(requests, 2);
+  f.rates.parallel.USD = 9.8; f.rates.official.USD = 6.45;
+  assert.equal(await db.ensureWebRatesReady(), true); assert.equal(requests, 3);
+});
 test('Partial delivery retains failed platform, survives restore, never repeats Telegram', async () => {
   const f = fixture(), env = socialFixture(f), s = env.social;
   await assert.rejects(s.broadcastRateChanges([update], false, 'all', true));
@@ -122,7 +207,7 @@ test('Exhausted retries retain failed items but do not block unrelated new curre
 test('Official bulletin only completes when all enabled platforms deliver; Facebook-only works', async () => {
   const f = fixture(), env = socialFixture(f), s = env.social;
   assert.equal(await s.broadcastOfficialRates(false), false); assert.equal(s.lastOfficialBroadcastDate, '');
-  env.failFB(false); f.advance(30001);
+  env.failFB(false); f.advance(60001);
   assert.equal(await s.broadcastOfficialRates(false), true); assert.equal(env.counts.telegram, 1);
   assert.equal(s.lastOfficialBroadcastDate, '2026-10-12');
   const another = fixture(); another.config.telegramAutoPost = false;

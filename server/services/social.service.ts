@@ -4,6 +4,7 @@ import { appConfig, telegramManager, setTelegramManager } from '../config';
 import { rates } from '../state';
 import { db, supabase, supabaseKey } from '../db';
 import { addBroadcastLog } from './broadcastLog.service';
+import { ensureWebRatesReady } from './db.service';
 import { delay, getPublicAppUrl, getLibyaTimeInfo, getTelegramShareUrl } from '../utils/helpers';
 
 interface FacebookApiResponse {
@@ -291,8 +292,62 @@ function recordBroadcast(updates: { id?: string; name: string; newVal?: number; 
   );
 }
 
+let facebookPreviewRevision = '';
+let facebookPreviewRequest: Promise<void> | null = null;
+let facebookPreviewFailure = { revision: '', at: 0 };
+async function refreshFacebookPricePreview() {
+  const canonical = new URL('/', process.env.WEB_SERVER_URL || 'https://dollar-price-qp14.onrender.com/').toString();
+  const prices = [
+    { value: rates.parallel.USD, label: 'دولار' }, { value: rates.parallel.EUR, label: 'يورو' }
+  ].filter(price => Number.isFinite(price.value) && price.value > 0);
+  const revision = JSON.stringify([canonical, ...prices.map(price => price.value.toFixed(2))]);
+  if (facebookPreviewRevision === revision) return;
+  if (facebookPreviewFailure.revision === revision && Date.now() - facebookPreviewFailure.at < 60000) {
+    throw new Error('لم يؤكد فيسبوك تحديث معاينة الأسعار بعد؛ المنشور محفوظ لإعادة المحاولة.');
+  }
+  if (!facebookPreviewRequest) {
+    facebookPreviewRequest = (async () => {
+      if (!prices.length) throw new Error('لا توجد أسعار صالحة لمعاينة فيسبوك.');
+      for (const link of [canonical, 'https://tinyurl.com/2j7667u2']) {
+        let response = await fetch('https://graph.facebook.com/v20.0/', {
+          method: 'POST', signal: AbortSignal.timeout(10000),
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${appConfig.facebookAccessToken}` },
+          body: JSON.stringify({ id: link, scrape: true, fields: 'og_object{title}' })
+        });
+        let result: any = await response.json();
+        if (response.ok && !result?.error && typeof result?.og_object?.title !== 'string') {
+          const lookup = new URL('https://graph.facebook.com/v20.0/');
+          lookup.searchParams.set('id', link);
+          lookup.searchParams.set('fields', 'og_object{title}');
+          response = await fetch(lookup.toString(), {
+            signal: AbortSignal.timeout(10000), headers: { Authorization: `Bearer ${appConfig.facebookAccessToken}` }
+          });
+          result = await response.json();
+        }
+        if (!response.ok || result?.error || typeof result?.og_object?.title !== 'string' ||
+            !prices.every(price => result.og_object.title.includes(`${price.label}: ${price.value.toFixed(2)}`))) {
+          throw new Error(`تعذر تأكيد معاينة فيسبوك المحدثة${Number.isFinite(result?.error?.code) ? ' (API ' + result.error.code + ')' : ''}. تحقق من صلاحية التوكن وإعادة قراءة الرابط.`);
+        }
+      }
+      facebookPreviewRevision = revision;
+      facebookPreviewFailure = { revision: '', at: 0 };
+    })().catch(error => {
+      facebookPreviewFailure = { revision, at: Date.now() };
+      throw error;
+    }).finally(() => { facebookPreviewRequest = null; });
+  }
+  await facebookPreviewRequest;
+  if (facebookPreviewRevision !== revision) throw new Error('تغيرت الأسعار أثناء تحديث معاينة فيسبوك؛ أعد المحاولة.');
+}
+
 export async function broadcastToSocialMedia(message: string, isTest: boolean = false, target: 'all' | 'telegram' | 'facebook' = 'all', isManual: boolean = false) {
   const sentTargets: ('telegram' | 'facebook')[] = [];
+
+  const hasPriceLink = message.includes('https://tinyurl.com/2j7667u2') ||
+    message.includes(new URL(process.env.WEB_SERVER_URL || 'https://dollar-price-qp14.onrender.com/').origin);
+  if (!isTest && hasPriceLink && !await ensureWebRatesReady()) {
+    throw new Error('لم تكتمل مزامنة Web ومعاينة الأسعار؛ لم يُرسل المنشور.');
+  }
 
   const manager = getOrInitTelegramManager();
 
@@ -414,6 +469,7 @@ export async function broadcastToSocialMedia(message: string, isTest: boolean = 
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
+          if (!isTest && fbMessage.includes('https://tinyurl.com/2j7667u2')) await refreshFacebookPricePreview();
           const targetId = appConfig.facebookPageId.trim() || 'me';
           let url = `https://graph.facebook.com/v20.0/${targetId}/feed`;
           
@@ -622,6 +678,7 @@ export async function broadcastOfficialRates(
     console.log(`[Official Broadcast] Already broadcasted for today (${todayLibyaKey}). Skipping duplicate post.`);
     return true;
   }
+  if (!isTest && !await ensureWebRatesReady()) return false;
 
   const dayNames = ["الأحد", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"];
   let dayName = "الخميس";
@@ -1490,6 +1547,7 @@ export async function executeBroadcast(
   }
   const start = Date.now();
   try {
+    if (!isTest && !await ensureWebRatesReady()) throw new Error('لم تكتمل مزامنة Web ومعاينة الأسعار؛ التحديث محفوظ في الطابور.');
     const result = await broadcastToSocialMedia(formatSmartBroadcastMessage(updates, customHeaderTitle), isTest, target, isManual);
     if (!result.sentTargets.length) return false;
     if (!isTest) recordBroadcast(updates);

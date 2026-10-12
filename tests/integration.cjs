@@ -173,7 +173,7 @@ async function main() {
     await webDb.loadLatestRatesFromSupabase(); assert.equal(w.rates.parallel.USD, 9.8);
     assert.equal(webDb.lastRatesFetchTime, w.now());
     console.log('PASS paired Web loader updates previous price/source time/cache and rejects older snapshots');
-    let calls = 0, active = 0, maxActive = 0, broadcasts = 0, alwaysFail = false, release;
+    let calls = 0, active = 0, maxActive = 0, broadcasts = 0, alwaysFail = false, release, syncGate;
     const retryTimers = [], waiting = new Promise(resolve => { release = resolve; });
     const pass = (_req, _res, next) => next(), empty = () => express.Router();
     const security = Object.fromEntries(['ipBanMiddleware', 'suspiciousActivityMiddleware', 'userAgentMiddleware',
@@ -182,6 +182,22 @@ async function main() {
       express, 'express-rate-limit': require('express-rate-limit'), helmet: require('helmet'), '../config': { appConfig: w.config }
     });
     security.userAgentMiddleware = webSecurity.userAgentMiddleware;
+    assert.equal(webSecurity.isValidCronSecret('fixture-cron-only-token'), false);
+    assert.ok(/const knownKeys = \[\s*process\.env\.CRON_SECRET\s*\]/.test(webSecurity.isValidCronSecret.toString()),
+      'Cron authentication has no embedded fallback credential');
+    const configuredSecurity = w.load(path.join(webRoot, 'server/middleware/security.ts'), {
+      express, 'express-rate-limit': require('express-rate-limit'), helmet: require('helmet'), '../config': { appConfig: w.config }
+    }, { process: { env: { CRON_SECRET: 'fixture-cron-only-token' } } });
+    assert.equal(configuredSecurity.isValidCronSecret('fixture-cron-only-token'), true);
+    assert.equal(configuredSecurity.isValidCronSecret('  fixture-cron-only-token  '), true);
+    assert.equal(configuredSecurity.isValidCronSecret('wrong-fixture-token'), false);
+    assert.equal(configuredSecurity.isValidCronSecret(undefined), false);
+    const timeoutLimits = [];
+    for (const [path, query] of [['/api/internal/notify-rates-updated', { wait: 'true' }],
+      ['/api/internal/notify-rates-updated', {}], ['/api/rates', {}]]) {
+      webSecurity.timeoutMiddleware({ path, query }, { setTimeout: limit => timeoutLimits.push(limit) }, () => {});
+    }
+    assert.deepEqual(timeoutLimits, [20000, 5000, 5000]);
     const webAppModule = w.load(path.join(webRoot, 'server/app.ts'), {
       express, compression: require('compression'), fs: {}, vite: { createServer: async () => ({ middlewares: pass }) },
       './middleware/security': { ...security, apiStats: {} }, './routes/rates.routes': empty(),
@@ -194,6 +210,7 @@ async function main() {
         try {
           if (alwaysFail || calls === 1) throw Error('Fixture database unavailable');
           if (calls === 2) await waiting;
+          if (syncGate) await syncGate;
         } finally { active--; }
       } }, './socket/socket.service': { broadcastRatesUpdate: () => { broadcasts++; } }
     }, { process: { env: { NODE_ENV: 'test', WORKER_INTERNAL_SECRET: 'fixture-only' }, cwd: () => webRoot },
@@ -227,8 +244,26 @@ async function main() {
       for (let i = 0; i < 2; i++) { await waitFor(() => retryTimers.length === 1); retryTimers.shift()(); }
       await waitFor(() => calls === 6 && active === 0);
       assert.equal(broadcasts, 2); assert.equal(retryTimers.length, 0);
+
+      alwaysFail = false;
+      let finishSync, completed = false;
+      syncGate = new Promise(resolve => { finishSync = resolve; });
+      const completion = pairedNotify.notifyWebServers(w.rates).then(value => { completed = true; return value; });
+      await waitFor(() => calls === 7 && active === 1);
+      assert.equal(completed, false); assert.equal(broadcasts, 2, 'Completion cannot precede DB load and Socket.IO');
+      syncGate = undefined; finishSync();
+      assert.equal(await completion, true); assert.equal(broadcasts, 3);
+
+      alwaysFail = true;
+      const failedCompletion = fetch(notifiedWeb.url + '/api/internal/notify-rates-updated?wait=true', {
+        method: 'POST', headers: { 'User-Agent': 'Dollar-Price-Worker/1.0', 'x-worker-secret': 'fixture-only' }
+      });
+      for (let i = 0; i < 2; i++) { await waitFor(() => retryTimers.length === 1); retryTimers.shift()(); }
+      const failedResponse = await failedCompletion;
+      assert.equal(failedResponse.status, 503); assert.equal((await failedResponse.json()).status, 'failed');
+      assert.equal(broadcasts, 3);
     } finally { await notifiedWeb.close(); }
-    console.log('PASS paired Web notification HTTP: authentication, immediate acknowledgement, bounded DB retry and coalesced synchronization');
+    console.log('PASS paired Web notification HTTP: legacy acknowledgement, completed synchronization before publishing, timeouts and bounded failed DB retries');
     const workerSecurity = f.load('server/middleware/security.ts', {
       express, 'express-rate-limit': require('express-rate-limit'), helmet: require('helmet'), '../config': { appConfig: f.config }
     });
