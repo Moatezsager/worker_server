@@ -303,6 +303,17 @@ test('Web app_config extraction rules override defaults, preserve removals and u
   ] }, 'fixture');
   assert.equal(config.appConfig.terms.length, 1); assert.equal(s.extractRatesFromText('INV 10')[0].value, 0.1);
 });
+test('Worker settings save only the authoritative app_config, never a missing currency_terms mirror', async () => {
+  const f = fixture(), writes = [];
+  const config = f.load('server/config.ts', {
+    '../telegramClient': {}, './db': { db: noopDb, supabaseKey: 'fixture', supabase: fakeSupabase(q => {
+      assert.equal(q.op, 'upsert'); writes.push(q.table); return { error: null };
+    }) }
+  });
+  assert.equal(await config.saveConfigToSupabase(f.config), true);
+  assert.deepEqual(writes, ['app_config']);
+});
+
 test('Local extraction cache preserves configured removals across a Worker restart', async () => {
   const f = fixture(), sqlite = new Database(':memory:');
   sqlite.exec('CREATE TABLE server_config(key TEXT PRIMARY KEY, value TEXT); CREATE TABLE currency_terms(id TEXT PRIMARY KEY, name TEXT, regex TEXT, min REAL, max REAL, is_inverse INTEGER, flag TEXT, is_active INTEGER, updated_at TEXT);');

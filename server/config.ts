@@ -357,23 +357,6 @@ export async function saveConfigToSupabase(newConfig: AppConfig) {
       console.error("Error saving config to Supabase:", error);
     }
 
-    // Also upsert into currency_terms table in Supabase if it exists
-    try {
-      await supabase.from('currency_terms').upsert(
-        newConfig.terms.map(t => ({
-          id: t.id,
-          name: t.name,
-          regex: t.regex,
-          min: t.min,
-          max: t.max,
-          is_inverse: t.isInverse ? 1 : 0,
-          flag: t.flag
-        }))
-      );
-    } catch (e) {
-      // Ignored if table schema is slightly different or table does not exist
-    }
-
     return !error;
   } catch (err) {
     console.error("Failed to save config to Supabase", err);
