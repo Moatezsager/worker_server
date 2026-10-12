@@ -199,13 +199,13 @@ export function isLibyanHoliday(dateStr: string, dayIndex: number): boolean {
 }
 
 // Fetch official rates from Central Bank of Libya website with timeout, retry, and exponential backoff
-export async function fetchFromCBL(maxRetries: number = 3): Promise<{ cblDate: string, rates: RateMap } | null> {
+export async function fetchFromCBL(maxRetries: number = 3, isManualAdmin = false, force = false): Promise<{ cblDate: string, rates: RateMap } | null> {
   let attempt = 0;
   console.log(`[CBL] ${CBL_STATUS.STARTED}: Initiating HTTP fetch from Central Bank of Libya website (maxRetries=${maxRetries})...`);
   
   while (attempt < maxRetries) {
     const status = getCblStatusInfo();
-    if (!status.enabled || !status.isInActiveWindow || status.isTodayFetched) return null;
+    if ((!status.enabled && !isManualAdmin && !force) || !status.isInActiveWindow || status.isTodayFetched) return null;
     const remainingMs = (11 - status.currentLibyaHour) * 3600000 - Number(status.currentLibyaTime.slice(3)) * 60000 - Date.now() % 60000;
     attempt++;
     const startTime = Date.now();
@@ -263,7 +263,10 @@ export async function fetchFromCBL(maxRetries: number = 3): Promise<{ cblDate: s
  */
 function normalizeDateString(rawDate: string): string | null {
   if (!rawDate) return null;
-  const clean = rawDate.trim();
+  // Normalize Eastern Arabic numerals (٠-٩) to standard ASCII digits (0-9)
+  const clean = rawDate
+    .replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d).toString())
+    .trim();
   
   // Format 1: YYYY-MM-DD or YYYY/MM/DD
   const isoMatch = clean.match(/\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b/);
@@ -341,7 +344,13 @@ export function parseCBLHtml(html: string): { cblDate: string, rates: RateMap } 
     if (tds && tds.length >= 6) {
       // In CBL table, column index 0 is strictly the bulletin date cell for that currency
       const dateCellHtml = tds[0].replace(/<[^>]+>/g, '').trim();
-      const rowDate = normalizeDateString(dateCellHtml);
+      let rowDate = normalizeDateString(dateCellHtml);
+      if (!rowDate) {
+        for (const td of tds) {
+          const d = normalizeDateString(td.replace(/<[^>]+>/g, ''));
+          if (d) { rowDate = d; break; }
+        }
+      }
       
       // Associate date with the currency row (prefer date from USD row or first valid row date in the rates table)
       if (rowDate && !cblDateStr) {
@@ -369,8 +378,13 @@ export function parseCBLHtml(html: string): { cblDate: string, rates: RateMap } 
 
       if (currencyId) {
         // Index 4 is strictly the 'Selling' (بيع) column on the CBL website
-        const sellHtml = tds[4];
-        const match = sellHtml.match(/[\d.]+/);
+        let sellHtml = tds[4];
+        const sellCell = tds.find(td => td.includes("بيع"));
+        if (sellCell) sellHtml = sellCell;
+        const normalizedSell = sellHtml
+          .replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d).toString())
+          .replace(/,/g, '.');
+        const match = normalizedSell.match(/[\d.]+/);
         if (match) {
           let val = parseFloat(match[0]);
           if (!isNaN(val) && val > 0 && val < 30) {
@@ -455,7 +469,7 @@ async function fetchOfficialRatesJob(force: boolean, isManualAdmin: boolean): Pr
   console.log(`[CBL] Libya today date = ${currentLibyaDate}, Hour = ${currentLibyaHour}:00 (lastOfficialFetchDate = '${lastOfficialFetchDate || 'none'}')`);
 
   // All callers, including manual jobs, obey the owner's daily collection window.
-  if (!isCblFetchEnabled) {
+  if (!isCblFetchEnabled && !isManualAdmin && !force) {
     console.log("[CBL] Skipping fetch. CBL auto-fetch function is disabled in Admin settings.");
     return false;
   }
@@ -476,7 +490,7 @@ async function fetchOfficialRatesJob(force: boolean, isManualAdmin: boolean): Pr
   }
 
   // 1. FETCH from CBL website (Sequential Await)
-  const cblResult = await fetchFromCBL();
+  const cblResult = await fetchFromCBL(3, isManualAdmin, force);
   if (!cblResult) {
     console.warn(`[CBL] ${CBL_STATUS.FAILED}: HTTP fetch or parsing failed.`);
     return false;

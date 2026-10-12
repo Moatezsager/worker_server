@@ -292,7 +292,7 @@ dashboardRouter.post("/api/dashboard/trigger", async (req: Request, res: Respons
         const result = await runJobSafely(
           "official_rates_scraper",
           "جلب وتحديث أسعار مصرف ليبيا المركزي الرسمي (يدوي من اللوحة)",
-          async () => await fetchOfficialRates()
+          async () => await fetchOfficialRates(true, true)
         );
         return res.json({ success: true, message: "تم تشغيل جلب المصرف المركزي", result });
       }
@@ -312,7 +312,7 @@ dashboardRouter.post("/api/dashboard/trigger", async (req: Request, res: Respons
           "تحديث شامل ومزامنة الأسعار مع سوبابيس (يدوي من اللوحة)",
           async () => {
             await fetchParallelRatesFromTelegram();
-            await fetchOfficialRates();
+            await fetchOfficialRates(true, true);
             return true;
           }
         );
