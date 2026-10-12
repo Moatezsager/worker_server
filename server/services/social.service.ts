@@ -3,7 +3,7 @@ import { appConfig, telegramManager, setTelegramManager } from '../config';
 import { rates } from '../state';
 import { db, supabase, supabaseKey } from '../db';
 import { addBroadcastLog } from './broadcastLog.service';
-import { delay, getPublicAppUrl, getLibyaTimeInfo } from '../utils/helpers';
+import { delay, getPublicAppUrl, getLibyaTimeInfo, getTelegramShareUrl } from '../utils/helpers';
 
 interface FacebookApiResponse {
   error?: {
@@ -329,8 +329,9 @@ export async function broadcastToSocialMedia(message: string, isTest: boolean = 
       let lastErrMessage = "";
       const maxRetries = isTest ? 1 : 2;
 
-      // تجهيز رسالة تيليجرام: الحفاظ على الرابط المختصر https://tinyurl.com/2j7667u2
-      let tgMessage = message;
+      // One fresh website URL per publication; immediate retries reuse it.
+      const shareUrl = getTelegramShareUrl();
+      const tgMessage = message.replace(/https:\/\/tinyurl\.com\/2j7667u2|https:\/\/dollar-price-qp14\.onrender\.com(?:\/[^\s<>"')\]]*)?/g, () => shareUrl);
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
