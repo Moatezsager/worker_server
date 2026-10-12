@@ -86,7 +86,11 @@ export async function loadCblStateFromSupabase(): Promise<void> {
         .select('value')
         .eq('key', 'last_official_fetch_date')
         .single();
-      if (error && error.code !== 'PGRST116') throw error;
+      const settingsTableMissing = error?.code === 'PGRST205' || error?.code === '42P01';
+      if (error && error.code !== 'PGRST116' && !settingsTableMissing) throw error;
+      if (settingsTableMissing) {
+        console.warn('[Official] Optional server_config table unavailable; using saved official rows and local CBL settings.');
+      }
       if (data?.value && data.value > lastOfficialFetchDate) {
         lastOfficialFetchDate = data.value;
         console.log(`[Official] Loaded lastOfficialFetchDate from Supabase server_config: ${data.value}`);
@@ -120,7 +124,7 @@ export async function loadCblStateFromSupabase(): Promise<void> {
         .select('value')
         .eq('key', 'cbl_fetch_enabled')
         .single();
-      if (enabledError && enabledError.code !== 'PGRST116') throw enabledError;
+      if (enabledError && !['PGRST116', 'PGRST205', '42P01'].includes(enabledError.code)) throw enabledError;
       if (enabledData?.value !== undefined) {
         isCblFetchEnabled = enabledData.value === 'true';
         console.log(`[Official] Loaded isCblFetchEnabled from Supabase: ${isCblFetchEnabled}`);

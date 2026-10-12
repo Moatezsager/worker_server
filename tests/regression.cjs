@@ -227,6 +227,35 @@ test('CBL cannot re-fetch when persisted daily state is temporarily unreadable',
   });
   assert.equal(await s.fetchOfficialRates(), false); assert.equal(fetches, 0);
 });
+test('Missing optional server_config never blocks CBL; saved official rows still prevent daily duplicates', async () => {
+  for (const code of ['PGRST205', '42P01']) {
+    for (const manual of [false, true]) {
+      for (const savedToday of [false, true]) {
+        const f = fixture(); f.advance(-3 * 3600000);
+        let fetches = 0, saves = 0;
+        const s = scraper(f, { saveToSupabase: async () => { saves++; return true; }, saveWorkerStateToSupabase: async () => {} }, {},
+          async () => { fetches++; return { ok: true, text: async () => cblHtml('2026-10-12') }; }, {
+            db: noopDb, supabase: fakeSupabase(q => q.table === 'official_rates'
+              ? { data: [{ recorded_at: (savedToday ? '2026-10-12' : '2026-10-11') + 'T07:00:00Z' }], error: null }
+              : { data: null, error: { code, message: 'Optional table missing' } })
+          });
+        assert.equal(await s.fetchOfficialRates(manual, manual), !savedToday);
+        assert.equal(fetches, savedToday ? 0 : 1); assert.equal(saves, savedToday ? 0 : 1);
+        await s.fetchOfficialRates(manual, manual);
+        assert.equal(fetches, savedToday ? 0 : 1, 'Saved-row checkpoint prevents a second fetch');
+      }
+    }
+  }
+  const f = fixture(); f.advance(-3 * 3600000);
+  const disabledDb = { ...noopDb, prepare: () => ({ get: key => key === 'cbl_fetch_enabled' ? { value: 'false' } : undefined }) };
+  const s = scraper(f, {}, {}, async () => { throw new Error('Disabled CBL must not fetch'); }, {
+    db: disabledDb, supabase: fakeSupabase(q => q.table === 'official_rates'
+      ? { data: [], error: null } : { data: null, error: { code: 'PGRST205' } })
+  });
+  await s.loadCblStateFromSupabase();
+  assert.equal(s.getCblStatusInfo().enabled, false); assert.equal(await s.fetchOfficialRates(), false);
+});
+
 test('Saved official prices use actual database save time', async () => {
   const f = fixture(); f.advance(-3 * 3600000); let saved;
   const db = dbService(f, q => { if (q.table === 'official_rates' && q.op === 'insert') saved = q.args.insert[0][0]; return { data: [], error: null }; });
