@@ -26,8 +26,9 @@ import {
   isQuietHoursActive
 } from "../services/social.service";
 
-import { activeClient, initializeTelegram } from "../../telegramClient";
-import { whatsappManager } from "../services/whatsapp.service";
+import { activeClient, initializeTelegram, disconnectTelegram } from "../../telegramClient";
+import { whatsappManager, isAutomaticWhatsAppSource } from "../services/whatsapp.service";
+import { getTelegramCredentials, saveTelegramSession } from '../services/telegramSession.service';
 import { addLog, getRecentLogs, clearLogs } from "../utils/logger";
 import { renderDashboardHtml, renderLoginHtml } from "../views/dashboard.html";
 import { getRecentIngestedRecords } from "../services/ingestion.service";
@@ -694,13 +695,12 @@ dashboardRouter.post("/api/dashboard/broadcast/settings/save", async (req: Reque
 dashboardRouter.get("/api/dashboard/sources", async (req: Request, res: Response) => {
   try {
     const telegramChannels = appConfig.channels || [];
-    const whatsappSources = appConfig.whatsappSources || [];
     const reachableChats = await whatsappManager.getReachableChats().catch(() => []);
     
     res.json({
       success: true,
       telegramChannels,
-      whatsappSources,
+      whatsappSources: whatsappManager.getSources(),
       whatsappStatus: whatsappManager.getStatus().status,
       whatsappReachableChats: reachableChats
     });
@@ -792,36 +792,11 @@ dashboardRouter.post("/api/dashboard/sources/telegram/delete", async (req: Reque
 dashboardRouter.post("/api/dashboard/sources/whatsapp/refresh", async (req: Request, res: Response) => {
   try {
     const chats = await whatsappManager.getReachableChats();
-    if (!appConfig.whatsappSources) {
-      appConfig.whatsappSources = [];
-    }
-
-    let addedCount = 0;
-    for (const chat of chats) {
-      const existing = appConfig.whatsappSources.find(s => s.jid === chat.id);
-      if (!existing) {
-        appConfig.whatsappSources.push({
-          jid: chat.id,
-          name: chat.name,
-          enabled: true,
-          type: chat.type
-        });
-        addedCount++;
-      } else {
-        existing.name = chat.name || existing.name;
-        existing.type = chat.type || existing.type;
-      }
-    }
-
-    if (addedCount > 0 || chats.length > 0) {
-      addLog("info", "إدارة المصادر", `تم اكتشاف ومزامنة ${chats.length} مجموعة/قناة من حساب واتساب`);
-      await saveConfigToSupabase(appConfig);
-    }
 
     res.json({
       success: true,
       message: `تم جلب ومزامنة ${chats.length} مجموعة وقناة من حساب واتساب المنضم إليها`,
-      whatsappSources: appConfig.whatsappSources,
+      whatsappSources: whatsappManager.getSources(),
       chats
     });
   } catch (err: any) {
@@ -831,8 +806,16 @@ dashboardRouter.post("/api/dashboard/sources/whatsapp/refresh", async (req: Requ
 
 dashboardRouter.post("/api/dashboard/sources/whatsapp/toggle", async (req: Request, res: Response) => {
   try {
-    const { jid, enabled } = req.body || {};
-    if (!jid) return res.status(400).json({ success: false, error: "معرف المصدر مفقود" });
+    const { jid: rawJid, enabled } = req.body || {};
+    const jid = typeof rawJid === 'string' ? rawJid.trim() : '';
+    if (!jid || typeof enabled !== 'boolean') {
+      return res.status(400).json({ success: false, error: 'معرف المصدر وحالة التفعيل غير صالحين.' });
+    }
+    if (isAutomaticWhatsAppSource(jid)) {
+      if (!enabled) return res.status(409).json({ success: false, error: 'القنوات والمجموعات مفعّلة تلقائيًا. استخدم زر إيقاف استخراج واتساب لإيقاف المعالجة.' });
+      const sources = whatsappManager.getSources();
+      return res.json({ success: true, item: sources.find(source => source.jid === jid) || { jid, name: jid, enabled: true }, whatsappSources: sources });
+    }
 
     if (!appConfig.whatsappSources) appConfig.whatsappSources = [];
     let item = appConfig.whatsappSources.find(s => s.jid === jid);
@@ -846,7 +829,7 @@ dashboardRouter.post("/api/dashboard/sources/whatsapp/toggle", async (req: Reque
     addLog("info", "إدارة المصادر", `تم ${item.enabled ? 'تفعيل' : 'تعطيل'} استخراج الأسعار من مصدر واتساب: ${item.name}`);
     await saveConfigToSupabase(appConfig);
 
-    res.json({ success: true, item, whatsappSources: appConfig.whatsappSources });
+    res.json({ success: true, item, whatsappSources: whatsappManager.getSources() });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err?.message || String(err) });
   }
@@ -873,7 +856,7 @@ dashboardRouter.post("/api/dashboard/sources/whatsapp/add", async (req: Request,
     addLog("info", "إدارة المصادر", `تم إضافة مصدر واتساب جديد يدوياً: ${name}`);
     await saveConfigToSupabase(appConfig);
 
-    res.json({ success: true, message: "تم إضافة مصدر واتساب بنجاح", whatsappSources: appConfig.whatsappSources });
+    res.json({ success: true, message: "تم إضافة مصدر واتساب بنجاح", whatsappSources: whatsappManager.getSources() });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err?.message || String(err) });
   }
@@ -881,8 +864,12 @@ dashboardRouter.post("/api/dashboard/sources/whatsapp/add", async (req: Request,
 
 dashboardRouter.post("/api/dashboard/sources/whatsapp/delete", async (req: Request, res: Response) => {
   try {
-    const { jid } = req.body || {};
+    const rawJid = req.body?.jid;
+    const jid = typeof rawJid === 'string' ? rawJid.trim() : '';
     if (!jid) return res.status(400).json({ success: false, error: "معرف المصدر مفقود" });
+    if (isAutomaticWhatsAppSource(jid)) {
+      return res.status(409).json({ success: false, error: 'مصادر القنوات والمجموعات تتبع حساب واتساب تلقائيًا ولا تتطلب قائمة يدوية.' });
+    }
 
     if (appConfig.whatsappSources) {
       appConfig.whatsappSources = appConfig.whatsappSources.filter(s => s.jid !== jid);
@@ -890,7 +877,7 @@ dashboardRouter.post("/api/dashboard/sources/whatsapp/delete", async (req: Reque
       await saveConfigToSupabase(appConfig);
     }
 
-    res.json({ success: true, message: "تم حذف المصدر بنجاح", whatsappSources: appConfig.whatsappSources });
+    res.json({ success: true, message: "تم حذف المصدر بنجاح", whatsappSources: whatsappManager.getSources() });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err?.message || String(err) });
   }
@@ -938,23 +925,27 @@ import {
 // Save Telegram Session or Token
 dashboardRouter.post("/api/dashboard/accounts/telegram/save", async (req: Request, res: Response) => {
   const { sessionString, botToken, postChannel } = req.body || {};
-
-  if (sessionString !== undefined && typeof sessionString === "string") {
-    appConfig.telegramSessionString = sessionString.trim();
-    process.env.TELEGRAM_SESSION = sessionString.trim();
+  if ([sessionString, botToken, postChannel].some(value => value !== undefined && typeof value !== 'string')) {
+    return res.status(400).json({ success: false, error: 'قيم إعدادات تيليجرام يجب أن تكون نصية.' });
   }
-  if (botToken !== undefined && typeof botToken === "string") {
-    appConfig.telegramBotToken = botToken.trim();
-  }
-  if (postChannel !== undefined && typeof postChannel === "string") {
-    appConfig.telegramPostChannel = postChannel.trim();
-  }
-
-  addLog("info", "حسابات", "تم حفظ وتحديث إعدادات جلسة تيليجرام");
-  await saveConfigToSupabase(appConfig);
-
-  // Trigger reconnect
   try {
+    if (sessionString?.trim()) {
+      const { apiId, apiHash } = getTelegramCredentials();
+      await saveTelegramSession(apiId, apiHash, sessionString);
+    }
+    if (botToken !== undefined && typeof botToken === "string") {
+      appConfig.telegramBotToken = botToken.trim();
+    }
+    if (postChannel !== undefined && typeof postChannel === "string") {
+      appConfig.telegramPostChannel = postChannel.trim();
+    }
+
+    addLog("info", "حسابات", "تم حفظ وتحديث إعدادات جلسة تيليجرام");
+    if (!await saveConfigToSupabase(appConfig)) {
+      return res.status(503).json({ success: false, error: 'تعذر حفظ إعدادات تيليجرام. أعد المحاولة قبل إعادة تشغيل السيرفر.' });
+    }
+
+    // Trigger reconnect
     await initializeTelegram();
     return res.json({
       success: true,
@@ -962,10 +953,9 @@ dashboardRouter.post("/api/dashboard/accounts/telegram/save", async (req: Reques
       connected: !!(activeClient && activeClient.connected)
     });
   } catch (err: any) {
-    return res.json({
-      success: true,
-      message: `تم حفظ الإعدادات (جاري الاتصال: ${err?.message || err})`,
-      connected: false
+    return res.status(503).json({
+      success: false,
+      error: err?.message || 'تعذر حفظ جلسة تيليجرام الخاصة.'
     });
   }
 });
@@ -1051,9 +1041,7 @@ dashboardRouter.post("/api/dashboard/accounts/telegram/reconnect", async (req: R
 dashboardRouter.post("/api/dashboard/accounts/telegram/disconnect", async (req: Request, res: Response) => {
   addLog("info", "حسابات", "قطع اتصال جلسة تيليجرام يدوياً");
   try {
-    if (activeClient && activeClient.connected) {
-      await activeClient.disconnect();
-    }
+    await disconnectTelegram();
     return res.json({ success: true, message: "تم قطع اتصال تيليجرام" });
   } catch (err: any) {
     return res.status(500).json({ success: false, error: err?.message || String(err) });

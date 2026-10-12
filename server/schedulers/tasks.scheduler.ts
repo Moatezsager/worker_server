@@ -229,15 +229,9 @@ export function startMonitoring() {
       }
 
       // 2. WhatsApp Stealth Reconnect
-      if (hasSavedSession()) {
-        const waStatus = whatsappManager.getStatus();
-        if (waStatus.status === 'disconnected') {
-          console.log("[Reconnector] WhatsApp session saved and disconnected, attempting reconnect...");
-          await whatsappManager.initClient();
-        }
-      }
+      if (hasSavedSession()) await whatsappManager.reconnectSavedSession();
     }, { timeoutMs: 30000 });
-  }, 15 * 60 * 1000); // 15 mins
+  }, 60 * 1000); // Memory-only checks while healthy; no price/database polling.
 
   activeIntervals.push(interval);
 }

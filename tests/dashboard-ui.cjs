@@ -25,12 +25,27 @@ async function main() {
         if (url.pathname.endsWith('/ingested-messages')) return route.fulfill({ json: { success: true, messages: [{
           source: attack, timestamp: new f.Clock().toISOString(), rawText: attack, status: 'ignored' }] } });
         if (url.pathname.endsWith('/stats')) return route.fulfill({ json: state });
+        if (url.pathname.endsWith('/sources')) return route.fulfill({ json: { success: true, whatsappSources: [
+          { jid: 'dealer@g.us', name: 'Dealer ' + attack, enabled: false, type: 'group' },
+          { jid: 'prices@newsletter', name: 'Channel', enabled: false, type: 'channel' },
+          { jid: 'private@s.whatsapp.net', name: 'Private', enabled: false, type: 'chat' }
+        ], whatsappReachableChats: [{ id: 'discovered@g.us', name: 'Discovered', type: 'group' }] } });
         return route.fulfill({ json: { success: true, queue, messages: [], channels: [], data: {} } });
       });
       await page.goto('http://worker.fixture/dashboard');
       await page.waitForFunction(() => typeof renderQueueUI === 'function');
       await page.evaluate(async () => { await fetchIngestedMessages(); });
       assert.equal(await page.evaluate(() => window.__fixtureXss || window.__fixtureInitial || false), false);
+      await page.locator('#tab-btn-sources').click();
+      await page.waitForFunction(() => document.querySelectorAll('#wa-sources-list-container input').length === 4);
+      const autoSources = page.locator('#wa-sources-list-container input:disabled');
+      assert.equal(await autoSources.count(), 3);
+      assert.equal(await page.locator('#wa-sources-list-container input:disabled:checked').count(), 3);
+      const manual = page.locator('#wa-sources-list-container input:not(:disabled)');
+      assert.equal(await manual.count(), 1); assert.equal(await manual.isChecked(), false);
+      assert.equal(await page.locator('#wa-sources-list-container button').count(), 1, 'Only manually configured sources offer per-source deletion');
+      assert.equal(await page.locator('#wa-sources-list-container img').count(), 0);
+      assert.ok((await autoSources.first().getAttribute('aria-label')).includes('Dealer'));
       await page.evaluate(code => {
         const button = [...document.querySelectorAll('.rate-btn-edit')].find(b => b.getAttribute('onclick').includes(code));
         button.click();
@@ -53,7 +68,7 @@ async function main() {
       }
       assert.ok(dimensions.scroll <= dimensions.client + 1, 'Page overflow at ' + width + ': ' + JSON.stringify(dimensions));
       await page.close();
-      console.log('PASS dashboard ' + width + 'px: safe source text/initial JSON, quoted edit handler, per-platform queue status, no page overflow');
+      console.log('PASS dashboard ' + width + 'px: safe source text, automatic group/channel controls, quoted edit handler, queue status, no page overflow');
     }
     const login = view.renderLoginHtml({ clientIp: attack });
     assert.ok(!login.includes('IP: ' + attack));

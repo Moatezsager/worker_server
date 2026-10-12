@@ -2340,7 +2340,8 @@ export function renderDashboardHtml(initialState?: any): string {
       }
 
       list.innerHTML = allItems.map(function(item) {
-        var isEnabled = item.enabled === true;
+        var isAutomatic = typeof item.jid === 'string' && (item.jid.endsWith('@newsletter') || item.jid.endsWith('@g.us'));
+        var isEnabled = isAutomatic || item.enabled === true;
         var icon = item.type === 'channel' ? '📢' : item.type === 'group' ? '👥' : '💬';
         return '<div style="display:flex; justify-content:space-between; align-items:center; background:#1e293b; border:1px solid #334155; border-radius:6px; padding:8px 12px; gap:8px;">' +
           '<div style="display:flex; align-items:center; gap:8px; flex:1; min-width:0;">' +
@@ -2351,11 +2352,12 @@ export function renderDashboardHtml(initialState?: any): string {
             '</div>' +
           '</div>' +
           '<div style="display:flex; align-items:center; gap:8px;">' +
-            '<label class="switch" style="transform:scale(0.85);" title="' + (isEnabled ? 'تعطيل الاستخراج' : 'تفعيل الاستخراج') + '">' +
-              '<input type="checkbox" onchange="toggleWhatsAppSource(' + jsArg(item.jid) + ', this.checked)" ' + (isEnabled ? 'checked' : '') + '>' +
+            (isAutomatic ? '<span style="font-size:11px; color:#a7f3d0;">تلقائي</span>' : '') +
+            '<label class="switch" style="transform:scale(0.85);" title="' + (isAutomatic ? 'مفعّل تلقائيًا' : isEnabled ? 'تعطيل الاستخراج' : 'تفعيل الاستخراج') + '">' +
+              '<input type="checkbox" aria-label="' + escapeHtml(item.name || item.jid) + '" onchange="toggleWhatsAppSource(' + jsArg(item.jid) + ', this.checked)" ' + (isEnabled ? 'checked' : '') + (isAutomatic ? ' disabled' : '') + '>' +
               '<span class="slider"></span>' +
             '</label>' +
-            '<button class="btn btn-danger btn-sm" onclick="deleteWhatsAppSource(' + jsArg(item.jid) + ')" style="padding:2px 6px; font-size:10px;" title="حذف المصدر">🗑️</button>' +
+            (isAutomatic ? '' : '<button class="btn btn-danger btn-sm" onclick="deleteWhatsAppSource(' + jsArg(item.jid) + ')" style="padding:2px 6px; font-size:10px;" title="حذف المصدر">🗑️</button>') +
           '</div>' +
         '</div>';
       }).join('');

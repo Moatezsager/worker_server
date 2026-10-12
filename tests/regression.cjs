@@ -33,6 +33,7 @@ function socialFixture(f, options = {}) {
     '../../telegramClient': { getTelegramManager: () => ({
       sendMessage: async () => { counts.telegram++; return delayed ? await delayed : !failTG; }, lastError: 'Fixture TG failure'
     }) },
+    './telegramSession.service': { getTelegramCredentials: () => ({ apiId: 1, apiHash: 'fixture', sessionString: 'fixture' }) },
     '../config': { appConfig: f.config, setTelegramManager() {} }, '../state': { rates: f.rates },
     '../db': { db, supabase: null, supabaseKey: '' }, './broadcastLog.service': { addBroadcastLog() {} },
     '../utils/helpers': { ...f.helper, delay: async () => {} }
@@ -128,23 +129,119 @@ test('Official bulletin only completes when all enabled platforms deliver; Faceb
   const fb = socialFixture(another); fb.failFB(false);
   assert.equal(await fb.social.broadcastOfficialRates(false), true); assert.equal(fb.counts.telegram, 0);
 });
-test('WhatsApp discovery does not process disabled or unlisted chats, global toggle is unified', async () => {
+test('WhatsApp channels and groups are automatic, private chats stay opt-in and the global stop is respected', async () => {
+  const { normalizeMessageContent } = await import('@whiskeysockets/baileys');
   const f = fixture(); let calls = 0, enabled = true;
+  f.config.whatsappSources.push({ jid: 'old@newsletter', enabled: false }, { jid: 'enabled@s.whatsapp.net', enabled: true });
   const source = { get isWhatsAppFetchEnabled() { return enabled; },
     setWhatsAppFetchEnabled: v => { enabled = v; },
     processWhatsAppMessage: async () => { calls++; return { processed: true, extractedCount: 1 }; } };
   const wa = f.load('server/services/whatsapp.service.ts', {
-    '@whiskeysockets/baileys': {}, qrcode: {}, pino: () => ({}), fs: { existsSync: () => true },
+    './accountLease.service': { ensureAccountLease: async () => true, ownsAccountLease: () => true },
+    '@whiskeysockets/baileys': { normalizeMessageContent }, qrcode: {}, pino: () => ({}), fs: { existsSync: () => true },
     '../db': { db: noopDb, supabase: null }, '../config': { appConfig: f.config },
     './scraper.service': source, './db.service': { logErrorArabic: async () => {} }
   });
-  for (const jid of ['allowed@g.us', 'disabled@g.us', 'unknown@s.whatsapp.net']) {
+  for (const jid of ['allowed@g.us', 'disabled@g.us', 'new@g.us', 'old@newsletter', 'new@newsletter',
+    'enabled@s.whatsapp.net', 'unknown@s.whatsapp.net', 'spoof@g.us.invalid']) {
     await wa.whatsappManager.handleIncomingMessage({ key: { remoteJid: jid, fromMe: false },
       message: { conversation: 'USD 9.80' }, messageTimestamp: f.now() / 1000 });
   }
-  assert.equal(calls, 1);
+  assert.equal(calls, 6);
+  const sources = wa.whatsappManager.getSources();
+  assert.equal(sources.find(source => source.jid === 'disabled@g.us').enabled, true);
+  assert.equal(sources.find(source => source.jid === 'new@newsletter').enabled, true);
+  assert.equal(sources.find(source => source.jid === 'unknown@s.whatsapp.net').enabled, false);
+  assert.equal(f.config.whatsappSources.find(source => source.jid === 'disabled@g.us').enabled, false, 'Discovery must not rewrite shared settings');
+  assert.equal(wa.isAutomaticWhatsAppSource('spoof@g.us.invalid'), false);
   wa.whatsappManager.setAutoProcess(false); assert.equal(wa.whatsappManager.getStatus().autoProcessEnabled, false);
+  await wa.whatsappManager.handleIncomingMessage({ key: { remoteJid: 'new@newsletter' },
+    message: { conversation: 'USD 9.80' }, messageTimestamp: f.now() / 1000 });
+  assert.equal(calls, 6);
 });
+
+test('Automatic WhatsApp messages use saved extraction rules, normalize captions and preserve real source timestamps', async () => {
+  const { normalizeMessageContent } = await import('@whiskeysockets/baileys');
+  const f = fixture(), writes = []; let ruleReads = 0;
+  f.config.terms = [{ id: 'USD', name: 'Custom USD', regex: 'CASH\\s+(\\d+\\.\\d+)', min: 9.7, max: 9.9, isInverse: false }];
+  const source = scraper(f, { commitParallelRates: async entries => { writes.push(...entries); return []; }, logErrorArabic: async () => {} },
+    {}, undefined, undefined, { appConfig: f.config, refreshExtractionTerms: async () => { ruleReads++; } });
+  const wa = f.load('server/services/whatsapp.service.ts', {
+    './accountLease.service': { ensureAccountLease: async () => true, ownsAccountLease: () => true },
+    '@whiskeysockets/baileys': { normalizeMessageContent }, qrcode: {}, pino: () => ({}), fs: { existsSync: () => true },
+    '../db': { db: noopDb, supabase: null }, '../config': { appConfig: f.config },
+    './scraper.service': source, './db.service': { logErrorArabic: async () => {} }
+  });
+  const message = (jid, text, timestamp = f.now() / 1000) => ({ key: { remoteJid: jid }, message: { conversation: text }, messageTimestamp: timestamp });
+  await wa.whatsappManager.handleIncomingMessage(message('new@g.us', 'CASH 9.80', (f.now() - 1000) / 1000));
+  await wa.whatsappManager.handleIncomingMessage({ key: { remoteJid: 'new@newsletter' },
+    message: { ephemeralMessage: { message: { imageMessage: { caption: 'CASH 9.85' } } } },
+    messageTimestamp: String(f.now() / 1000) });
+  assert.deepEqual(writes.map(entry => [entry.code, entry.value, entry.time]), [['USD', 9.8, f.now() - 1000], ['USD', 9.85, f.now()]]);
+  await wa.whatsappManager.handleIncomingMessage(message('new@g.us', 'CASH 9.60'));
+  await wa.whatsappManager.handleIncomingMessage(message('new@newsletter', 'نشرة اليوم دون أسعار'));
+  await wa.whatsappManager.handleIncomingMessage(message('old@newsletter', 'CASH 9.80', (f.now() - 86400000) / 1000));
+  await wa.whatsappManager.handleIncomingMessage(message('future@newsletter', 'CASH 9.80', f.now() / 1000 + 301));
+  await wa.whatsappManager.handleIncomingMessage(message('invalid@newsletter', 'CASH 9.80', 'not-a-date'));
+  const noTime = message('missing@newsletter', 'CASH 9.80'); delete noTime.messageTimestamp;
+  await wa.whatsappManager.handleIncomingMessage(noTime);
+  await wa.whatsappManager.handleIncomingMessage(message('private@s.whatsapp.net', 'CASH 9.80'));
+  await wa.whatsappManager.handleIncomingMessage({ ...message('new@g.us', 'CASH 9.80'), key: { remoteJid: 'new@g.us', fromMe: true } });
+  assert.equal(writes.length, 2, 'Out-of-range, non-price, stale, future, undated and private messages must not save a quote');
+  assert.equal(ruleReads, 4, 'Invalid/stale/private messages must not fetch extraction settings');
+  assert.equal(wa.whatsappManager.getStatus().ratesExtractedCount, 2);
+});
+test('WhatsApp SDK events discover auto sources at connection/restart without processing history or retired socket messages', async () => {
+  const { normalizeMessageContent } = await import('@whiskeysockets/baileys');
+  const f = fixture(), processed = []; let handlers, groupReads = 0, duringProcess;
+  const load = () => f.load('server/services/whatsapp.service.ts', {
+    './accountLease.service': { ensureAccountLease: async () => true, ownsAccountLease: () => true },
+    '@whiskeysockets/baileys': { normalizeMessageContent, DisconnectReason: {},
+      fetchLatestBaileysVersion: async () => ({ version: [2, 3000, 1] }),
+      useMultiFileAuthState: async () => ({ state: { creds: { registered: true }, keys: { set: async () => {} } }, saveCreds: async () => {} }),
+      default: () => {
+        handlers = {};
+        return { ev: { on: (name, fn) => { handlers[name] = fn; } }, end() {},
+          groupFetchAllParticipating: async () => { groupReads++; return { 'joined@g.us': { subject: 'Joined Group', participants: [] } }; } };
+      }
+    }, qrcode: {}, pino: () => ({}),
+    fs: { existsSync: () => true, readFileSync: () => '{"registered":true}', readdirSync: () => [] },
+    '../db': { db: noopDb, supabase: null }, '../config': { appConfig: f.config },
+    './scraper.service': { isWhatsAppFetchEnabled: true, processWhatsAppMessage: async (...args) => { processed.push(args); duringProcess?.(); return { processed: true, extractedCount: 1 }; } },
+    './db.service': { logErrorArabic: async () => {} }
+  });
+  let wa = load(); await wa.whatsappManager.initClient();
+  await handlers['connection.update']({ connection: 'open' });
+  assert.equal(groupReads, 1, 'Group metadata loads once at connection, not for each message');
+  assert.equal(wa.whatsappManager.getSources().find(source => source.jid === 'joined@g.us').enabled, true);
+  const message = jid => ({ key: { remoteJid: jid }, message: { conversation: 'USD 9.80' }, messageTimestamp: f.now() / 1000 });
+  handlers['messaging-history.set']({ chats: [{ id: 'prices@newsletter', name: 'Prices Channel' }, { id: 'private@s.whatsapp.net', name: 'Private' }],
+    messages: [message('prices@newsletter')] });
+  handlers['groups.upsert']([{ id: 'other@g.us', subject: 'Other Group' }]);
+  handlers['chats.update']([{ id: 'prices@newsletter', name: 'Renamed Channel' }]);
+  assert.equal(processed.length, 0, 'History sync discovers sources without replaying historical prices');
+  assert.equal(wa.whatsappManager.getSources().some(source => source.jid === 'private@s.whatsapp.net'), false);
+  await handlers['messages.upsert']({ messages: [
+    { ...message('prices@newsletter'), messageTimestamp: String(f.now() / 1000), pushName: 'Publisher Alias' },
+    { ...message('other@g.us'), messageTimestamp: { toNumber: () => f.now() / 1000 } }, message('private@s.whatsapp.net')
+  ] });
+  assert.equal(processed.length, 2); assert.equal(processed[0][0], 'Renamed Channel');
+  assert.equal(processed[1][0], 'Other Group'); assert.equal(groupReads, 1);
+  const retired = handlers; wa.whatsappManager.closeOnly();
+  await retired['messages.upsert']({ messages: [message('prices@newsletter')] });
+  retired['chats.upsert']([{ id: 'late@g.us', name: 'Late Event' }]);
+  assert.equal(processed.length, 2);
+  assert.equal(wa.whatsappManager.getSources().some(source => source.jid === 'late@g.us'), false);
+  wa = load(); await wa.whatsappManager.initClient(); await handlers['connection.update']({ connection: 'open' });
+  await handlers['messages.upsert']({ messages: [message('prices@newsletter')] });
+  assert.equal(processed.length, 3, 'An unseen channel still extracts after an ephemeral restart without a saved manual selection');
+  assert.equal(f.config.whatsappSources.some(source => source.jid === 'prices@newsletter'), false);
+  duringProcess = () => wa.whatsappManager.closeOnly();
+  await handlers['messages.upsert']({ messages: [message('prices@newsletter'), message('other@g.us')] });
+  assert.equal(processed.length, 4, 'Closing during a batch must stop its remaining messages');
+  wa.whatsappManager.closeOnly();
+});
+
 test('SQLite ingestion stores real observations without synthetic startup prices', async () => {
   const f = fixture(), sqlite = new Database(':memory:');
   try {
@@ -371,6 +468,7 @@ test('WhatsApp backs up changed session keys privately; never overwrites newer l
     readFileSync: name => files[path.basename(name)], writeFileSync: (name, value) => { files[path.basename(name)] = value; },
     mkdirSync() {}, unlinkSync: name => { delete files[path.basename(name)]; } };
   const wa = f.load('server/services/whatsapp.service.ts', {
+    './accountLease.service': { ensureAccountLease: async () => true, ownsAccountLease: () => true },
     '@whiskeysockets/baileys': {}, qrcode: {}, pino: () => ({}), fs: disk,
     '../db': { db: noopDb, supabaseKey: 'fixture', supabase: fakeSupabase(q => {
       assert.equal(q.table, 'server_config');
@@ -391,6 +489,7 @@ test('WhatsApp backs up changed session keys privately; never overwrites newer l
 test('Invalid cloud session filenames cannot escape the Worker authentication folder', async () => {
   const f = fixture(), path = require('node:path'); let writes = 0;
   const wa = f.load('server/services/whatsapp.service.ts', {
+    './accountLease.service': { ensureAccountLease: async () => true, ownsAccountLease: () => true },
     '@whiskeysockets/baileys': {}, qrcode: {}, pino: () => ({}),
     fs: { existsSync: name => path.basename(name) !== 'creds.json', writeFileSync: () => { writes++; } },
     '../db': { db: noopDb, supabaseKey: 'fixture', supabase: fakeSupabase(() => ({
@@ -407,6 +506,7 @@ test('WhatsApp logout reports cloud cleanup failure, clears local keys and prese
   const disk = { existsSync: name => path.basename(name) === 'whatsapp_auth' || Object.hasOwn(files, path.basename(name)),
     readdirSync: () => Object.keys(files), unlinkSync: name => { delete files[path.basename(name)]; } };
   const mocks = {
+    './accountLease.service': { ensureAccountLease: async () => true, ownsAccountLease: () => true },
     '@whiskeysockets/baileys': {}, qrcode: {}, pino: () => ({}), fs: disk,
     '../db': { db: sqlite, supabaseKey: 'fixture', supabase: fakeSupabase(q => q.op === 'upsert' ?
       { error: { message: 'fixture cloud failure' } } : { data: { value: '{"creds.json":"{}"}' }, error: null }) },
@@ -426,6 +526,7 @@ test('WhatsApp logout reports cloud cleanup failure, clears local keys and prese
 test('Private cloud session restoration never copies keys back into shared application configuration', async () => {
   const f = fixture(), path = require('node:path'), files = {};
   const wa = f.load('server/services/whatsapp.service.ts', {
+    './accountLease.service': { ensureAccountLease: async () => true, ownsAccountLease: () => true },
     '@whiskeysockets/baileys': {}, qrcode: {}, pino: () => ({}),
     fs: { existsSync: name => path.basename(name) === 'whatsapp_auth' || Object.hasOwn(files, path.basename(name)),
       readFileSync: name => files[path.basename(name)],
@@ -440,7 +541,7 @@ test('Private cloud session restoration never copies keys back into shared appli
 });
 test('WhatsApp pairing persists immediately; ephemeral restart restores keys and reconnects without QR', async () => {
   const f = fixture(), path = require('node:path');
-  let files = {}, cloud, uploads = 0, cloudFailure = false, socket, state;
+  let files = {}, cloud, uploads = 0, cloudFailure = false, socket, state, leased = true;
   const timers = new Map(); let nextTimer = 0;
   const disk = {
     existsSync: name => path.basename(name) === 'whatsapp_auth' || Object.hasOwn(files, path.basename(name)),
@@ -450,6 +551,7 @@ test('WhatsApp pairing persists immediately; ephemeral restart restores keys and
     unlinkSync: name => { delete files[path.basename(name)]; }
   };
   const load = () => f.load('server/services/whatsapp.service.ts', {
+    './accountLease.service': { ensureAccountLease: async () => leased, ownsAccountLease: () => leased },
     '@whiskeysockets/baileys': {
       default: options => {
         state = options.auth;
@@ -477,7 +579,8 @@ test('WhatsApp pairing persists immediately; ephemeral restart restores keys and
   });
   let wa = load(); await wa.whatsappManager.initClient();
   assert.equal(state.creds.registered, false);
-  state.creds.registered = true;
+  state.creds.me = { id: 'fixture:1' };
+  state.creds.account = { details: 'QR-paired-account' };
   await socket.emit('creds.update', {});
   assert.equal(uploads, 1, 'pairing must persist without waiting for the debounce');
   await socket.emit('connection.update', { connection: 'open' });
@@ -493,8 +596,13 @@ test('WhatsApp pairing persists immediately; ephemeral restart restores keys and
   wa.whatsappManager.closeOnly();
   assert.equal(nextTimer, beforeClosing, 'shutdown must not schedule reconnect');
   files = { 'creds.json': '{"registered":false}' }; timers.clear();
-  wa = load(); await wa.whatsappManager.initClient();
-  assert.equal(state.creds.registered, true, 'unregistered local credentials must not block cloud restore');
+  const closedSocket = socket;
+  wa = load(); leased = false; await wa.whatsappManager.initClient();
+  assert.equal(socket, closedSocket, 'Standby must not create a WhatsApp socket or QR');
+  assert.equal(wa.whatsappManager.getStatus().status, 'disconnected');
+  leased = true; await wa.whatsappManager.initClient();
+  assert.equal(state.creds.me.id, 'fixture:1', 'QR credentials must restore even without registered=true');
+  assert.equal(state.creds.registered, false);
   assert.equal(JSON.parse(files['session-123@s.whatsapp.net.json']).key, 'latest-key');
   await socket.emit('connection.update', { connection: 'open' });
   assert.equal(wa.whatsappManager.getStatus().status, 'connected');
@@ -515,12 +623,25 @@ test('WhatsApp pairing persists immediately; ephemeral restart restores keys and
   cloudFailure = false; await wa.backupAuthToStorage();
   assert.equal(wa.whatsappManager.getStatus().lastError, null);
   assert.equal(JSON.parse(JSON.parse(cloud)['session-123@s.whatsapp.net.json']).key, 'pending');
+  leased = false;
+  await state.keys.set({ 'session-123@s.whatsapp.net': { key: 'standby-stale' } });
+  const beforeStandby = cloud; await wa.backupAuthToStorage();
+  assert.equal(cloud, beforeStandby, 'A standby shutdown cannot overwrite the active instance checkpoint');
+  leased = true;
+  await socket.emit('connection.update', { connection: 'close', lastDisconnect: { error: { output: { statusCode: 408 } } } });
+  const failedSocket = socket; await wa.whatsappManager.reconnectSavedSession();
+  assert.equal(socket, failedSocket, 'The monitor must respect connection backoff');
+  await wa.whatsappManager.initClient();
+  await socket.emit('connection.update', { connection: 'close', lastDisconnect: { error: { output: { statusCode: 401 } } } });
+  const loggedOut = socket; await wa.whatsappManager.reconnectSavedSession();
+  assert.equal(socket, loggedOut, 'The monitor must not revive a provider-revoked WhatsApp session');
 });
 
 test('WhatsApp cloud outage never starts blank pairing or uploads unregistered credentials', async () => {
   const f = fixture(), path = require('node:path'); let sockets = 0, uploads = 0;
   const files = { 'creds.json': '{"registered":false}' };
   const wa = f.load('server/services/whatsapp.service.ts', {
+    './accountLease.service': { ensureAccountLease: async () => true, ownsAccountLease: () => true },
     '@whiskeysockets/baileys': { default: () => { sockets++; }, useMultiFileAuthState: async () => { throw new Error('Must not pair'); } },
     qrcode: {}, pino: () => ({}), fs: {
       existsSync: name => path.basename(name) === 'whatsapp_auth' || Object.hasOwn(files, path.basename(name)),
@@ -542,6 +663,7 @@ test('WhatsApp logout tombstone overrides leftover files; failed restoration nev
   let tombstone = true, writes = [];
   const files = { 'creds.json': '{"registered":true}' };
   const wa = f.load('server/services/whatsapp.service.ts', {
+    './accountLease.service': { ensureAccountLease: async () => true, ownsAccountLease: () => true },
     '@whiskeysockets/baileys': {}, qrcode: {}, pino: () => ({}), fs: {
       existsSync: name => path.basename(name) === 'whatsapp_auth' || Object.hasOwn(files, path.basename(name)),
       readFileSync: name => files[path.basename(name)],

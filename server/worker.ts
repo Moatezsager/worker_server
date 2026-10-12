@@ -21,7 +21,10 @@ import { loadRecentBroadcastTimestamps, loadBroadcastQueueState, flushBroadcastQ
 import { initStatsIfEmpty } from "./services/reporting.service";
 import { fetchParallelRatesFromTelegram, loadCblStateFromSupabase } from "./services/scraper.service";
 import { whatsappManager, restoreAuthFromStorage, backupAuthToStorage } from "./services/whatsapp.service";
-import { activeClient, initializeTelegram } from "../telegramClient";
+import { activeClient, initializeTelegram, disconnectTelegram } from "../telegramClient";
+import { restoreTelegramSession } from './services/telegramSession.service';
+import { closeTelegramLogin } from './services/telegramAuth.service';
+import { configureAccountLease, stopAccountLease, releaseAccountLease } from './services/accountLease.service';
 import { rates } from "./state";
 import { db } from "./db";
 
@@ -85,6 +88,10 @@ let isShuttingDown = false;
 export const gracefulShutdown = async (signal: string = 'SIGTERM') => {
   if (isShuttingDown) return;
   isShuttingDown = true;
+  setTimeout(() => {
+    console.warn('[Worker] Shutdown deadline reached; preserved cloud sessions will be restored by the next instance.');
+    process.exit(0);
+  }, 25000).unref();
 
   console.log(`\n==========================================`);
   console.log(`🛑 [Worker] Initiating Graceful Shutdown (${signal})...`);
@@ -93,6 +100,7 @@ export const gracefulShutdown = async (signal: string = 'SIGTERM') => {
   // 1. Stop all timers, schedulers and reject any new jobs from starting
   stopBackgroundTasks();
   stopCronSchedulers();
+  stopAccountLease();
 
   // 2. Wait up to 6 seconds for active jobs to finish cleanly
   const runningJobs = getWorkerJobsStatus().filter(j => j.isRunning);
@@ -118,17 +126,12 @@ export const gracefulShutdown = async (signal: string = 'SIGTERM') => {
   }
 
   // 4. Disconnect Telegram client cleanly
-  if (activeClient && activeClient.connected) {
-    try {
-      console.log("[GramJS] Disconnecting Telegram client...");
-      await activeClient.disconnect();
-    } catch (tgErr) {
-      console.warn("[GramJS] Error during Telegram disconnect:", tgErr);
-    }
-  }
-
+  await closeTelegramLogin().catch(() => {});
+  await disconnectTelegram();
+  await backupAuthToStorage();
+  await releaseAccountLease().catch(() => console.warn('[Accounts] Lease release unconfirmed; awaiting expiry.'));
   await Promise.race([
-    Promise.all([flushBroadcastQueueState(), backupAuthToStorage()]),
+    flushBroadcastQueueState(),
     new Promise(resolve => setTimeout(resolve, 5000))
   ]);
   // 5. Close local SQLite database cleanly
@@ -262,9 +265,22 @@ export async function startWorkerServer() {
   // 1. Initial database and configuration loading
   await initializeRatesFromDB();
   await loadConfigFromSupabase();
+  try { await restoreTelegramSession(); }
+  catch { console.warn('[Telegram] Private session could not be restored; inspect account settings.'); }
   await loadBroadcastStateFromStorageAndSupabase();
   await loadCblStateFromSupabase();
   await loadBroadcastQueueState();
+  configureAccountLease(async () => {
+    if (isShuttingDown) return;
+    try { await restoreTelegramSession(true); }
+    catch { console.warn('[Telegram] Private checkpoint reload deferred during account handoff.'); }
+    await initializeTelegram();
+    await whatsappManager.reconnectSavedSession();
+  }, async () => {
+    console.warn('[Accounts] Lease lost: closing account connections without logging out.');
+    whatsappManager.closeOnly();
+    await Promise.all([closeTelegramLogin(), disconnectTelegram()]);
+  });
 
   // 2. Initialize HTTP server for Worker Health / Admin
   const PORT = Number(process.env.PORT) || 3000;

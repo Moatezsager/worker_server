@@ -47,12 +47,13 @@ function fixture() {
 }
 function fakeSupabase(perform) {
   return { from(table) {
-    const query = { table, op: 'select', args: {} };
+    const query = { table, op: 'select', args: {}, filters: {} };
     const chain = {};
-    for (const method of ['select', 'insert', 'upsert', 'delete', 'eq', 'lt', 'in', 'order', 'limit', 'single', 'abortSignal']) {
+    for (const method of ['select', 'insert', 'upsert', 'update', 'delete', 'eq', 'lt', 'in', 'order', 'limit', 'single', 'maybeSingle', 'abortSignal']) {
       chain[method] = (...args) => {
         query.args[method] = args;
-        if (['insert', 'upsert', 'delete'].includes(method)) query.op = method;
+        if (method === 'eq') query.filters[args[0]] = args[1];
+        if (['insert', 'upsert', 'update', 'delete'].includes(method)) query.op = method;
         return chain;
       };
     }

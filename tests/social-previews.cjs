@@ -19,6 +19,7 @@ async function main() {
     } };
     const social = f.load(path.join(root, 'server/services/social.service.ts'), {
       '../../telegramClient': { getTelegramManager: () => manager },
+      './telegramSession.service': { getTelegramCredentials: () => ({ apiId: 1, apiHash: 'fixture', sessionString: 'fixture' }) },
       '../config': { appConfig: f.config, telegramManager: manager, setTelegramManager() {} },
       '../state': { rates: f.rates }, '../db': { db: noopDb, supabase: null, supabaseKey: '', supabaseAnonKey: '' },
       './broadcastLog.service': { addBroadcastLog() {} }, '../utils/helpers': { ...helper, delay: async () => {} }

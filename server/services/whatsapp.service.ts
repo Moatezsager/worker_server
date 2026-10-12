@@ -1,6 +1,7 @@
 import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
+  normalizeMessageContent,
   fetchLatestBaileysVersion,
   WAMessage,
   WASocket
@@ -12,8 +13,10 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { db, supabase, supabaseKey } from '../db';
 import { appConfig } from '../config';
+import type { WhatsAppSourceConfig } from '../types';
 import { processWhatsAppMessage, isWhatsAppFetchEnabled, setWhatsAppFetchEnabled } from './scraper.service';
 import { logErrorArabic } from './db.service';
+import { ensureAccountLease, ownsAccountLease } from './accountLease.service';
 
 export interface WhatsAppServiceStatus {
   status: 'disconnected' | 'connecting' | 'scan_qr' | 'connected' | 'error';
@@ -53,8 +56,17 @@ let checkpointFailures = 0;
 
 function isRegisteredSession(content: unknown): boolean {
   if (typeof content !== 'string') return false;
-  try { return JSON.parse(content)?.registered === true; }
+  try {
+    const creds = JSON.parse(content);
+    // Baileys QR pairing sets me/account; registered is only set on some pairing flows.
+    return creds?.registered === true || (typeof creds?.me?.id === 'string' && !!creds.me.id &&
+      !!creds.account && typeof creds.account === 'object' && !Array.isArray(creds.account));
+  }
   catch { return false; }
+}
+
+export function isAutomaticWhatsAppSource(jid: unknown): boolean {
+  return typeof jid === 'string' && (jid.endsWith('@newsletter') || jid.endsWith('@g.us'));
 }
 
 /**
@@ -114,6 +126,7 @@ async function backupAuthJob(): Promise<void> {
     }
 
     // Keep Worker sessions outside the shared application configuration.
+    if (!ownsAccountLease()) return; // Standby instances must not overwrite the active socket's keys.
     if (supabase && supabaseKey && !supabaseKey.includes('dummy')) {
       try {
         const { error } = await supabase
@@ -242,6 +255,7 @@ class WhatsAppManager {
   private knownChats = new Map<string, WhatsAppChatSummary>();
   private isInitializing = false;
   private reconnectAttempts = 0;
+  private autoReconnectBlocked = false;
   private maxReconnectAttempts = 10;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private stableTimer: NodeJS.Timeout | null = null;
@@ -278,8 +292,47 @@ class WhatsAppManager {
     setWhatsAppFetchEnabled(enabled);
   }
 
+  public getSources(): WhatsAppSourceConfig[] {
+    const sources = new Map<string, WhatsAppSourceConfig>();
+    for (const source of appConfig.whatsappSources || []) {
+      if (typeof source?.jid !== 'string') continue;
+      sources.set(source.jid, { ...source,
+        type: source.jid.endsWith('@newsletter') ? 'channel' : source.jid.endsWith('@g.us') ? 'group' : source.type,
+        enabled: isAutomaticWhatsAppSource(source.jid) || source.enabled === true });
+    }
+    for (const chat of this.knownChats.values()) {
+      const configured = sources.get(chat.id);
+      sources.set(chat.id, { jid: chat.id,
+        name: isAutomaticWhatsAppSource(chat.id) ? chat.name : configured?.name || chat.name, type: chat.type,
+        enabled: isAutomaticWhatsAppSource(chat.id) || configured?.enabled === true });
+    }
+    return [...sources.values()];
+  }
+
+  private rememberChats(chats: { id?: string; name?: string | null; subject?: string }[]): void {
+    for (const chat of chats) {
+      if (!isAutomaticWhatsAppSource(chat.id)) continue;
+      const id = chat.id!;
+      const previous = this.knownChats.get(id);
+      const name = chat.subject || chat.name || previous?.name ||
+        appConfig.whatsappSources?.find(source => source.jid === id)?.name ||
+        (id.endsWith('@newsletter') ? 'قناة أسعار واتساب' : 'مجموعة أسعار واتساب');
+      this.chatNamesCache.set(id, name);
+      this.knownChats.set(id, { id, name, type: id.endsWith('@newsletter') ? 'channel' : 'group',
+        messagesCount: previous?.messagesCount || 0, lastMessageTime: previous?.lastMessageTime || null,
+        lastSnippet: previous?.lastSnippet || '', isReadable: true, participantsCount: previous?.participantsCount });
+    }
+  }
+
+  public async reconnectSavedSession(): Promise<void> {
+    if (authBackupPaused || this.autoReconnectBlocked || this.connectPromise || this.reconnectTimer ||
+        this.status === 'connected' || this.status === 'scan_qr') return;
+    if (await restoreAuthFromStorage()) await this.initClient();
+  }
+
   public async initClient(): Promise<void> {
     authBackupPaused = false;
+    if (this.autoReconnectBlocked) { this.reconnectAttempts = 0; this.autoReconnectBlocked = false; }
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -309,6 +362,11 @@ class WhatsAppManager {
     this.lastError = null;
 
     try {
+      if (!await ensureAccountLease()) {
+        this.status = 'disconnected';
+        this.lastError = 'بانتظار تسليم اتصال الحسابات من نسخة Worker الأخرى أو استعادة قاعدة البيانات.';
+        return;
+      }
       console.log('[WhatsApp] Initializing Baileys client with Supabase cloud persistent session...');
       
       // Step 1: Restore session files from Supabase cloud into container folder
@@ -348,6 +406,7 @@ class WhatsAppManager {
       }
 
       // Step 3: Instantiate socket
+      if (this.closing || !await ensureAccountLease()) return;
       const makeSocketFn = (makeWASocket as any).default || makeWASocket;
       this.sock = makeSocketFn({
         version,
@@ -370,7 +429,7 @@ class WhatsAppManager {
       this.sock.ev.on('creds.update', async () => {
         try {
           await persist(saveCreds);
-          if (state.creds.registered && !lastSavedAuthHash) await backupAuthToStorage();
+          if (!lastSavedAuthHash) await backupAuthToStorage();
           else queueAuthBackup();
         } catch (err) {
           console.error('[WhatsApp] Error in creds.update handler:', err);
@@ -411,6 +470,7 @@ class WhatsAppManager {
           // Never delete auth files on disconnect!
           // 1. Handle 440: Connection Replaced (another device or session connected to WhatsApp)
           if (statusCode === 440 || statusCode === DisconnectReason.connectionReplaced) {
+            this.autoReconnectBlocked = true;
             console.warn('[WhatsApp] Disconnect reason 440 (connectionReplaced): Another device or session connected with this WhatsApp number. Stopping auto-reconnect to prevent bandwidth abuse and number banning.');
             this.status = 'error';
             this.lastError = 'تم تسجيل الدخول إلى هذا الرقم من جهاز أو متصفح آخر (رمز 440). تم إيقاف إعادة الاتصال تلقائياً لمنع استهلاك الباندويث وحظر الرقم. يمكنك إعادة الاتصال من لوحة التحكم عند الحاجة.';
@@ -419,6 +479,7 @@ class WhatsAppManager {
 
           // 2. Handle 401: Logged Out
           if (statusCode === 401 || statusCode === DisconnectReason.loggedOut) {
+            this.autoReconnectBlocked = true;
             console.warn('[WhatsApp] Disconnect reason 401 (loggedOut): Session was logged out. Halting auto-reconnect.');
             this.status = 'error';
             this.lastError = 'تم تسجيل الخروج من جلسة واتساب. يرجى مسح رمز الاستجابة السريعة (QR) من جديد.';
@@ -427,6 +488,7 @@ class WhatsAppManager {
 
           // 3. Stop reconnecting after max attempts to prevent bandwidth drain
           if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+            this.autoReconnectBlocked = true;
             console.error(`[WhatsApp] Max reconnect attempts (${this.maxReconnectAttempts}) reached. Stopping auto-reconnect to prevent bandwidth abuse. Restart from admin panel.`);
             this.status = 'error';
             this.lastError = `فشل الاتصال بعد ${this.maxReconnectAttempts} محاولة. أعد الاتصال يدوياً من لوحة التحكم.`;
@@ -466,13 +528,25 @@ class WhatsAppManager {
           }, 5 * 60 * 1000);
           await persist(saveCreds);
           await backupAuthToStorage();
+          await this.getReachableChats();
         }
       });
 
-      // Step 6: Handle incoming messages
-      this.sock.ev.on('messages.upsert', async (m) => {
+      const socket = this.sock;
+      const rememberChats = (chats: Parameters<WhatsAppManager['rememberChats']>[0]) => {
+        if (this.sock === socket && !this.closing && !authBackupPaused) this.rememberChats(chats);
+      };
+      socket.ev.on('chats.upsert', rememberChats);
+      socket.ev.on('chats.update', rememberChats);
+      socket.ev.on('groups.upsert', rememberChats);
+      socket.ev.on('groups.update', rememberChats);
+      socket.ev.on('messaging-history.set', ({ chats }) => rememberChats(chats));
+      socket.ev.on('newsletter-settings.update', ({ id, update }) => rememberChats([{ id, name: update.name }]));
 
+      // History events above discover sources only; prices still use the existing message pipeline.
+      socket.ev.on('messages.upsert', async (m) => {
         for (const msg of m.messages) {
+          if (this.sock !== socket || this.closing || authBackupPaused) break;
           try {
             await this.handleIncomingMessage(msg);
           } catch (msgErr) {
@@ -495,53 +569,35 @@ class WhatsAppManager {
     if (!msg.message) return;
     if (msg.key.fromMe) return;
 
-    const mObj = msg.message;
+    const remoteJid = msg.key.remoteJid || 'unknown';
+    this.rememberChats([{ id: remoteJid,
+      name: remoteJid.endsWith('@newsletter') && !this.chatNamesCache.has(remoteJid) ? msg.pushName : undefined }]);
+    const mObj = normalizeMessageContent(msg.message);
+    if (!mObj) return;
     const text =
       mObj.conversation ||
       mObj.extendedTextMessage?.text ||
       mObj.imageMessage?.caption ||
       mObj.videoMessage?.caption ||
       mObj.documentMessage?.caption ||
-      (mObj as any)?.ephemeralMessage?.message?.extendedTextMessage?.text ||
-      (mObj as any)?.ephemeralMessage?.message?.conversation ||
-      (mObj as any)?.viewOnceMessage?.message?.extendedTextMessage?.text ||
-      (mObj as any)?.viewOnceMessage?.message?.conversation ||
-      (mObj as any)?.viewOnceMessageV2?.message?.extendedTextMessage?.text ||
-      (mObj as any)?.viewOnceMessageV2?.message?.conversation ||
       '';
 
     if (!text || text.trim().length < 4) return;
+    const timestamp = msg.messageTimestamp as number | string | { toNumber(): number } | undefined;
+    const seconds = typeof timestamp === 'number' || typeof timestamp === 'string' ? Number(timestamp) : timestamp?.toNumber?.();
+    const msgTime = Number(seconds) * 1000;
+    if (!Number.isSafeInteger(seconds) || !Number.isSafeInteger(msgTime) || msgTime <= 0 || msgTime > Date.now() + 300000) return;
 
     this.messagesReceivedCount++;
     this.lastMessageTime = new Date().toISOString();
 
-    const remoteJid = msg.key.remoteJid || 'unknown';
     this.activeChats.add(remoteJid);
 
-    let chatName = this.chatNamesCache.get(remoteJid);
-    if (!chatName) {
-      if (remoteJid.includes('@g.us')) {
-        chatName = 'مجموعة تجار';
-        if (this.sock) {
-          this.sock.groupMetadata(remoteJid).then(meta => {
-            if (meta?.subject) {
-              this.chatNamesCache.set(remoteJid, meta.subject);
-            }
-          }).catch(() => {});
-        }
-      } else if (remoteJid.includes('@newsletter')) {
-        chatName = msg.pushName ? `قناة ${msg.pushName}` : 'قناة أسعار واتساب';
-      } else {
-        chatName = msg.pushName ? `محادثة (${msg.pushName})` : 'محادثة خاصة';
-      }
-    }
+    const chatName = this.chatNamesCache.get(remoteJid) ||
+      (msg.pushName ? `محادثة (${msg.pushName})` : 'محادثة خاصة');
 
-    const msgTime = (typeof msg.messageTimestamp === 'number'
-      ? msg.messageTimestamp
-      : (msg.messageTimestamp as any)?.low || Math.floor(Date.now() / 1000)) * 1000;
-
-    const isChannel = remoteJid.includes('@newsletter');
-    const isGroup = remoteJid.includes('@g.us');
+    const isChannel = remoteJid.endsWith('@newsletter');
+    const isGroup = remoteJid.endsWith('@g.us');
     const snippet = text.replace(/\s+/g, ' ').substring(0, 100);
     const prev = this.knownChats.get(remoteJid);
     this.knownChats.set(remoteJid, {
@@ -555,16 +611,18 @@ class WhatsAppManager {
       participantsCount: prev?.participantsCount
     });
     if (!isWhatsAppFetchEnabled ||
-        !appConfig.whatsappSources?.some(source => source.jid === remoteJid && source.enabled === true)) return;
+        (!isAutomaticWhatsAppSource(remoteJid) &&
+         !appConfig.whatsappSources?.some(source => source.jid === remoteJid && source.enabled === true))) return;
     const result = await processWhatsAppMessage(chatName, text, msgTime);
     if (result.processed) this.ratesExtractedCount += result.extractedCount;
   }
 
   public async getReachableChats(): Promise<WhatsAppChatSummary[]> {
+    const socket = this.sock;
     if (this.sock && this.status === 'connected') {
       try {
-        const groups = await (this.sock as any).groupFetchAllParticipating();
-        if (groups) {
+        const groups = await socket!.groupFetchAllParticipating();
+        if (groups && this.sock === socket && this.status === 'connected') {
           for (const jid in groups) {
             const g = groups[jid];
             const existing = this.knownChats.get(jid);
@@ -596,6 +654,8 @@ class WhatsAppManager {
 
   public closeOnly(): void {
     this.closing = true;
+    this.status = 'disconnected';
+    this.qrCodeUrl = null;
     if (backupDebounceTimer) clearTimeout(backupDebounceTimer);
     backupDebounceTimer = null;
     if (this.reconnectTimer) {
@@ -651,6 +711,9 @@ class WhatsAppManager {
       this.phoneNumber = null;
       this.userName = null;
       this.connectedAt = null;
+      this.knownChats.clear();
+      this.chatNamesCache.clear();
+      this.activeChats.clear();
       this.lastError = cleanupError?.message || null;
       this.reconnectAttempts = 0;
       if (cleanupError) throw cleanupError;

@@ -1,9 +1,10 @@
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
 import { computeCheck } from "telegram/Password";
-import { appConfig, saveConfigToSupabase } from "../config";
 import { initializeTelegram } from "../../telegramClient";
 import { addLog } from "../utils/logger";
+import { getTelegramCredentials, saveTelegramSession } from './telegramSession.service';
+import { ensureAccountLease } from './accountLease.service';
 
 interface PendingLoginSession {
   client: TelegramClient;
@@ -15,14 +16,34 @@ interface PendingLoginSession {
 }
 
 let pendingSession: PendingLoginSession | null = null;
+let sendingCode = false;
+let verifyingLogin = false;
+let completingLogin: Promise<void> | null = null;
+let loginExpiry: NodeJS.Timeout | null = null;
+
+async function withLoginVerification<T>(step: () => Promise<T>): Promise<T> {
+  if (sendingCode || verifyingLogin || completingLogin) throw new Error('طلب تسجيل الدخول قيد التنفيذ. انتظر اكتماله.');
+  verifyingLogin = true;
+  try { return await step(); } finally { verifyingLogin = false; }
+}
+
+export async function closeTelegramLogin(): Promise<void> {
+  if (loginExpiry) clearTimeout(loginExpiry);
+  loginExpiry = null;
+  const session = pendingSession;
+  pendingSession = null;
+  if (session) {
+    try { await session.client.destroy(); } catch { await session.client.disconnect(); }
+  }
+}
 
 // Helper functions to retrieve Telegram API credentials from environment or config
 export const getEnvTelegramApiId = (): number => {
-  return Number(process.env.TELEGRAM_API_ID || process.env.VITE_TELEGRAM_API_ID || appConfig.telegramApiId) || 0;
+  return getTelegramCredentials().apiId || 0;
 };
 
 export const getEnvTelegramApiHash = (): string => {
-  return (process.env.TELEGRAM_API_HASH || process.env.VITE_TELEGRAM_API_HASH || appConfig.telegramApiHash || "").trim();
+  return getTelegramCredentials().apiHash;
 };
 
 /**
@@ -44,51 +65,63 @@ export async function sendTelegramLoginCode(params: {
   if (!phoneNumber) {
     throw new Error("رقم الهاتف مطلوب للاتصال بحساب تيليجرام");
   }
+  if (sendingCode || verifyingLogin || completingLogin) throw new Error('طلب تسجيل الدخول قيد التنفيذ. انتظر اكتماله.');
+  sendingCode = true;
+  let client: TelegramClient | null = null;
+  try {
+    if (!await ensureAccountLease()) throw new Error('انتظر انتقال اتصال الحسابات إلى نسخة Worker الحالية ثم أعد المحاولة.');
 
-  // Cleanup existing pending session if any
-  if (pendingSession?.client) {
-    try {
-      await pendingSession.client.disconnect();
-    } catch (e) {}
-    pendingSession = null;
-  }
+    // Cleanup existing pending session if any
+    await closeTelegramLogin();
 
-  console.log(`[TelegramAuth] Connecting with apiId=${apiId} for phone ${phoneNumber}...`);
-  addLog("info", "حساب تيليجرام", `بدء طلب كود التحقق لرقم الهاتف: ${phoneNumber}`);
+    console.log(`[TelegramAuth] Connecting with apiId=${apiId} for phone ${phoneNumber}...`);
+    addLog("info", "حساب تيليجرام", `بدء طلب كود التحقق لرقم الهاتف: ${phoneNumber}`);
 
-  const stringSession = new StringSession("");
-  const client = new TelegramClient(stringSession, apiId, apiHash, {
-    connectionRetries: 3,
-    deviceModel: "LYD Indicator Hub",
-    systemVersion: "Linux/Node",
-    appVersion: "1.0.0",
-  });
+    const stringSession = new StringSession("");
+    client = new TelegramClient(stringSession, apiId, apiHash, {
+      connectionRetries: 3,
+      deviceModel: "LYD Indicator Hub",
+      systemVersion: "Linux/Node",
+      appVersion: "1.0.0",
+    });
 
-  await client.connect();
+    pendingSession = { client, apiId, apiHash, phoneNumber, phoneCodeHash: '', createdAt: Date.now() };
+    await client.connect();
+    if (!pendingSession || !await ensureAccountLease()) throw new Error('توقفت محاولة الاتصال. أعد طلب الكود.');
 
-  const sendResult = await client.sendCode(
-    { apiId, apiHash },
-    phoneNumber,
-    false
-  );
+    const sendResult = await client.sendCode(
+      { apiId, apiHash },
+      phoneNumber,
+      false
+    );
+    if (pendingSession?.client !== client || !await ensureAccountLease()) throw new Error('توقفت محاولة الاتصال. أعد طلب الكود.');
 
-  if (!sendResult || !sendResult.phoneCodeHash) {
-    throw new Error("تعذر الحصول على phoneCodeHash من سيرفر تيليجرام");
-  }
+    if (!sendResult || !sendResult.phoneCodeHash) {
+      throw new Error("تعذر الحصول على phoneCodeHash من سيرفر تيليجرام");
+    }
 
-  pendingSession = {
-    client,
-    apiId,
-    apiHash,
-    phoneNumber,
-    phoneCodeHash: sendResult.phoneCodeHash,
-    createdAt: Date.now()
-  };
+    pendingSession = {
+      client,
+      apiId,
+      apiHash,
+      phoneNumber,
+      phoneCodeHash: sendResult.phoneCodeHash,
+      createdAt: Date.now()
+    };
+    loginExpiry = setTimeout(() => {
+      closeTelegramLogin().catch(() => console.warn('[TelegramAuth] Expired login connection cleanup failed.'));
+    }, 10 * 60 * 1000);
+    loginExpiry.unref();
 
-  return {
-    phoneCodeHash: sendResult.phoneCodeHash,
-    isCodeViaApp: Boolean(sendResult.isCodeViaApp)
-  };
+    return {
+      phoneCodeHash: sendResult.phoneCodeHash,
+      isCodeViaApp: Boolean(sendResult.isCodeViaApp)
+    };
+  } catch (error) {
+    if (pendingSession?.client === client) pendingSession = null;
+    if (client) { try { await client.destroy(); } catch {} }
+    throw error;
+  } finally { sendingCode = false; }
 }
 
 /**
@@ -101,66 +134,70 @@ export async function verifyTelegramLoginCode(phoneCode: string): Promise<{
   message: string;
   sessionString?: string;
 }> {
-  if (!pendingSession || !pendingSession.client) {
-    throw new Error("لا توجد جلسة تسجيل دخول نشطة. يرجى طلب كود التحقق أولاً.");
-  }
+  return withLoginVerification(async () => {
+    const session = pendingSession;
+    if (!session || !session.client) {
+      throw new Error("لا توجد جلسة تسجيل دخول نشطة. يرجى طلب كود التحقق أولاً.");
+    }
 
-  // Session expiry check (10 minutes)
-  if (Date.now() - pendingSession.createdAt > 10 * 60 * 1000) {
-    try { await pendingSession.client.disconnect(); } catch (e) {}
-    pendingSession = null;
-    throw new Error("انتهت صلاحية جلسة تسجيل الدخول (أكثر من 10 دقائق). يرجى طلب كود جديد.");
-  }
+    // Session expiry check (10 minutes)
+    if (Date.now() - session.createdAt > 10 * 60 * 1000) {
+      await closeTelegramLogin();
+      throw new Error("انتهت صلاحية جلسة تسجيل الدخول (أكثر من 10 دقائق). يرجى طلب كود جديد.");
+    }
 
-  const cleanCode = phoneCode.trim().replace(/\s+/g, '');
-  if (!cleanCode) {
-    throw new Error("يرجى إدخال كود التحقق المستلم");
-  }
+    const cleanCode = phoneCode.trim().replace(/\s+/g, '');
+    if (!await ensureAccountLease()) throw new Error('اتصال الحسابات غير متاح في النسخة الحالية.');
+    if (!cleanCode) {
+      throw new Error("يرجى إدخال كود التحقق المستلم");
+    }
 
-  addLog("info", "حساب تيليجرام", `محاولة تأكيد كود التحقق للحساب [${pendingSession.phoneNumber}]`);
+    addLog("info", "حساب تيليجرام", `محاولة تأكيد كود التحقق للحساب [${session.phoneNumber}]`);
+    if (pendingSession !== session) throw new Error('جلسة تسجيل الدخول تغيرت. أعد المحاولة.');
 
-  try {
-    const result = await pendingSession.client.invoke(
-      new Api.auth.SignIn({
-        phoneNumber: pendingSession.phoneNumber,
-        phoneCodeHash: pendingSession.phoneCodeHash,
-        phoneCode: cleanCode,
-      })
-    );
+    try {
+      if (!await session.client.checkAuthorization()) await session.client.invoke(
+        new Api.auth.SignIn({
+          phoneNumber: session.phoneNumber,
+          phoneCodeHash: session.phoneCodeHash,
+          phoneCode: cleanCode,
+        })
+      );
 
-    // Direct success without 2FA
-    const sessionString = pendingSession.client.session.save() as unknown as string;
-    await completeTelegramLogin(pendingSession.apiId, pendingSession.apiHash, sessionString);
+      // Direct success without 2FA
+      const sessionString = session.client.session.save() as unknown as string;
+      await completeTelegramLogin(session.apiId, session.apiHash, sessionString);
 
-    return {
-      success: true,
-      requires2FA: false,
-      message: "تم تسجيل الدخول بنجاح وحفظ جلسة تيليجرام السحابية الدائمة!",
-      sessionString
-    };
-  } catch (error: any) {
-    const errorMsg = error?.errorMessage || error?.message || String(error);
-
-    // Check if account has 2FA enabled
-    if (errorMsg === "SESSION_PASSWORD_NEEDED" || errorMsg.includes("SESSION_PASSWORD_NEEDED")) {
-      console.log("[TelegramAuth] Account has Two-Step Verification (2FA) enabled. Awaiting password...");
-      addLog("warn", "حساب تيليجرام", "الحساب محمي بكلمة مرور ثنائية (2FA) - بانتظار إدخال كلمة المرور");
       return {
         success: true,
-        requires2FA: true,
-        message: "حسابك محمي بالتحقق بخطوتين (2FA). يرجى إدخال كلمة المرور الثنائية لإتمام الربط."
+        requires2FA: false,
+        message: "تم تسجيل الدخول بنجاح وحفظ جلسة تيليجرام السحابية الدائمة!",
+        sessionString
       };
-    }
+    } catch (error: any) {
+      const errorMsg = error?.errorMessage || error?.message || String(error);
 
-    if (errorMsg.includes("PHONE_CODE_INVALID")) {
-      throw new Error("كود التحقق غير صحيح. تأكد من إدخال الأرقام بشكل صحيح.");
-    }
-    if (errorMsg.includes("PHONE_CODE_EXPIRED")) {
-      throw new Error("انتهت صلاحية كود التحقق. يرجى طلب كود جديد.");
-    }
+      // Check if account has 2FA enabled
+      if (errorMsg === "SESSION_PASSWORD_NEEDED" || errorMsg.includes("SESSION_PASSWORD_NEEDED")) {
+        console.log("[TelegramAuth] Account has Two-Step Verification (2FA) enabled. Awaiting password...");
+        addLog("warn", "حساب تيليجرام", "الحساب محمي بكلمة مرور ثنائية (2FA) - بانتظار إدخال كلمة المرور");
+        return {
+          success: true,
+          requires2FA: true,
+          message: "حسابك محمي بالتحقق بخطوتين (2FA). يرجى إدخال كلمة المرور الثنائية لإتمام الربط."
+        };
+      }
 
-    throw new Error(`خطأ تيليجرام: ${errorMsg}`);
-  }
+      if (errorMsg.includes("PHONE_CODE_INVALID")) {
+        throw new Error("كود التحقق غير صحيح. تأكد من إدخال الأرقام بشكل صحيح.");
+      }
+      if (errorMsg.includes("PHONE_CODE_EXPIRED")) {
+        throw new Error("انتهت صلاحية كود التحقق. يرجى طلب كود جديد.");
+      }
+
+      throw new Error(`خطأ تيليجرام: ${errorMsg}`);
+    }
+  });
 }
 
 /**
@@ -171,65 +208,67 @@ export async function verifyTelegram2FAPassword(password: string): Promise<{
   message: string;
   sessionString: string;
 }> {
-  if (!pendingSession || !pendingSession.client) {
-    throw new Error("لا توجد جلسة تسجيل دخول نشطة. يرجى بدء تسجيل الدخول من جديد.");
-  }
-
-  const cleanPassword = password.trim();
-  if (!cleanPassword) {
-    throw new Error("يرجى إدخال كلمة المرور الثنائية (2FA)");
-  }
-
-  addLog("info", "حساب تيليجرام", "التحقق من كلمة مرور الحساب الثنائية (2FA)...");
-
-  try {
-    const passwordSrpResult = await pendingSession.client.invoke(new Api.account.GetPassword());
-    const passwordSrpCheck = await computeCheck(passwordSrpResult, cleanPassword);
-
-    await pendingSession.client.invoke(
-      new Api.auth.CheckPassword({
-        password: passwordSrpCheck,
-      })
-    );
-
-    const sessionString = pendingSession.client.session.save() as unknown as string;
-    await completeTelegramLogin(pendingSession.apiId, pendingSession.apiHash, sessionString);
-
-    return {
-      success: true,
-      message: "تم التحقق من كلمة المرور الثنائية بنجاح وحفظ جلسة تيليجرام السحابية الدائمة!",
-      sessionString
-    };
-  } catch (error: any) {
-    const errorMsg = error?.errorMessage || error?.message || String(error);
-    if (errorMsg.includes("PASSWORD_HASH_INVALID") || errorMsg.includes("SRP_ID_INVALID")) {
-      throw new Error("كلمة المرور الثنائية غير صحيحة. يرجى إعادة المحاولة.");
+  return withLoginVerification(async () => {
+    const session = pendingSession;
+    if (!session || !session.client) {
+      throw new Error("لا توجد جلسة تسجيل دخول نشطة. يرجى بدء تسجيل الدخول من جديد.");
     }
-    throw new Error(`خطأ في التحقق من كلمة المرور: ${errorMsg}`);
-  }
+
+    const cleanPassword = password.trim();
+    if (Date.now() - session.createdAt > 10 * 60 * 1000) {
+      await closeTelegramLogin();
+      throw new Error('انتهت صلاحية جلسة تسجيل الدخول. اطلب كودًا جديدًا.');
+    }
+    if (!await ensureAccountLease()) throw new Error('اتصال الحسابات غير متاح في النسخة الحالية.');
+    if (!cleanPassword) {
+      throw new Error("يرجى إدخال كلمة المرور الثنائية (2FA)");
+    }
+
+    addLog("info", "حساب تيليجرام", "التحقق من كلمة مرور الحساب الثنائية (2FA)...");
+    if (pendingSession !== session) throw new Error('جلسة تسجيل الدخول تغيرت. أعد المحاولة.');
+
+    try {
+      if (!await session.client.checkAuthorization()) {
+        const passwordSrpResult = await session.client.invoke(new Api.account.GetPassword());
+        const passwordSrpCheck = await computeCheck(passwordSrpResult, cleanPassword);
+
+        await session.client.invoke(
+          new Api.auth.CheckPassword({
+            password: passwordSrpCheck,
+          })
+        );
+      }
+
+      const sessionString = session.client.session.save() as unknown as string;
+      await completeTelegramLogin(session.apiId, session.apiHash, sessionString);
+
+      return {
+        success: true,
+        message: "تم التحقق من كلمة المرور الثنائية بنجاح وحفظ جلسة تيليجرام السحابية الدائمة!",
+        sessionString
+      };
+    } catch (error: any) {
+      const errorMsg = error?.errorMessage || error?.message || String(error);
+      if (errorMsg.includes("PASSWORD_HASH_INVALID") || errorMsg.includes("SRP_ID_INVALID")) {
+        throw new Error("كلمة المرور الثنائية غير صحيحة. يرجى إعادة المحاولة.");
+      }
+      throw new Error(`خطأ في التحقق من كلمة المرور: ${errorMsg}`);
+    }
+  });
 }
 
 /**
- * Finalize login: persist session to appConfig, environment, Supabase, and connect active client.
+ * Finalize login in Worker-private storage, never the shared Web configuration.
  */
 async function completeTelegramLogin(apiId: number, apiHash: string, sessionString: string): Promise<void> {
-  appConfig.telegramApiId = apiId;
-  appConfig.telegramApiHash = apiHash;
-  appConfig.telegramSessionString = sessionString;
-
-  process.env.TELEGRAM_API_ID = String(apiId);
-  process.env.TELEGRAM_API_HASH = apiHash;
-  process.env.TELEGRAM_SESSION = sessionString;
-
-  await saveConfigToSupabase(appConfig);
-  addLog("success", "حساب تيليجرام", "تم حفظ وتفعيل جلسة تيليجرام بنجاح ومزامنتها في السحابة");
-
-  // Re-initialize active client
-  try {
+  if (completingLogin) return completingLogin;
+  completingLogin = (async () => {
+    if (!await ensureAccountLease()) throw new Error('توقف اتصال الحسابات قبل الحفظ. أعد تسجيل الدخول من النسخة الحالية.');
+    await saveTelegramSession(apiId, apiHash, sessionString);
+    // The OTP client uses this same auth key: close it before opening the runtime client.
+    await closeTelegramLogin();
+    addLog("success", "حساب تيليجرام", "تم حفظ جلسة تيليجرام في التخزين الخاص الدائم");
     await initializeTelegram();
-  } catch (e) {
-    console.warn("[TelegramAuth] Reconnect warning after login:", e);
-  } finally {
-    pendingSession = null;
-  }
+  })().finally(() => { completingLogin = null; });
+  return completingLogin;
 }

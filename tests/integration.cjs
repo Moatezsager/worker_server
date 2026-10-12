@@ -59,7 +59,7 @@ async function main() {
   } finally { await http.close(); }
   console.log('PASS real internal HTTP routes: authentication, allowlist, dispatch, toggle and broadcast validation');
 
-  let saveFails = true;
+  let saveFails = true, sessionSaveFails = false, configSaveFails = false, privateSessionSaves = 0, settingsWrites = 0;
   const db = f.load('server/services/db.service.ts', {
     '../db': { db: noopDb, supabaseKey: 'fixture', supabase: fakeSupabase(q =>
       ({ error: saveFails && q.table === 'parallel_rates' ? { message: 'fixture failure' } : null })) },
@@ -69,13 +69,21 @@ async function main() {
   const adminAuth = f.load('server/middleware/auth.ts', { express, '../config': { appConfig: f.config } });
   assert.equal(adminAuth.validateAdminPassword('admin'), false);
   const token = adminAuth.createAdminSession('fixture', 'fixture').token;
+  const waSources = f.load('server/services/whatsapp.service.ts', {
+    '@whiskeysockets/baileys': {}, qrcode: {}, pino: () => ({}), fs: { existsSync: () => true },
+    './accountLease.service': {}, '../db': { db: noopDb, supabase: null }, '../config': { appConfig: f.config },
+    './scraper.service': {}, './db.service': {}
+  });
+  waSources.whatsappManager.rememberChats([{ id: 'found@newsletter', name: 'Found Channel' }]);
   const dashboard = f.load('server/routes/dashboard.routes.ts', {
-    express, '../state': { rates: f.rates }, '../config': { appConfig: f.config },
+    express, '../state': { rates: f.rates }, '../config': { appConfig: f.config, saveConfigToSupabase: async () => { settingsWrites++; return !configSaveFails; } },
     '../db': { db: noopDb }, '../utils/version': { serverStartTime: new f.Clock() },
     '../schedulers/tasks.scheduler': scheduler, '../services/scraper.service': source,
     '../services/db.service': db, '../services/maintenance.service': {}, '../services/ai.service': {},
-    '../services/social.service': {}, '../../telegramClient': {}, '../services/whatsapp.service': {},
+    '../services/social.service': {}, '../../telegramClient': { initializeTelegram: async () => null }, '../services/whatsapp.service': waSources,
     '../services/telegramAuth.service': {},
+    '../services/telegramSession.service': { getTelegramCredentials: () => ({ apiId: 123, apiHash: 'fixture' }),
+      saveTelegramSession: async () => { if (sessionSaveFails) throw new Error('Private checkpoint failed'); privateSessionSaves++; } },
     '../utils/logger': { addLog() {} }, '../views/dashboard.html': {}, '../services/ingestion.service': {},
     '../middleware/security': { loginLimiter: (req, res, next) => next() }, '../middleware/auth': adminAuth
   }).default;
@@ -86,6 +94,32 @@ async function main() {
     body: JSON.stringify(body)
   });
   try {
+    assert.equal((await fetch(adminHttp.url + '/api/dashboard/sources')).status, 401);
+    const sourceList = await (await fetch(adminHttp.url + '/api/dashboard/sources', { headers: { Authorization: 'Bearer ' + token } })).json();
+    assert.equal(sourceList.whatsappSources.find(source => source.jid === 'disabled@g.us').enabled, true);
+    assert.equal(sourceList.whatsappSources.find(source => source.jid === 'found@newsletter').enabled, true);
+    const beforeSourceRefresh = settingsWrites;
+    assert.equal((await adminPost('sources/whatsapp/refresh', {})).status, 200);
+    assert.equal(settingsWrites, beforeSourceRefresh, 'Source discovery must not overwrite shared app_config');
+    assert.equal((await adminPost('sources/whatsapp/toggle', { jid: 'disabled@g.us', enabled: false })).status, 409);
+    assert.equal((await adminPost('sources/whatsapp/toggle', { jid: 'found@newsletter', enabled: true })).status, 200);
+    assert.equal((await adminPost('sources/whatsapp/toggle', { jid: 'found@newsletter', enabled: 'false' })).status, 400);
+    assert.equal((await adminPost('sources/whatsapp/delete', { jid: 'found@newsletter' })).status, 409);
+    assert.equal(settingsWrites, beforeSourceRefresh);
+    assert.equal((await adminPost('sources/whatsapp/toggle', { jid: 'private@s.whatsapp.net', enabled: true })).status, 200);
+    assert.equal(f.config.whatsappSources.find(source => source.jid === 'private@s.whatsapp.net').enabled, true);
+    assert.equal((await adminPost('accounts/telegram/save', { sessionString: 'fixture' }, false)).status, 401);
+    assert.equal((await adminPost('accounts/telegram/save', { sessionString: 123 })).status, 400);
+    assert.equal((await adminPost('accounts/telegram/save', { sessionString: ' ' })).status, 200);
+    assert.equal(privateSessionSaves, 0, 'A blank form field must not erase the saved account');
+    sessionSaveFails = true;
+    assert.equal((await adminPost('accounts/telegram/save', { sessionString: 'fixture' })).status, 503);
+    assert.equal(f.config.telegramSessionString, undefined, 'Never copy the new Worker session into shared config');
+    sessionSaveFails = false; configSaveFails = true;
+    assert.equal((await adminPost('accounts/telegram/save', { botToken: 'fixture' })).status, 503);
+    configSaveFails = false;
+    assert.equal((await adminPost('accounts/telegram/save', { sessionString: 'fixture' })).status, 200);
+    assert.equal(privateSessionSaves, 1);
     assert.equal((await adminPost('update-rate', { code: 'USD', rate: 9.8 }, false)).status, 401);
     assert.equal((await adminPost('update-rate', { code: 'USD', rate: 9.8 })).status, 500);
     assert.equal(f.rates.parallel.USD, 9.7);

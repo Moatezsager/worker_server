@@ -1,6 +1,8 @@
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
 import { CustomFile } from "telegram/client/uploads";
+import { getTelegramCredentials, restoreTelegramSession } from './server/services/telegramSession.service';
+import { ensureAccountLease } from './server/services/accountLease.service';
 
 /**
  * Public channel scraper that extracts live messages and timestamps directly from t.me/s/ preview.
@@ -79,8 +81,10 @@ export class TelegramManager {
   private apiHash: string;
   private sessionString: string;
   public botToken?: string;
-  private isConnecting = false;
+  private credentialVersion = 0;
+  private closingClient: Promise<void> = Promise.resolve();
   private connectPromise: Promise<TelegramClient | null> | null = null;
+  private connectingVersion = 0;
   private cooldownUntil = 0;
   public lastFetchTime: number = 0;
   public lastError: string = "";
@@ -94,20 +98,16 @@ export class TelegramManager {
   }
 
   public updateCredentials(apiId: number, apiHash: string, sessionString: string, botToken?: string) {
-    if (this.apiId !== apiId || this.apiHash !== apiHash || this.sessionString !== sessionString || this.botToken !== botToken) {
+    if (botToken !== undefined) this.botToken = botToken;
+    if (this.apiId !== apiId || this.apiHash !== apiHash || this.sessionString !== sessionString) {
       console.log("[TelegramManager] Credentials updated, resetting client state.");
       this.apiId = apiId;
       this.apiHash = apiHash;
       this.sessionString = sessionString;
-      this.botToken = botToken;
+      this.credentialVersion++;
       this.isAuthRevoked = false;
       this.lastError = "";
-      if (this.client) {
-        this.client.disconnect().catch(() => {});
-        this.client = null;
-        activeClient = null;
-      }
-      this.connectPromise = null;
+      this.retireClient();
       this.cooldownUntil = 0;
     }
   }
@@ -122,24 +122,6 @@ export class TelegramManager {
       return null;
     }
 
-    // If a connection attempt is already in flight, reuse its promise
-    if (this.connectPromise) {
-      return this.connectPromise;
-    }
-
-    // If already connected and authorized, return it
-    if (this.client && this.client.connected) {
-      try {
-        const isAuthorized = await this.client.checkAuthorization();
-        if (isAuthorized) {
-          activeClient = this.client;
-          return this.client;
-        }
-      } catch (e) {
-        console.warn("[TelegramManager] Authorization check failed, re-connecting...");
-      }
-    }
-
     // Cooldown check to prevent rapid reconnection loops
     const now = Date.now();
     if (now < this.cooldownUntil) {
@@ -148,33 +130,39 @@ export class TelegramManager {
       return null;
     }
 
-    this.connectPromise = this.doConnect().finally(() => {
-      this.connectPromise = null;
-    });
-
-    return this.connectPromise;
+    if (!this.connectPromise) {
+      this.connectingVersion = this.credentialVersion;
+      this.connectPromise = this.doConnect().finally(() => { this.connectPromise = null; });
+    }
+    const version = this.connectingVersion;
+    const client = await this.connectPromise;
+    return version === this.credentialVersion ? client : this.getClient();
   }
 
   private async doConnect(): Promise<TelegramClient | null> {
-    this.isConnecting = true;
+    const version = this.credentialVersion;
     try {
       if (!this.sessionString) {
         this.lastError = "لم يتم حفظ جلسة تيليجرام بعد";
         return null;
       }
 
-      console.log("[TelegramManager] Initializing new Telegram client...");
-      
-      if (this.client) {
-        try { 
-          await this.client.disconnect(); 
-          if ((this.client as any).destroy) await (this.client as any).destroy();
-        } catch (e) {}
+      await this.closingClient;
+      if (!await ensureAccountLease()) {
+        this.lastError = 'بانتظار تسليم اتصال الحسابات من نسخة Worker الأخرى أو استعادة قاعدة البيانات.';
+        return null;
       }
+      if (version !== this.credentialVersion) return null;
+      if (this.client?.connected) { activeClient = this.client; return this.client; }
+      await this.retireClient();
+      if (version !== this.credentialVersion) return null;
+      console.log("[TelegramManager] Initializing new Telegram client...");
 
       const stringSession = new StringSession(this.sessionString || "");
       this.client = new TelegramClient(stringSession, this.apiId, this.apiHash, {
         connectionRetries: 2,
+        reconnectRetries: 6,
+        retryDelay: 5000,
         useWSS: false,
         autoReconnect: true,
         floodSleepThreshold: 120,
@@ -183,25 +171,32 @@ export class TelegramManager {
         appVersion: "1.0",
       });
 
-      await this.client.connect();
-      
-      const isAuthorized = await this.client.checkAuthorization();
+      const client = this.client;
+      await client.connect();
+      if (version !== this.credentialVersion || !await ensureAccountLease()) {
+        await client.destroy();
+        if (this.client === client) this.client = null;
+        return null;
+      }
+      const isAuthorized = await client.checkAuthorization();
       if (!isAuthorized) {
-        throw new Error("Session is not authorized. Please check your session string.");
+        throw new Error('AUTH_KEY_UNREGISTERED');
       }
       
       console.log("[TelegramManager] Successfully connected and authorized.");
       this.isAuthRevoked = false;
       this.lastError = "";
-      activeClient = this.client;
-      return this.client;
+      if (version !== this.credentialVersion) { await client.destroy(); return null; }
+      activeClient = client;
+      return client;
     } catch (error: any) {
+      if (version !== this.credentialVersion) return null;
       const errorMsg = error.message || String(error);
       
       let cooldownDuration = 30000;
-      if (errorMsg.includes("AUTH_KEY_DUPLICATED")) {
+      if (/AUTH_KEY_DUPLICATED|SESSION_REVOKED|AUTH_KEY_UNREGISTERED|SESSION_EXPIRED/.test(errorMsg)) {
         this.isAuthRevoked = true;
-        this.lastError = "تم إبطال جلسة تيليجرام (AUTH_KEY_DUPLICATED) من سيرفرات تيليجرام بسبب تشغيلها في مكان آخر أو إعادة تشغيل التطبيق. يرجى تجديد تسجيل الدخول من لوحة التحكم أو استخدام Bot Token.";
+        this.lastError = "جلسة تيليجرام غير صالحة أو أُبطلت بسبب اتصال متزامن. أعد تسجيل الدخول مرة واحدة، ولا تستخدم الجلسة نفسها في خدمة أخرى.";
         console.warn("[TelegramManager] Telegram session active elsewhere or duplicate auth key (AUTH_KEY_DUPLICATED). Switched to public web channel scraper (no session required).");
         cooldownDuration = 24 * 60 * 60 * 1000;
       } else {
@@ -209,19 +204,22 @@ export class TelegramManager {
         this.lastError = errorMsg;
       }
       
-      if (this.client) {
-        try { 
-          await this.client.disconnect(); 
-          if ((this.client as any).destroy) await (this.client as any).destroy();
-        } catch (e) {}
-      }
-      this.client = null;
-      activeClient = null;
+      await this.retireClient();
       this.cooldownUntil = Date.now() + cooldownDuration;
       return null;
-    } finally {
-      this.isConnecting = false;
     }
+  }
+
+  private retireClient(): Promise<void> {
+    const client = this.client;
+    this.client = null;
+    activeClient = null;
+    this.closingClient = this.closingClient.then(async () => {
+      if (client) {
+        try { await client.destroy(); } catch { try { await client.disconnect(); } catch {} }
+      }
+    });
+    return this.closingClient;
   }
 
   /**
@@ -253,11 +251,12 @@ export class TelegramManager {
         }
 
         // Wrap getMessages in timeout to prevent hanging on half-open MTProto socket
+        let timeout: NodeJS.Timeout;
         const getMessagesPromise = client.getMessages(entity, { limit });
         const timeoutPromise = new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("GramJS getMessages timed out after 10000ms")), 10000)
+          timeout = setTimeout(() => reject(new Error("GramJS getMessages timed out after 10000ms")), 10000)
         );
-        const messages = await Promise.race([getMessagesPromise, timeoutPromise]);
+        const messages = await Promise.race([getMessagesPromise, timeoutPromise]).finally(() => clearTimeout(timeout));
         this.lastFetchTime = Date.now();
         
         const valid = messages
@@ -272,9 +271,10 @@ export class TelegramManager {
         }
       } catch (error: any) {
         console.warn(`[TelegramManager] GramJS fetch failed for ${channelUsername} (${error.message || error}), switching to public HTTP scraper...`);
-        if (error.message?.includes('connection') || error.message?.includes('disconnected') || error.message?.includes('AUTH_KEY_DUPLICATED')) {
-          this.client = null;
-          activeClient = null;
+        if (/connection|disconnected|timed out|TIMEOUT|AUTH_KEY_DUPLICATED|SESSION_REVOKED|AUTH_KEY_UNREGISTERED/i.test(error.message || '')) {
+          if (/AUTH_KEY_DUPLICATED|SESSION_REVOKED|AUTH_KEY_UNREGISTERED/.test(error.message || '')) this.isAuthRevoked = true;
+          await this.disconnect();
+          this.cooldownUntil = Date.now() + 30000;
         }
       }
     }
@@ -471,9 +471,9 @@ const retryRes = await fetch(url, {
     } catch (error: any) {
       this.lastError = error.message || String(error);
       console.error(`[TelegramManager] Error sending message to ${channelUsername}:`, this.lastError);
-      if (error.message?.includes('connection') || error.message?.includes('disconnected') || error.message?.includes('AUTH_KEY_DUPLICATED')) {
-        this.client = null;
-        activeClient = null;
+      if (/connection|disconnected|AUTH_KEY_DUPLICATED|SESSION_REVOKED|AUTH_KEY_UNREGISTERED/i.test(error.message || '')) {
+        if (/AUTH_KEY_DUPLICATED|SESSION_REVOKED|AUTH_KEY_UNREGISTERED/.test(error.message || '')) this.isAuthRevoked = true;
+        await this.disconnect();
       }
       return false;
     }
@@ -540,14 +540,9 @@ const retryRes = await fetch(url, {
   }
 
   public async disconnect(): Promise<void> {
-    if (this.client) {
-      try {
-        await this.client.disconnect();
-        console.log("[TelegramManager] Disconnected successfully.");
-      } catch (e) {}
-      this.client = null;
-      activeClient = null;
-    }
+    this.credentialVersion++;
+    await this.retireClient();
+    if (this.connectPromise) await this.connectPromise;
   }
 
   public isConnected(): boolean {
@@ -558,6 +553,7 @@ const retryRes = await fetch(url, {
 // Singleton and helper exports
 export let activeClient: TelegramClient | null = null;
 let managerInstance: TelegramManager | null = null;
+export const disconnectTelegram = async () => { await managerInstance?.disconnect(); };
 
 /**
  * Gets the singleton TelegramManager instance.
@@ -590,27 +586,14 @@ export const getTelegramClient = async (
   return await manager.getClient();
 };
 
-let isInitializingTelegram = false;
-
 /**
- * Initializes Telegram using environment variables.
+ * Initializes Telegram using the same saved credentials as source fetching and publishing.
  * Safe from concurrent duplicate connection attempts.
  */
 export const initializeTelegram = async (): Promise<TelegramClient | null> => {
-  if (activeClient && activeClient.connected) {
-    return activeClient;
-  }
-
-  if (isInitializingTelegram) {
-    console.log("[Telegram] Client initialization already in progress, skipping duplicate call.");
-    return activeClient;
-  }
-
-  isInitializingTelegram = true;
   try {
-    const apiId = Number(process.env.TELEGRAM_API_ID || process.env.VITE_TELEGRAM_API_ID);
-    const apiHash = process.env.TELEGRAM_API_HASH || process.env.VITE_TELEGRAM_API_HASH;
-    const sessionString = process.env.TELEGRAM_SESSION || process.env.TG_SESSION_V2 || process.env.VITE_TELEGRAM_SESSION;
+    await restoreTelegramSession();
+    const { apiId, apiHash, sessionString } = getTelegramCredentials();
 
     if (!apiId || !apiHash || !sessionString) {
       console.warn("[Telegram] Missing environment variables for GramJS session. Public channel scraper will be used.");
@@ -621,8 +604,6 @@ export const initializeTelegram = async (): Promise<TelegramClient | null> => {
   } catch (err: any) {
     console.warn("[Telegram] Failed to initialize GramJS client:", err?.message || err);
     return null;
-  } finally {
-    isInitializingTelegram = false;
   }
 };
 

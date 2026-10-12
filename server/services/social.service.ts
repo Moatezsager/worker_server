@@ -1,4 +1,5 @@
 import { TelegramManager, getTelegramManager } from '../../telegramClient';
+import { getTelegramCredentials } from './telegramSession.service';
 import { appConfig, telegramManager, setTelegramManager } from '../config';
 import { rates } from '../state';
 import { db, supabase, supabaseKey } from '../db';
@@ -120,9 +121,7 @@ const RETRY_BASE_DELAY_MS = 30 * 1000; // 30 ثانية، 60، 120
 
 
 export function getOrInitTelegramManager(): TelegramManager {
-  const apiId = Number(process.env.TELEGRAM_API_ID || appConfig.telegramApiId || 0);
-  const apiHash = process.env.TELEGRAM_API_HASH || appConfig.telegramApiHash || "";
-  const sessionString = process.env.TELEGRAM_SESSION || process.env.TG_SESSION_V2 || appConfig.telegramSessionString || "";
+  const { apiId, apiHash, sessionString } = getTelegramCredentials();
   const botToken = process.env.TELEGRAM_BOT_TOKEN || appConfig.telegramBotToken || "";
   
   const manager = getTelegramManager(apiId, apiHash, sessionString, botToken);
