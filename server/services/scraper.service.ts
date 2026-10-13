@@ -657,7 +657,7 @@ export const extractRatesFromText = (originalText: string) => {
 
   const processTermValue = (term: typeof compiledTerms[0], valStr: string): number | null => {
     if (term.id === 'OFFICIAL_USD') return null;
-    let cleanValStr = valStr;
+    let cleanValStr = valStr.replace(/\s+/g, '').trim();
     if (cleanValStr.includes(',')) {
       if (/^\d+,\d{1,4}$/.test(cleanValStr)) {
         cleanValStr = cleanValStr.replace(',', '.');

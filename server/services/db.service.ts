@@ -667,6 +667,8 @@ let notificationPending = false;
 let notificationSnapshot: typeof rates | undefined;
 let notificationMarket: 'parallel' | 'official' | 'both' = 'both';
 let confirmedWebRevision = '';
+let confirmedParallelRevision = '';
+let confirmedOfficialRevision = '';
 let confirmedWebAt = 0;
 let failedWebRevision = '';
 let failedWebAt = 0;
@@ -674,18 +676,34 @@ function webRevision(snapshot: typeof rates) {
   return JSON.stringify([snapshot.lastUpdated, snapshot.parallel.USD || null,
     snapshot.parallel.EUR || null, snapshot.official.USD || null, snapshot.official.EUR || null]);
 }
+function parallelRevision(snapshot: typeof rates) {
+  return JSON.stringify([Number(snapshot.parallel?.USD) || null, Number(snapshot.parallel?.EUR) || null]);
+}
+function officialRevision(snapshot: typeof rates) {
+  return JSON.stringify([Number(snapshot.official?.USD) || null, Number(snapshot.official?.EUR) || null]);
+}
 
 export async function ensureWebRatesReady(market: 'parallel' | 'official' | 'both' = 'both'): Promise<boolean> {
   const snapshot = structuredClone(rates), revision = webRevision(snapshot);
   if (confirmedWebRevision === revision && Date.now() - confirmedWebAt < 30000) return true;
+  if (market === 'parallel' && confirmedParallelRevision === parallelRevision(snapshot) && Date.now() - confirmedWebAt < 30000) return true;
+  if (market === 'official' && confirmedOfficialRevision === officialRevision(snapshot) && Date.now() - confirmedWebAt < 30000) return true;
   if (failedWebRevision === revision && Date.now() - failedWebAt < 30000) return false;
   const synchronized = await notifyWebServers(snapshot, market);
-  return synchronized && (confirmedWebRevision === revision || (market === 'official' && Number(rates.official.USD) > 0)) && (webRevision(rates) === revision || (market === 'official' && Number(rates.official.USD) > 0));
+  return synchronized && (
+    confirmedWebRevision === revision ||
+    (market === 'parallel' && Number(rates.parallel.USD) > 0) ||
+    (market === 'official' && Number(rates.official.USD) > 0)
+  ) && (
+    webRevision(rates) === revision ||
+    (market === 'parallel' && Number(rates.parallel.USD) > 0) ||
+    (market === 'official' && Number(rates.official.USD) > 0)
+  );
 }
 
 export function notifyWebServers(snapshot?: typeof rates, market: 'parallel' | 'official' | 'both' = 'both'): Promise<boolean> {
-  const webUrl = process.env.WEB_SERVER_URL;
-  const secret = process.env.WORKER_INTERNAL_SECRET;
+  const webUrl = (process.env.WEB_SERVER_URL || '').trim();
+  const secret = (process.env.WORKER_INTERNAL_SECRET || '').trim();
   if (!webUrl || !secret) return Promise.resolve(false);
   notificationPending = true;
   if (snapshot) { notificationSnapshot = structuredClone(snapshot); notificationMarket = market; }
@@ -720,8 +738,8 @@ export function notifyWebServers(snapshot?: typeof rates, market: 'parallel' | '
                 (!expected.official?.EUR || matchesRate(result.official?.EUR, expected.official.EUR));
               const resTime = Date.parse(result.lastUpdated);
               const expTime = Date.parse(expected.lastUpdated);
-              const isTimestampValid = !isNaN(resTime) && !isNaN(expTime) && (resTime >= expTime - 2000);
-              const timeConfirmed = expectedMarket === 'official' ? (isTimestampValid || officialMatches) : isTimestampValid;
+              const isTimestampValid = !isNaN(resTime) && !isNaN(expTime) && (resTime >= expTime - 5000);
+              const timeConfirmed = expectedMarket === 'official' ? (isTimestampValid || officialMatches) : expectedMarket === 'parallel' ? (isTimestampValid || parallelMatches) : (isTimestampValid || (parallelMatches && officialMatches));
               if (result.status !== 'synchronized' ||
                   !timeConfirmed ||
                   (expectedMarket !== 'official' && !parallelMatches) ||
@@ -730,6 +748,8 @@ export function notifyWebServers(snapshot?: typeof rates, market: 'parallel' | '
               }
               const marketConfirmed = expectedMarket === 'official' ? officialMatches : expectedMarket === 'parallel' ? parallelMatches : (parallelMatches && officialMatches);
               confirmedWebRevision = marketConfirmed ? webRevision(expected) : '';
+              if (parallelMatches) confirmedParallelRevision = parallelRevision(expected);
+              if (officialMatches) confirmedOfficialRevision = officialRevision(expected);
               confirmedWebAt = Date.now();
               failedWebRevision = '';
             }
