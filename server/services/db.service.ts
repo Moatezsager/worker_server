@@ -252,7 +252,11 @@ export async function saveToSupabase(
   delete saved.lastChanged.parallel.OFFICIAL_USD;
   delete saved.lastChanged.parallel.official_usd;
   const now = new Date().toISOString();
-  const recordedAt = saved.lastUpdated || now;
+  if (type === 'official' || !saved.lastUpdated) {
+    saved.lastUpdated = now;
+    snapshot.lastUpdated = now;
+  }
+  const recordedAt = saved.lastUpdated;
   try {
     // Confirm authoritative saves before writing compatibility copies.
     if (type === 'parallel' || type === 'both') {

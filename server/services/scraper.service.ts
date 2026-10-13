@@ -547,11 +547,12 @@ async function fetchOfficialRatesJob(force: boolean, isManualAdmin: boolean): Pr
   });
 
   // 5. SAVE TO SUPABASE (Persistence Check BEFORE modifying in-memory state!)
+  const candidateSnapshot = {
+    ...rates,
+    lastChanged: { ...rates.lastChanged, official: { ...rates.lastChanged.official, ...candidateLastChanged } }
+  };
   try {
-    const saveSuccess = await saveToSupabase('official', candidateOfficialRates, {
-      ...rates, lastUpdated: new Date().toISOString(),
-      lastChanged: { ...rates.lastChanged, official: { ...rates.lastChanged.official, ...candidateLastChanged } }
-    });
+    const saveSuccess = await saveToSupabase('official', candidateOfficialRates, candidateSnapshot);
     if (!saveSuccess) {
       console.error(`[CBL] ${CBL_STATUS.SAVE_FAILED}: saveToSupabase reported database failure. In-memory state and success timestamps NOT updated.`);
       await logErrorArabic("فشل حفظ أسعار المصرف المركزي في قاعدة البيانات", "مصرف ليبيا المركزي");
@@ -568,7 +569,7 @@ async function fetchOfficialRatesJob(force: boolean, isManualAdmin: boolean): Pr
   rates.official = candidateOfficialRates;
   rates.previousOfficial = { ...rates.previousOfficial, ...candidatePreviousOfficial };
   rates.lastChanged.official = { ...rates.lastChanged.official, ...candidateLastChanged };
-  rates.lastUpdated = new Date().toISOString();
+  rates.lastUpdated = candidateSnapshot.lastUpdated || new Date().toISOString();
 
   if (anyChanged) {
     console.log(`[Official] Rates updated via CBL Scraper (USD: ${rates.official.USD})`);
@@ -626,8 +627,14 @@ export function stripArabicDiacritics(text: string): string {
   return result;
 }
 
+export function normalizeArabicDigits(text: string): string {
+  return text
+    .replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d).toString())
+    .replace(/[۰-۹]/g, d => '۰۱۲۳۴۵۶۷۸۹'.indexOf(d).toString());
+}
+
 export const extractRatesFromText = (originalText: string) => {
-  const cleanText = stripArabicDiacritics(originalText);
+  const cleanText = normalizeArabicDigits(stripArabicDiacritics(originalText));
   
   // Ignore non-price execution status and banking card tracking reports
   if (isNonPriceAnnouncement(cleanText)) {
@@ -645,7 +652,14 @@ export const extractRatesFromText = (originalText: string) => {
 
   const processTermValue = (term: typeof compiledTerms[0], valStr: string): number | null => {
     if (term.id === 'OFFICIAL_USD') return null;
-    let cleanValStr = valStr.replace(/,/g, ''); 
+    let cleanValStr = valStr;
+    if (cleanValStr.includes(',')) {
+      if (/^\d+,\d{1,4}$/.test(cleanValStr)) {
+        cleanValStr = cleanValStr.replace(',', '.');
+      } else {
+        cleanValStr = cleanValStr.replace(/,/g, '');
+      }
+    }
     let val = parseFloat(cleanValStr);
     
     if (term.id === 'GOLD_LIRA' && val < 500) return null;

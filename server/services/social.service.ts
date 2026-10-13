@@ -340,12 +340,21 @@ async function refreshFacebookPricePreview() {
   if (facebookPreviewRevision !== revision) throw new Error('تغيرت الأسعار أثناء تحديث معاينة فيسبوك؛ أعد المحاولة.');
 }
 
-export async function broadcastToSocialMedia(message: string, isTest: boolean = false, target: 'all' | 'telegram' | 'facebook' = 'all', isManual: boolean = false) {
+export async function broadcastToSocialMedia(
+  message: string,
+  isTest: boolean = false,
+  target: 'all' | 'telegram' | 'facebook' = 'all',
+  isManual: boolean = false,
+  market?: 'parallel' | 'official' | 'both'
+) {
   const sentTargets: ('telegram' | 'facebook')[] = [];
+
+  const isOfficial = market === 'official' || (!market && (message.includes('مصرف ليبيا المركزي') || message.includes('نشرة أسعار مصرف ليبيا المركزي')));
+  const targetMarket: 'parallel' | 'official' | 'both' = market || (isOfficial ? 'official' : 'parallel');
 
   const hasPriceLink = message.includes('https://tinyurl.com/2j7667u2') ||
     message.includes(new URL(process.env.WEB_SERVER_URL || 'https://dollar-price-qp14.onrender.com/').origin);
-  if (!isTest && hasPriceLink && !await ensureWebRatesReady()) {
+  if (!isTest && hasPriceLink && !await ensureWebRatesReady(targetMarket)) {
     throw new Error('لم تكتمل مزامنة Web ومعاينة الأسعار؛ لم يُرسل المنشور.');
   }
 
@@ -735,7 +744,7 @@ export async function broadcastOfficialRates(
           (officialDelivery.attempts[platform] || 0) > MAX_RETRY_ATTEMPTS ||
           (officialDelivery.retryAt[platform] || 0) > Date.now())) continue;
       try {
-        await broadcastToSocialMedia(message, isTest, platform, isManual || isTest);
+        await broadcastToSocialMedia(message, isTest, platform, isManual || isTest, 'official');
         if (!isTest) officialDelivery.delivered[platform] = true;
         addBroadcastLog({ platform, currency_ids: officialEntries.map(([id]) => 'OFFICIAL_' + id),
           status: 'success', attempts: 1, is_test: isTest ? 1 : isManual ? 2 : 0 });
@@ -1554,8 +1563,8 @@ export async function executeBroadcast(
   }
   const start = Date.now();
   try {
-    if (!isTest && !await ensureWebRatesReady()) throw new Error('لم تكتمل مزامنة Web ومعاينة الأسعار؛ التحديث محفوظ في الطابور.');
-    const result = await broadcastToSocialMedia(formatSmartBroadcastMessage(updates, customHeaderTitle), isTest, target, isManual);
+    if (!isTest && !await ensureWebRatesReady('parallel')) throw new Error('لم تكتمل مزامنة Web ومعاينة الأسعار؛ التحديث محفوظ في الطابور.');
+    const result = await broadcastToSocialMedia(formatSmartBroadcastMessage(updates, customHeaderTitle), isTest, target, isManual, 'parallel');
     if (!result.sentTargets.length) return false;
     if (!isTest) recordBroadcast(updates);
     for (const platform of result.sentTargets) addBroadcastLog({
