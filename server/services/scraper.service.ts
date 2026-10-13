@@ -270,6 +270,7 @@ function normalizeDateString(rawDate: string): string | null {
   // Normalize Eastern Arabic numerals (٠-٩) to standard ASCII digits (0-9)
   const clean = rawDate
     .replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d).toString())
+    .replace(/[۰-۹]/g, d => '۰۱۲۳۴۵۶۷۸۹'.indexOf(d).toString())
     .trim();
   
   // Format 1: YYYY-MM-DD or YYYY/MM/DD
@@ -387,6 +388,8 @@ export function parseCBLHtml(html: string): { cblDate: string, rates: RateMap } 
         if (sellCell) sellHtml = sellCell;
         const normalizedSell = sellHtml
           .replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d).toString())
+          .replace(/[۰-۹]/g, d => '۰۱۲۳۴۵۶۷۸۹'.indexOf(d).toString())
+          .replace(/[٫]/g, '.')
           .replace(/,/g, '.');
         const match = normalizedSell.match(/[\d.]+/);
         if (match) {
@@ -630,7 +633,9 @@ export function stripArabicDiacritics(text: string): string {
 export function normalizeArabicDigits(text: string): string {
   return text
     .replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d).toString())
-    .replace(/[۰-۹]/g, d => '۰۱۲۳۴۵۶۷۸۹'.indexOf(d).toString());
+    .replace(/[۰-۹]/g, d => '۰۱۲۳۴۵۶۷۸۹'.indexOf(d).toString())
+    .replace(/[٫]/g, '.')
+    .replace(/[،]/g, ',');
 }
 
 export const extractRatesFromText = (originalText: string) => {
@@ -666,10 +671,6 @@ export const extractRatesFromText = (originalText: string) => {
     
     // Smart extraction for TND (Ensure 1 TND = X LYD format)
     if (term.id === 'TND') {
-      if (valStr.includes(',')) {
-        val = parseFloat(valStr.replace(/,/g, '.'));
-      }
-      
       if (val >= 100 && val <= 500) {
         val = val / 100;
       } else if (val >= 20 && val < 100) {
@@ -681,9 +682,6 @@ export const extractRatesFromText = (originalText: string) => {
     
     // Smart extraction for EGP
     if (term.id === 'EGP') {
-      if (valStr.includes(',')) {
-        val = parseFloat(valStr.replace(/,/g, '.'));
-      }
       if (val >= 10.0 && val <= 100.0) {
         val = val / 100;
       } else if (val >= 2.0 && val < 10.0) {
@@ -693,9 +691,6 @@ export const extractRatesFromText = (originalText: string) => {
     
     // Smart extraction for TRY
     if (term.id === 'TRY') {
-      if (valStr.includes(',')) {
-        val = parseFloat(valStr.replace(/,/g, '.'));
-      }
       if (val >= 10.0 && val <= 100.0) {
         val = val / 100;
       } else if (val >= 2.0 && val < 10.0) {

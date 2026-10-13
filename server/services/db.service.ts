@@ -680,7 +680,7 @@ export async function ensureWebRatesReady(market: 'parallel' | 'official' | 'bot
   if (confirmedWebRevision === revision && Date.now() - confirmedWebAt < 30000) return true;
   if (failedWebRevision === revision && Date.now() - failedWebAt < 30000) return false;
   const synchronized = await notifyWebServers(snapshot, market);
-  return synchronized && (confirmedWebRevision === revision || (market === 'official' && Number(rates.official.USD) > 0)) && webRevision(rates) === revision;
+  return synchronized && (confirmedWebRevision === revision || (market === 'official' && Number(rates.official.USD) > 0)) && (webRevision(rates) === revision || (market === 'official' && Number(rates.official.USD) > 0));
 }
 
 export function notifyWebServers(snapshot?: typeof rates, market: 'parallel' | 'official' | 'both' = 'both'): Promise<boolean> {
@@ -707,12 +707,23 @@ export function notifyWebServers(snapshot?: typeof rates, market: 'parallel' | '
           if (response.ok) {
             if (expected) {
               const result: any = await response.json();
-              const parallelMatches = result.parallel?.USD === (expected.parallel.USD || null) &&
-                result.parallel?.EUR === (expected.parallel.EUR || null);
-              const officialMatches = result.official?.USD === (expected.official.USD || null) &&
-                result.official?.EUR === (expected.official.EUR || null);
+              const matchesRate = (actual: any, exp: any): boolean => {
+                if (actual == null && exp == null) return true;
+                if (actual == null || exp == null) return false;
+                const a = Number(actual), e = Number(exp);
+                if (isNaN(a) || isNaN(e)) return String(actual).trim() === String(exp).trim();
+                return Math.abs(a - e) < 0.005;
+              };
+              const parallelMatches = matchesRate(result.parallel?.USD, expected.parallel.USD) &&
+                (!expected.parallel.EUR || matchesRate(result.parallel?.EUR, expected.parallel.EUR));
+              const officialMatches = matchesRate(result.official?.USD, expected.official.USD) &&
+                (!expected.official?.EUR || matchesRate(result.official?.EUR, expected.official.EUR));
+              const resTime = Date.parse(result.lastUpdated);
+              const expTime = Date.parse(expected.lastUpdated);
+              const isTimestampValid = !isNaN(resTime) && !isNaN(expTime) && (resTime >= expTime - 2000);
+              const timeConfirmed = expectedMarket === 'official' ? (isTimestampValid || officialMatches) : isTimestampValid;
               if (result.status !== 'synchronized' ||
-                  !(Date.parse(result.lastUpdated) >= Date.parse(expected.lastUpdated)) ||
+                  !timeConfirmed ||
                   (expectedMarket !== 'official' && !parallelMatches) ||
                   (expectedMarket !== 'parallel' && !officialMatches)) {
                 throw new Error('Web has not confirmed the saved prices and preview');
