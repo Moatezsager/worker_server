@@ -16,6 +16,7 @@ import { extractRatesWithAI } from "../services/ai.service";
 import { 
   broadcastToSocialMedia, 
   broadcastRateChanges,
+  broadcastOfficialRates,
   getBroadcastDisplayRank,
   getBroadcastQueueStatus, 
   flushBroadcastQueueImmediately, 
@@ -293,9 +294,31 @@ dashboardRouter.post("/api/dashboard/trigger", async (req: Request, res: Respons
         const result = await runJobSafely(
           "official_rates_scraper",
           "جلب وتحديث أسعار مصرف ليبيا المركزي الرسمي (يدوي من اللوحة)",
-          async () => await fetchOfficialRates(true, true)
+          async () => {
+            const fetched = await fetchOfficialRates(true, true);
+            if (rates.official.USD && rates.official.USD > 0) {
+              await broadcastOfficialRates(false, "all", true).catch(err => {
+                console.warn("[Dashboard CBL] Manual broadcast notice:", err?.message || err);
+              });
+            }
+            return fetched;
+          }
         );
-        return res.json({ success: true, message: "تم تشغيل جلب المصرف المركزي", result });
+        return res.json({ success: true, message: "تم تشغيل جلب ومزامنة المصرف المركزي", result });
+      }
+
+      case "broadcast_official":
+      case "broadcast_cbl": {
+        const result = await runJobSafely(
+          "official_rates_broadcast",
+          "نشر نشرة أسعار مصرف ليبيا المركزي الرسمية",
+          async () => await broadcastOfficialRates(false, "all", true)
+        );
+        return res.json({
+          success: !!result,
+          message: result ? "تم نشر نشرة المصرف المركزي بنجاح على القنوات!" : "تعذر نشر النشرة الرسمية، يرجى مراجعة سجلات الاتصال بالمنصات",
+          result
+        });
       }
 
       case "telegram": {

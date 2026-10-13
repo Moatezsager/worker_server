@@ -671,12 +671,12 @@ function webRevision(snapshot: typeof rates) {
     snapshot.parallel.EUR || null, snapshot.official.USD || null, snapshot.official.EUR || null]);
 }
 
-export async function ensureWebRatesReady(): Promise<boolean> {
+export async function ensureWebRatesReady(market: 'parallel' | 'official' | 'both' = 'both'): Promise<boolean> {
   const snapshot = structuredClone(rates), revision = webRevision(snapshot);
   if (confirmedWebRevision === revision && Date.now() - confirmedWebAt < 30000) return true;
   if (failedWebRevision === revision && Date.now() - failedWebAt < 30000) return false;
-  const synchronized = await notifyWebServers(snapshot);
-  return synchronized && confirmedWebRevision === revision && webRevision(rates) === revision;
+  const synchronized = await notifyWebServers(snapshot, market);
+  return synchronized && (confirmedWebRevision === revision || (market === 'official' && Number(rates.official.USD) > 0)) && webRevision(rates) === revision;
 }
 
 export function notifyWebServers(snapshot?: typeof rates, market: 'parallel' | 'official' | 'both' = 'both'): Promise<boolean> {
@@ -713,7 +713,8 @@ export function notifyWebServers(snapshot?: typeof rates, market: 'parallel' | '
                   (expectedMarket !== 'parallel' && !officialMatches)) {
                 throw new Error('Web has not confirmed the saved prices and preview');
               }
-              confirmedWebRevision = parallelMatches && officialMatches ? webRevision(expected) : '';
+              const marketConfirmed = expectedMarket === 'official' ? officialMatches : expectedMarket === 'parallel' ? parallelMatches : (parallelMatches && officialMatches);
+              confirmedWebRevision = marketConfirmed ? webRevision(expected) : '';
               confirmedWebAt = Date.now();
               failedWebRevision = '';
             }

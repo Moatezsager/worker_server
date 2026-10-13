@@ -1166,9 +1166,12 @@ export function renderDashboardHtml(initialState?: any): string {
     <div id="tab-content-rates">
       
       <!-- Quick Action Buttons -->
-      <div style="display:grid; grid-template-columns:repeat(2, 1fr); gap:8px; margin-bottom:8px;">
+      <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; margin-bottom:8px;">
         <button class="btn btn-action" onclick="triggerJob('cbl', 'جلب مصرف ليبيا المركزي')">
           🏦 جلب أسعار CBL
+        </button>
+        <button class="btn btn-action" onclick="triggerJob('broadcast_official', 'نشر نشرة المصرف المركزي')">
+          📢 نشر النشرة الرسمية
         </button>
         <button class="btn btn-action" onclick="triggerJob('telegram', 'جلب أسعار تيليجرام')">
           📱 جلب تيليجرام الموازي
@@ -2930,6 +2933,7 @@ export function renderDashboardHtml(initialState?: any): string {
     function triggerJobById(jobId, jobName) {
       const map = {
         'official_rates_scraper': 'cbl',
+        'official_rates_broadcast': 'broadcast_official',
         'parallel_rates_scraper': 'telegram',
         'database_cleanup': 'maintenance',
         'periodic_supabase_sync': 'refresh',

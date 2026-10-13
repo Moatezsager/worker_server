@@ -662,7 +662,8 @@ const OFFICIAL_CURRENCIES_INFO: Record<string, { name: string; flag: string; ran
 
 export async function broadcastOfficialRates(
   isTest: boolean = false, 
-  target: 'all' | 'telegram' | 'facebook' = 'all'
+  target: 'all' | 'telegram' | 'facebook' = 'all',
+  isManual: boolean = false
 ): Promise<boolean> {
   if (!Number.isFinite(rates.official.USD) || rates.official.USD <= 0) return false;
   const now = new Date();
@@ -674,11 +675,14 @@ export async function broadcastOfficialRates(
   const dateStr = now.toLocaleDateString('ar-LY', { timeZone: 'Africa/Tripoli' });
   const timeStr = now.toLocaleTimeString('ar-LY', { timeZone: 'Africa/Tripoli', hour: '2-digit', minute: '2-digit' });
   
-  if (!isTest && (lastOfficialBroadcastDate === todayLibyaKey || lastOfficialBroadcastDate === dateStr)) {
+  if (!isTest && !isManual && (lastOfficialBroadcastDate === todayLibyaKey || lastOfficialBroadcastDate === dateStr)) {
     console.log(`[Official Broadcast] Already broadcasted for today (${todayLibyaKey}). Skipping duplicate post.`);
     return true;
   }
-  if (!isTest && !await ensureWebRatesReady()) return false;
+  if (!isTest && !await ensureWebRatesReady('official')) {
+    console.warn("[Official Broadcast] Web server rates are not synchronized yet for official market. Holding broadcast.");
+    return false;
+  }
 
   const dayNames = ["الأحد", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"];
   let dayName = "الخميس";
@@ -719,19 +723,22 @@ export async function broadcastOfficialRates(
   officialSending = true;
   try {
     const required: ('telegram' | 'facebook')[] = ['telegram', 'facebook'].filter(platform =>
-      (target === 'all' || target === platform) && (isTest ||
+      (target === 'all' || target === platform) && (isTest || isManual ||
        (platform === 'telegram' ? appConfig.telegramAutoPost : appConfig.facebookAutoPost))) as ('telegram' | 'facebook')[];
-    if (!required.length) return true;
+    if (!required.length) {
+      console.log("[Official Broadcast] No target platforms enabled for broadcast (telegramAutoPost/facebookAutoPost are off). Holding broadcast until enabled or manually triggered.");
+      return false;
+    }
     if (officialDelivery.date !== todayLibyaKey) officialDelivery = { date: todayLibyaKey, delivered: {}, attempts: {}, retryAt: {} };
     for (const platform of required) {
-      if (!isTest && (officialDelivery.delivered[platform] ||
+      if (!isTest && !isManual && (officialDelivery.delivered[platform] ||
           (officialDelivery.attempts[platform] || 0) > MAX_RETRY_ATTEMPTS ||
           (officialDelivery.retryAt[platform] || 0) > Date.now())) continue;
       try {
-        await broadcastToSocialMedia(message, isTest, platform, isTest);
+        await broadcastToSocialMedia(message, isTest, platform, isManual || isTest);
         if (!isTest) officialDelivery.delivered[platform] = true;
         addBroadcastLog({ platform, currency_ids: officialEntries.map(([id]) => 'OFFICIAL_' + id),
-          status: 'success', attempts: 1, is_test: isTest ? 1 : 0 });
+          status: 'success', attempts: 1, is_test: isTest ? 1 : isManual ? 2 : 0 });
       } catch (err: any) {
         if (isTest) throw err;
         const attempt = (officialDelivery.attempts[platform] || 0) + 1;
@@ -739,7 +746,7 @@ export async function broadcastOfficialRates(
         officialDelivery.retryAt[platform] = Date.now() + RETRY_BASE_DELAY_MS * 2 ** Math.min(attempt - 1, 3);
         officialDelivery.lastError = String(err?.message || err);
         addBroadcastLog({ platform, currency_ids: officialEntries.map(([id]) => 'OFFICIAL_' + id),
-          status: 'failed', attempts: attempt, error_message: officialDelivery.lastError, is_test: 0 });
+          status: 'failed', attempts: attempt, error_message: officialDelivery.lastError, is_test: isManual ? 2 : 0 });
       }
       if (!isTest) {
         persistBroadcastQueue();
