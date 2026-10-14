@@ -4,7 +4,7 @@ import { appConfig } from '../config';
 import { HistoryPoint, PriceChangeLog, RateMap, AppConfig } from '../types';
 import { isSignificantChange, METAL_IDS } from '../utils/helpers';
 import { updateStats } from './reporting.service';
-import { addLog } from '../utils/logger';
+import { addLog, sanitizeErrorMessage } from '../utils/logger';
 
 export let lastRatesFetchTime = 0;
 export const RATES_CACHE_TTL = 30 * 1000; // 30 seconds
@@ -297,6 +297,10 @@ export async function saveToSupabase(
     if (error) console.warn('[DB] Compatibility copy failed after authoritative save:', String(error?.message || error));
   }
   clearDbCache();
+  addLog('success', 'حفظ الأسعار', 'حُفظت الأسعار؛ بدء تأكيد مزامنة Web قبل النشر', {
+    stage: 'persist', market: type, recordedAt, parallel: { USD: saved.parallel.USD, EUR: saved.parallel.EUR },
+    official: { USD: saved.official.USD, EUR: saved.official.EUR }
+  });
   // A saved price remains authoritative even if Web is temporarily unavailable.
   await notifyWebServers(saved, type);
   return true;
@@ -666,45 +670,42 @@ let webNotification: Promise<boolean> | null = null;
 let notificationPending = false;
 let notificationSnapshot: typeof rates | undefined;
 let notificationMarket: 'parallel' | 'official' | 'both' = 'both';
-let confirmedWebRevision = '';
-let confirmedParallelRevision = '';
-let confirmedOfficialRevision = '';
-let confirmedWebAt = 0;
-let failedWebRevision = '';
-let failedWebAt = 0;
-function webRevision(snapshot: typeof rates) {
-  return JSON.stringify([snapshot.lastUpdated, snapshot.parallel.USD || null,
-    snapshot.parallel.EUR || null, snapshot.official.USD || null, snapshot.official.EUR || null]);
-}
-function parallelRevision(snapshot: typeof rates) {
-  return JSON.stringify([Number(snapshot.parallel?.USD) || null, Number(snapshot.parallel?.EUR) || null]);
-}
-function officialRevision(snapshot: typeof rates) {
-  return JSON.stringify([Number(snapshot.official?.USD) || null, Number(snapshot.official?.EUR) || null]);
+type WebMarket = 'parallel' | 'official' | 'both';
+const confirmedWeb: Partial<Record<WebMarket, { revision: string; at: number }>> = {};
+const failedWeb: Partial<Record<WebMarket, { revision: string; at: number; message: string }>> = {};
+function webRevision(snapshot: typeof rates, market: WebMarket) {
+  return JSON.stringify(market === 'both' ? [snapshot.lastUpdated, snapshot.parallel.USD, snapshot.parallel.EUR, snapshot.official.USD, snapshot.official.EUR]
+    : [snapshot[market].USD, snapshot[market].EUR]);
 }
 
-export async function ensureWebRatesReady(market: 'parallel' | 'official' | 'both' = 'both'): Promise<boolean> {
-  const snapshot = structuredClone(rates), revision = webRevision(snapshot);
-  if (confirmedWebRevision === revision && Date.now() - confirmedWebAt < 30000) return true;
-  if (market === 'parallel' && confirmedParallelRevision === parallelRevision(snapshot) && Date.now() - confirmedWebAt < 30000) return true;
-  if (market === 'official' && confirmedOfficialRevision === officialRevision(snapshot) && Date.now() - confirmedWebAt < 30000) return true;
-  if (failedWebRevision === revision && Date.now() - failedWebAt < 30000) return false;
-  const synchronized = await notifyWebServers(snapshot, market);
-  return synchronized && (
-    confirmedWebRevision === revision ||
-    (market === 'parallel' && Number(rates.parallel.USD) > 0) ||
-    (market === 'official' && Number(rates.official.USD) > 0)
-  ) && (
-    webRevision(rates) === revision ||
-    (market === 'parallel' && Number(rates.parallel.USD) > 0) ||
-    (market === 'official' && Number(rates.official.USD) > 0)
-  );
+export function getWebRatesSyncError(market: WebMarket = 'both'): string {
+  return failedWeb[market]?.message || 'لم يؤكد Web الأسعار المحفوظة بعد؛ التحديث لم يُرسل.';
 }
 
-export function notifyWebServers(snapshot?: typeof rates, market: 'parallel' | 'official' | 'both' = 'both'): Promise<boolean> {
+export async function ensureWebRatesReady(market: WebMarket = 'both'): Promise<boolean> {
+  const snapshot = structuredClone(rates), revision = webRevision(snapshot, market);
+  const confirmed = confirmedWeb[market], failed = failedWeb[market];
+  if (confirmed?.revision === revision && Date.now() - confirmed.at < 30000) return true;
+  if (failed?.revision === revision && Date.now() - failed.at < 30000) return false;
+  await notifyWebServers(snapshot, market);
+  // A concurrent notification can complete for another market or a newer price.
+  return confirmedWeb[market]?.revision === revision && webRevision(rates, market) === revision;
+}
+
+export function notifyWebServers(snapshot?: typeof rates, market: WebMarket = 'both'): Promise<boolean> {
   const webUrl = (process.env.WEB_SERVER_URL || '').trim();
   const secret = (process.env.WORKER_INTERNAL_SECRET || '').trim();
-  if (!webUrl || !secret) return Promise.resolve(false);
+  if (!webUrl || !secret) {
+    const revision = webRevision(snapshot || rates, market);
+    const message = !webUrl ? 'WEB_SERVER_URL مفقود في Worker؛ لا يمكن تأكيد المزامنة.'
+      : 'WORKER_INTERNAL_SECRET مفقود في Worker؛ لا يمكن توثيق طلب المزامنة.';
+    if (failedWeb[market]?.message !== message || Date.now() - failedWeb[market]!.at >= 30000) {
+      addLog('error', 'مزامنة Web', message, { stage: 'web-sync', market, code: 'MISSING_CONFIGURATION' });
+    }
+    failedWeb[market] = { revision, at: Date.now(), message };
+    delete confirmedWeb[market]; delete confirmedWeb.both;
+    return Promise.resolve(false);
+  }
   notificationPending = true;
   if (snapshot) { notificationSnapshot = structuredClone(snapshot); notificationMarket = market; }
   if (webNotification) return webNotification;
@@ -716,12 +717,22 @@ export function notifyWebServers(snapshot?: typeof rates, market: 'parallel' | '
       const expectedMarket = notificationMarket;
       notificationSnapshot = undefined;
       synchronized = false;
+      const started = Date.now();
+      let lastFailure = '';
+      let diagnostic: Record<string, any> = { stage: 'web-sync', market: expectedMarket };
+      addLog('info', 'مزامنة Web', 'طلب تأكيد تحميل الأسعار وتحديث المعاينة وSocket.IO', diagnostic);
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          const response = await fetch(`${webUrl.replace(/\/$/, '')}/api/internal/notify-rates-updated${expected ? '?wait=true' : ''}`, {
+          const endpoint = new URL(`/api/internal/notify-rates-updated${expected ? '?wait=true' : ''}`, webUrl);
+          if (!['https:', 'http:'].includes(endpoint.protocol) || endpoint.username || endpoint.password) throw new Error('WEB_SERVER_URL غير صالح.');
+          diagnostic = { stage: 'web-sync', market: expectedMarket, endpoint: endpoint.origin + endpoint.pathname,
+            attempt: attempt + 1, expected: expected && { lastUpdated: expected.lastUpdated,
+              parallel: { USD: expected.parallel.USD, EUR: expected.parallel.EUR }, official: { USD: expected.official.USD, EUR: expected.official.EUR } } };
+          const response = await fetch(endpoint.toString(), {
             method: 'POST', headers: { 'Content-Type': 'application/json', 'x-worker-secret': secret, 'User-Agent': 'Dollar-Price-Worker/1.0' },
-            signal: AbortSignal.timeout(expected ? 20000 : 5000)
+            signal: AbortSignal.timeout(expected ? 20000 : 5000), redirect: 'error'
           });
+          diagnostic.httpStatus = response.status;
           if (response.ok) {
             if (expected) {
               const result: any = await response.json();
@@ -729,47 +740,66 @@ export function notifyWebServers(snapshot?: typeof rates, market: 'parallel' | '
                 if (actual == null && exp == null) return true;
                 if (actual == null || exp == null) return false;
                 const a = Number(actual), e = Number(exp);
-                if (isNaN(a) || isNaN(e)) return String(actual).trim() === String(exp).trim();
-                return Math.abs(a - e) < 0.005;
+                return Number.isFinite(a) && Number.isFinite(e) && Math.abs(a - e) < 0.005;
               };
-              const parallelMatches = matchesRate(result.parallel?.USD, expected.parallel.USD) &&
+              const parallelMatches = Number.isFinite(expected.parallel.USD) && expected.parallel.USD > 0 && matchesRate(result.parallel?.USD, expected.parallel.USD) &&
                 (!expected.parallel.EUR || matchesRate(result.parallel?.EUR, expected.parallel.EUR));
-              const officialMatches = matchesRate(result.official?.USD, expected.official.USD) &&
+              const officialMatches = Number.isFinite(expected.official?.USD) && expected.official.USD > 0 && matchesRate(result.official?.USD, expected.official.USD) &&
                 (!expected.official?.EUR || matchesRate(result.official?.EUR, expected.official.EUR));
               const resTime = Date.parse(result.lastUpdated);
               const expTime = Date.parse(expected.lastUpdated);
               const isTimestampValid = !isNaN(resTime) && !isNaN(expTime) && (resTime >= expTime - 5000);
-              const timeConfirmed = expectedMarket === 'official' ? (isTimestampValid || officialMatches) : expectedMarket === 'parallel' ? (isTimestampValid || parallelMatches) : (isTimestampValid || (parallelMatches && officialMatches));
+              diagnostic.received = { status: result.status, lastUpdated: result.lastUpdated, parallel: result.parallel, official: result.official };
+              const marketMatches = expectedMarket === 'official' ? officialMatches : expectedMarket === 'parallel' ? parallelMatches : parallelMatches && officialMatches;
+              const timeConfirmed = Number.isFinite(resTime) && Number.isFinite(expTime) && (isTimestampValid || marketMatches);
               if (result.status !== 'synchronized' ||
                   !timeConfirmed ||
                   (expectedMarket !== 'official' && !parallelMatches) ||
                   (expectedMarket !== 'parallel' && !officialMatches)) {
-                throw new Error('Web has not confirmed the saved prices and preview');
+                throw new Error(result.status !== 'synchronized' ? 'Web لم يرجع status=synchronized؛ تحقق من نشر إصدار Web الداعم للتأكيد.'
+                  : 'أسعار Web لا تطابق الأسعار المحفوظة؛ راجع expected وreceived في تفاصيل السجل.');
               }
-              const marketConfirmed = expectedMarket === 'official' ? officialMatches : expectedMarket === 'parallel' ? parallelMatches : (parallelMatches && officialMatches);
-              confirmedWebRevision = marketConfirmed ? webRevision(expected) : '';
-              if (parallelMatches) confirmedParallelRevision = parallelRevision(expected);
-              if (officialMatches) confirmedOfficialRevision = officialRevision(expected);
-              confirmedWebAt = Date.now();
-              failedWebRevision = '';
+              for (const confirmedMarket of ['parallel', 'official', 'both'] as const) {
+                if (confirmedMarket === 'parallel' ? parallelMatches : confirmedMarket === 'official' ? officialMatches : parallelMatches && officialMatches) {
+                  confirmedWeb[confirmedMarket] = { revision: webRevision(expected, confirmedMarket), at: Date.now() };
+                  delete failedWeb[confirmedMarket];
+                }
+              }
             }
             synchronized = true;
+            addLog('success', 'مزامنة Web', expected ? 'أكد Web تحميل الأسعار وتحديث المعاينة والبث اللحظي' : 'استلم Web إشعار التحديث (استلام فقط)',
+              { ...diagnostic, duration_ms: Date.now() - started });
             break;
           }
+          const body: any = await response.json?.().catch(() => null);
+          diagnostic.responseError = body?.error || body?.message;
+          lastFailure = response.status === 401 ? 'HTTP 401: Web رفض المصادقة؛ تحقق من WORKER_INTERNAL_SECRET في خدمة Web وعنوان WEB_SERVER_URL في Worker.'
+            : response.status === 403 ? 'HTTP 403: Web رفض الطلب؛ تحقق من تطابق WORKER_INTERNAL_SECRET وقواعد الحماية.'
+            : response.status === 404 ? 'HTTP 404: مسار المزامنة غير موجود؛ تحقق من عنوان Web والإصدار المنشور.'
+            : 'HTTP ' + response.status + ': لم يكتمل تأكيد مزامنة Web.';
           if (response.status < 500 && ![408, 429].includes(response.status)) {
-            console.error('[Notify] Web rejected update notification:', response.status);
             break;
           }
-          throw new Error('HTTP ' + response.status);
+          throw new Error(lastFailure);
         } catch (err: any) {
-          if (attempt === 2) console.error('[Notify] Web notification failed after 3 attempts:', err.message);
-          else await new Promise(resolve => setTimeout(resolve, 1000 * 2 ** attempt));
+          lastFailure = sanitizeErrorMessage(err?.name === 'TimeoutError' || err?.name === 'AbortError'
+            ? 'انتهت مهلة اتصال Web؛ راجع جاهزية الخدمة وقاعدة البيانات.' : err) || 'فشل اتصال Web';
+          diagnostic.networkCode = err?.cause?.code || err?.code;
+          if (attempt < 2) {
+            addLog('warn', 'مزامنة Web', lastFailure, { ...diagnostic, retryInSeconds: 2 ** attempt });
+            await new Promise(resolve => setTimeout(resolve, 1000 * 2 ** attempt));
+          }
         }
       }
-      if (expected && !synchronized) {
-        failedWebRevision = webRevision(expected);
-        failedWebAt = Date.now();
-        confirmedWebRevision = '';
+      if (!synchronized) {
+        lastFailure = sanitizeErrorMessage(lastFailure) || 'لم يكتمل تأكيد مزامنة Web.';
+        addLog('error', 'مزامنة Web', lastFailure, { ...diagnostic, duration_ms: Date.now() - started });
+        console.error('[Notify]', lastFailure);
+        if (expected) {
+          failedWeb[expectedMarket] = { revision: webRevision(expected, expectedMarket), at: Date.now(), message: lastFailure };
+          delete confirmedWeb[expectedMarket]; delete confirmedWeb.both;
+          if (expectedMarket === 'both') { delete confirmedWeb.parallel; delete confirmedWeb.official; }
+        }
       }
     }
     return synchronized;

@@ -1830,15 +1830,26 @@ export function renderDashboardHtml(initialState?: any): string {
 
     <!-- TAB 6: LIVE LOGS -->
     <div id="tab-content-logs" class="hidden">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:12px;">
         <div style="font-size: 13px; font-weight: 700; color: #38bdf8;">
           📜 سجل الأحداث والعمليات (Live Logs)
         </div>
-        <button class="btn btn-secondary btn-sm" onclick="clearLiveLogs()">
+        <button class="btn btn-secondary" style="min-height:44px;" onclick="clearLiveLogs()">
           مسح السجلات
         </button>
       </div>
-      <div class="logs-container" id="logs-feed" style="background:#020617; border:1px solid #334155; border-radius:10px; padding:10px; font-family:monospace; font-size:11px; height:380px; overflow-y:auto; color:#cbd5e1;">
+      <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:end; margin-bottom:12px;">
+        <label style="flex:1 1 180px; font-size:13px; color:#cbd5e1;" for="logs-search">بحث في السجل
+          <input id="logs-search" type="search" oninput="renderLiveLogs()" style="display:block; width:100%; min-height:44px; margin-top:6px; padding:8px; background:#0f172a; border:1px solid #475569; border-radius:6px; color:#f1f5f9;" />
+        </label>
+        <label style="flex:0 1 180px; font-size:13px; color:#cbd5e1;" for="logs-level">المستوى
+          <select id="logs-level" onchange="renderLiveLogs()" style="display:block; width:100%; min-height:44px; margin-top:6px; padding:8px; background:#0f172a; border:1px solid #475569; border-radius:6px; color:#f1f5f9;">
+            <option value="all">جميع الأحداث</option><option value="error">الأخطاء</option><option value="warn">التحذيرات</option><option value="success">العمليات الناجحة</option><option value="info">المعلومات</option>
+          </select>
+        </label>
+        <span id="logs-count" style="font-size:13px; color:#cbd5e1; padding-bottom:12px;"></span>
+      </div>
+      <div class="logs-container" id="logs-feed" role="region" aria-label="سجل الأحداث والعمليات" tabindex="0" style="background:#020617; border:1px solid #334155; border-radius:8px; padding:12px; font-size:13px; line-height:1.7; height:440px; overflow-y:auto; color:#cbd5e1;">
         <div style="color: #64748b;">جاري تحميل السجلات...</div>
       </div>
     </div>
@@ -2472,6 +2483,47 @@ export function renderDashboardHtml(initialState?: any): string {
       }
     }
 
+    let recentLiveLogs = [];
+    let liveLogsRenderKey = '';
+    function renderLiveLogs(logs) {
+      if (Array.isArray(logs)) recentLiveLogs = logs;
+      const feed = document.getElementById('logs-feed');
+      if (!feed) return;
+      const level = document.getElementById('logs-level').value;
+      const query = document.getElementById('logs-search').value.trim().toLowerCase();
+      const visible = recentLiveLogs.filter(log => (level === 'all' || log.level === level) &&
+        [log.category, log.message, log.details].join(' ').toLowerCase().includes(query));
+      const renderKey = JSON.stringify([level, query, recentLiveLogs]);
+      if (renderKey === liveLogsRenderKey) return;
+      liveLogsRenderKey = renderKey;
+      const opened = new Set([...feed.querySelectorAll('details[open]')].map(el => el.dataset.logId));
+      const focusedId = document.activeElement?.closest('#logs-feed details')?.dataset.logId;
+      const scrollTop = feed.scrollTop;
+      const labels = { error: 'خطأ', warn: 'تحذير', success: 'نجاح', info: 'معلومة' };
+      const colors = { error: '#f87171', warn: '#fbbf24', success: '#34d399', info: '#38bdf8' };
+      feed.innerHTML = visible.map((log, index) => {
+        const id = String(log.id || index), date = new Date(log.timestamp);
+        const time = Number.isFinite(date.getTime()) ? date.toLocaleString('ar-LY', {
+          timeZone: 'Africa/Tripoli', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit'
+        }) : '--';
+        let details = log.details || '';
+        try { details = JSON.stringify(JSON.parse(details), null, 2); } catch {}
+        return '<article style="padding:12px 0; border-bottom:1px solid #334155; overflow-wrap:anywhere;">' +
+          '<header style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">' +
+          '<span style="font-weight:700; color:' + (colors[log.level] || colors.info) + ';">' + (labels[log.level] || labels.info) + '</span>' +
+          '<strong>' + escapeHtml(log.category || 'النظام') + '</strong>' +
+          '<time style="color:#94a3b8; font-size:12px; margin-inline-start:auto;" datetime="' + escapeHtml(log.timestamp || '') + '">' + escapeHtml(time) + '</time></header>' +
+          '<div style="margin-top:4px;">' + escapeHtml(log.message || '') + '</div>' +
+          (details ? '<details data-log-id="' + escapeHtml(id) + '"' + (opened.has(id) ? ' open' : '') + '>' +
+            '<summary style="min-height:44px; padding:10px 0; cursor:pointer; color:#7dd3fc;">تفاصيل الحدث</summary>' +
+            '<pre dir="ltr" style="margin:0; padding:12px; background:#0f172a; white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; line-height:1.7;">' + escapeHtml(details) + '</pre></details>' : '') +
+          '</article>';
+      }).join('') || '<div style="padding:16px 0; color:#cbd5e1;">لا توجد أحداث مطابقة.</div>';
+      document.getElementById('logs-count').textContent = visible.length + ' / ' + recentLiveLogs.length;
+      if (focusedId) [...feed.querySelectorAll('details')].find(el => el.dataset.logId === focusedId)?.querySelector('summary')?.focus({ preventScroll: true });
+      feed.scrollTop = scrollTop;
+    }
+
     function renderUI(data) {
       if (!data) return;
 
@@ -2567,23 +2619,7 @@ export function renderDashboardHtml(initialState?: any): string {
       }
 
       // 3. Live Logs
-      if (data.recentLogs && Array.isArray(data.recentLogs)) {
-        const lFeed = document.getElementById('logs-feed');
-        let lHtml = '';
-        for (const log of data.recentLogs) {
-          const time = new Date(log.timestamp).toLocaleTimeString('ar-LY');
-          const color = log.level === 'error' ? '#f87171' :
-            log.level === 'warn' ? '#fbbf24' :
-            log.level === 'success' ? '#34d399' : '#38bdf8';
-
-          lHtml += '<div style="padding:3px 0; border-bottom:1px solid rgba(51,65,85,0.4); display:flex; gap:6px; word-break:break-all;">' +
-            '<span style="color:#64748b;">' + time + '</span>' +
-            '<span style="color:' + color + '; font-weight:bold;">[' + escapeHtml(log.category) + ']:</span>' +
-            '<span>' + escapeHtml(log.message) + '</span>' +
-          '</div>';
-        }
-        if (lFeed && lHtml) lFeed.innerHTML = lHtml;
-      }
+      if (Array.isArray(data.recentLogs)) renderLiveLogs(data.recentLogs);
 
       // Populate Broadcast Queue and Settings
       if (data.broadcastConfig) {
@@ -4070,11 +4106,11 @@ export function renderDashboardHtml(initialState?: any): string {
 
     async function clearLiveLogs() {
       try {
-        await fetch('/api/dashboard/clear-logs', { method: 'POST' });
-        const feed = document.getElementById('logs-feed');
-        if (feed) feed.innerHTML = '<div style="color: #64748b;">تم مسح السجلات</div>';
+        const response = await fetch('/api/dashboard/clear-logs', { method: 'POST' });
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        renderLiveLogs([]);
         showToast('تم مسح السجلات');
-      } catch (e) {}
+      } catch (e) { showToast('تعذر مسح السجلات: ' + e.message, true); }
     }
 
     // ─── Currency Terms & Extraction Settings ───

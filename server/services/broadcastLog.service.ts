@@ -1,4 +1,6 @@
 import { db, supabase, supabaseKey } from '../db';
+import { addLog, sanitizeErrorMessage } from '../utils/logger';
+export { sanitizeErrorMessage } from '../utils/logger';
 
 export interface BroadcastLogRow {
   id: number;
@@ -39,46 +41,6 @@ export interface AddBroadcastLogParams {
 }
 
 /**
- * Sanitize error message to ensure no tokens, session strings, or API keys are stored.
- */
-export function sanitizeErrorMessage(rawError: any): string | null {
-  if (!rawError) return null;
-  let msg = typeof rawError === 'string' ? rawError : (rawError.message || String(rawError));
-
-  // Redact known environment secrets if present
-  const sensitiveStrings = [
-    process.env.SUPABASE_SERVICE_ROLE_KEY,
-    process.env.VITE_SUPABASE_ANON_KEY,
-    process.env.FACEBOOK_ACCESS_TOKEN,
-    process.env.TELEGRAM_BOT_TOKEN,
-    process.env.TELEGRAM_SESSION_STRING,
-    process.env.TELEGRAM_SESSION,
-    process.env.ADMIN_PASSWORD,
-    process.env.SESSION_SECRET,
-    process.env.GEMINI_API_KEY,
-    process.env.API_HMAC_SECRET,
-    process.env.CRON_SECRET,
-  ].filter((s): s is string => typeof s === 'string' && s.length > 4);
-
-  for (const secret of sensitiveStrings) {
-    msg = msg.split(secret).join('[REDACTED]');
-  }
-
-  // Regex sanitization for tokens, API credentials, URLs with query tokens
-  msg = msg.replace(/EAA[a-zA-Z0-9_-]{20,}/g, '[REDACTED_FB_TOKEN]');
-  msg = msg.replace(/\d{8,12}:[a-zA-Z0-9_-]{30,}/g, '[REDACTED_TG_TOKEN]');
-  msg = msg.replace(/1[a-zA-Z0-9+/=]{50,}/g, '[REDACTED_SESSION]');
-  msg = msg.replace(/Bearer\s+[a-zA-Z0-9_\-\.]+/gi, 'Bearer [REDACTED]');
-  msg = msg.replace(/access_token=[^&\s]+/gi, 'access_token=[REDACTED]');
-  msg = msg.replace(/token=[^&\s]+/gi, 'token=[REDACTED]');
-
-  if (msg.length > 500) {
-    msg = msg.substring(0, 497) + '...';
-  }
-  return msg;
-}
-
-/**
  * Record a broadcast outcome log entry to SQLite and fire-and-forget to Supabase.
  */
 export function addBroadcastLog(params: AddBroadcastLogParams): void {
@@ -87,6 +49,11 @@ export function addBroadcastLog(params: AddBroadcastLogParams): void {
   const currencyIdsJson = JSON.stringify(params.currency_ids || []);
   const sanitizedError = sanitizeErrorMessage(params.error_message);
   const durationMs = typeof params.duration_ms === 'number' ? Math.round(params.duration_ms) : null;
+  addLog(params.status === 'failed' ? 'error' : 'success', 'النشر',
+    `${params.status === 'failed' ? 'فشل النشر' : 'اكتمل النشر'} على ${params.platform}`, {
+      stage: 'platform-delivery', platform: params.platform, currencies: params.currency_ids,
+      attempts: params.attempts, duration_ms: durationMs, error: sanitizedError, isTest: !!params.is_test
+    });
 
   try {
     const stmt = db.prepare(`

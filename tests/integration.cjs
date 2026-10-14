@@ -64,7 +64,7 @@ async function main() {
     '../db': { db: noopDb, supabaseKey: 'fixture', supabase: fakeSupabase(q =>
       ({ error: saveFails && q.table === 'parallel_rates' ? { message: 'fixture failure' } : null })) },
     '../state': { rates: f.rates, history: [] }, '../config': { appConfig: f.config },
-    '../utils/helpers': f.helper, './reporting.service': { updateStats() {} }, '../utils/logger': { addLog() {} }
+    '../utils/helpers': f.helper, './reporting.service': { updateStats() {} }, '../utils/logger': f.logger
   });
   const adminAuth = f.load('server/middleware/auth.ts', { express, '../config': { appConfig: f.config } });
   assert.equal(adminAuth.validateAdminPassword('admin'), false);
@@ -138,7 +138,7 @@ async function main() {
   const notify = f.load('server/services/db.service.ts', {
     '../db': { db: noopDb, supabase: null, supabaseKey: '' }, '../state': { rates: f.rates, history: [] },
     '../config': { appConfig: f.config }, '../utils/helpers': f.helper,
-    './reporting.service': {}, '../utils/logger': {}
+    './reporting.service': {}, '../utils/logger': f.logger
   }, { process: { env: { WEB_SERVER_URL: 'https://fixture.invalid', WORKER_INTERNAL_SECRET: 'fixture-only' } },
     setTimeout: fn => { queueMicrotask(fn); return {}; },
     fetch: async (url, init) => {
@@ -198,6 +198,7 @@ async function main() {
       webSecurity.timeoutMiddleware({ path, query }, { setTimeout: limit => timeoutLimits.push(limit) }, () => {});
     }
     assert.deepEqual(timeoutLimits, [20000, 5000, 5000]);
+    const webEnvironment = { NODE_ENV: 'test', WORKER_INTERNAL_SECRET: 'fixture-only' };
     const webAppModule = w.load(path.join(webRoot, 'server/app.ts'), {
       express, compression: require('compression'), fs: {}, vite: { createServer: async () => ({ middlewares: pass }) },
       './middleware/security': { ...security, apiStats: {} }, './routes/rates.routes': empty(),
@@ -213,7 +214,7 @@ async function main() {
           if (syncGate) await syncGate;
         } finally { active--; }
       } }, './socket/socket.service': { broadcastRatesUpdate: () => { broadcasts++; } }
-    }, { process: { env: { NODE_ENV: 'test', WORKER_INTERNAL_SECRET: 'fixture-only' }, cwd: () => webRoot },
+    }, { process: { env: webEnvironment, cwd: () => webRoot },
       setTimeout: fn => { retryTimers.push(fn); return {}; } });
     const notifiedWeb = await listen(await webAppModule.createApp({}));
     const sendNotify = secret => fetch(notifiedWeb.url + '/api/internal/notify-rates-updated', {
@@ -229,9 +230,14 @@ async function main() {
       })).status, 403); assert.equal(calls, 0);
       assert.equal((await sendNotify()).status, 401);
       assert.equal((await sendNotify('wrong')).status, 403); assert.equal(calls, 0);
+      webEnvironment.WORKER_INTERNAL_SECRET = '';
+      const missingWebSecret = await sendNotify('fixture-only');
+      assert.equal(missingWebSecret.status, 401); assert.equal((await missingWebSecret.json()).error, 'Missing authentication');
+      assert.equal(calls, 0, 'Missing Web environment secret blocks before database access');
+      webEnvironment.WORKER_INTERNAL_SECRET = 'fixture-only';
       const pairedNotify = f.load('server/services/db.service.ts', {
         '../db': { db: noopDb, supabase: null, supabaseKey: '' }, '../state': { rates: f.rates, history: [] },
-        '../config': { appConfig: f.config }, '../utils/helpers': f.helper, './reporting.service': {}, '../utils/logger': {}
+        '../config': { appConfig: f.config }, '../utils/helpers': f.helper, './reporting.service': {}, '../utils/logger': f.logger
       }, { process: { env: { WEB_SERVER_URL: notifiedWeb.url, WORKER_INTERNAL_SECRET: 'fixture-only' } }, fetch });
       await pairedNotify.notifyWebServers(); assert.equal(calls, 1);
       await waitFor(() => retryTimers.length === 1); assert.equal(broadcasts, 0);

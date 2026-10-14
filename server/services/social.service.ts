@@ -4,7 +4,8 @@ import { appConfig, telegramManager, setTelegramManager } from '../config';
 import { rates } from '../state';
 import { db, supabase, supabaseKey } from '../db';
 import { addBroadcastLog } from './broadcastLog.service';
-import { ensureWebRatesReady } from './db.service';
+import { ensureWebRatesReady, getWebRatesSyncError } from './db.service';
+import { addLog, sanitizeErrorMessage } from '../utils/logger';
 import { delay, getPublicAppUrl, getLibyaTimeInfo, getTelegramShareUrl } from '../utils/helpers';
 
 interface FacebookApiResponse {
@@ -326,11 +327,17 @@ async function refreshFacebookPricePreview() {
         }
         if (!response.ok || result?.error || typeof result?.og_object?.title !== 'string' ||
             !prices.every(price => result.og_object.title.includes(`${price.label}: ${price.value.toFixed(2)}`))) {
+          addLog('error', 'معاينة Facebook', 'لم تؤكد Meta معاينة الأسعار؛ لم يبدأ نشر المنشور', {
+            stage: 'facebook-preview', link, httpStatus: response.status, apiCode: result?.error?.code,
+            apiSubcode: result?.error?.error_subcode, apiMessage: sanitizeErrorMessage(result?.error?.message),
+            expectedPrices: prices, receivedTitle: sanitizeErrorMessage(result?.og_object?.title, 2000)
+          });
           throw new Error(`تعذر تأكيد معاينة فيسبوك المحدثة${Number.isFinite(result?.error?.code) ? ' (API ' + result.error.code + ')' : ''}. تحقق من صلاحية التوكن وإعادة قراءة الرابط.`);
         }
       }
       facebookPreviewRevision = revision;
       facebookPreviewFailure = { revision: '', at: 0 };
+      addLog('success', 'معاينة Facebook', 'أكدت Meta معاينة الرابط الأصلي والمختصر', { stage: 'facebook-preview', prices });
     })().catch(error => {
       facebookPreviewFailure = { revision, at: Date.now() };
       throw error;
@@ -355,7 +362,7 @@ export async function broadcastToSocialMedia(
   const hasPriceLink = message.includes('https://tinyurl.com/2j7667u2') ||
     message.includes(new URL(process.env.WEB_SERVER_URL || 'https://dollar-price-qp14.onrender.com/').origin);
   if (!isTest && hasPriceLink && !await ensureWebRatesReady(targetMarket)) {
-    throw new Error('لم تكتمل مزامنة Web ومعاينة الأسعار؛ لم يُرسل المنشور.');
+    throw new Error(getWebRatesSyncError(targetMarket));
   }
 
   const manager = getOrInitTelegramManager();
@@ -689,7 +696,9 @@ export async function broadcastOfficialRates(
     return true;
   }
   if (!isTest && !await ensureWebRatesReady('official')) {
-    console.warn("[Official Broadcast] Web server rates are not synchronized yet for official market. Holding broadcast.");
+    const error = getWebRatesSyncError('official');
+    console.warn('[Official Broadcast]', error);
+    addLog('warn', 'النشر الرسمي', 'النشرة محفوظة؛ لم تبدأ مرحلة الإرسال', { stage: 'web-sync', market: 'official', error });
     return false;
   }
 
@@ -753,7 +762,7 @@ export async function broadcastOfficialRates(
         const attempt = (officialDelivery.attempts[platform] || 0) + 1;
         officialDelivery.attempts[platform] = attempt;
         officialDelivery.retryAt[platform] = Date.now() + RETRY_BASE_DELAY_MS * 2 ** Math.min(attempt - 1, 3);
-        officialDelivery.lastError = String(err?.message || err);
+        officialDelivery.lastError = sanitizeErrorMessage(err) || 'فشل النشر الرسمي';
         addBroadcastLog({ platform, currency_ids: officialEntries.map(([id]) => 'OFFICIAL_' + id),
           status: 'failed', attempts: attempt, error_message: officialDelivery.lastError, is_test: isManual ? 2 : 0 });
       }
@@ -868,6 +877,11 @@ export interface QueuedRateUpdate {
   lastError?: string;
   targets?: ('telegram' | 'facebook')[];
   headerTitle?: string;
+}
+
+function canDeliverQueuedItem(item: QueuedRateUpdate, platform: 'telegram' | 'facebook', isManual = false) {
+  return (!item.targets || item.targets.includes(platform)) && !item.delivered?.[platform] &&
+    (isManual || (item.attempts?.[platform] || 0) <= MAX_RETRY_ATTEMPTS && (item.retryAt?.[platform] || 0) <= Date.now());
 }
 
 export let smartBroadcastQueue: Map<string, QueuedRateUpdate> = new Map();
@@ -1178,10 +1192,11 @@ async function deliverQueuedUpdates(
   let failed = false;
   try {
     for (const platform of platforms) {
-      const pending = snapshot.filter(([, item]) => (!item.targets || item.targets.includes(platform)) && !item.delivered?.[platform] &&
-        (isManual || (item.attempts?.[platform] || 0) <= MAX_RETRY_ATTEMPTS &&
-         (item.retryAt?.[platform] || 0) <= Date.now()));
+      const pending = snapshot.filter(([, item]) => canDeliverQueuedItem(item, platform, isManual));
       if (!pending.length) continue;
+      addLog('info', 'طابور النشر', `بدء محاولة نشر ${pending.length} عملة على ${platform}`, {
+        stage: 'queue-delivery', platform, currencies: pending.map(([, item]) => item.id), isManual
+      });
       try {
         const headers = new Set(pending.map(([, item]) => item.headerTitle));
         const header = customHeaderTitle || (headers.size === 1 ? pending[0]?.[1].headerTitle : '📊 *مؤشر الدينار | نشرة الأسعار*');
@@ -1194,8 +1209,14 @@ async function deliverQueuedUpdates(
           const attempt = (item.attempts?.[platform] || 0) + 1;
           item.attempts = { ...item.attempts, [platform]: attempt };
           item.retryAt = { ...item.retryAt, [platform]: Date.now() + RETRY_BASE_DELAY_MS * 2 ** Math.min(attempt - 1, 3) };
-          item.lastError = String(err?.message || err);
+          item.lastError = sanitizeErrorMessage(err) || 'فشل النشر';
         }
+        addLog('error', 'طابور النشر', `تعذر النشر على ${platform}؛ التحديثات محفوظة`, {
+          stage: 'queue-delivery', platform, error: sanitizeErrorMessage(err),
+          retries: pending.map(([, item]) => ({ currency: item.id, attempt: item.attempts?.[platform],
+            retryAt: (item.attempts?.[platform] || 0) > MAX_RETRY_ATTEMPTS ? null : new Date(item.retryAt![platform]!).toISOString(),
+            requiresManualRetry: (item.attempts?.[platform] || 0) > MAX_RETRY_ATTEMPTS }))
+        });
       }
       persistBroadcastQueue();
       await flushBroadcastQueueState();
@@ -1232,8 +1253,12 @@ export async function flushBroadcastQueueImmediately(target?: 'all' | 'telegram'
 }
 
 export async function processSmartBroadcastQueue(): Promise<boolean> {
-  if (smartBroadcastQueue.size === 0) return false;
+  if (smartBroadcastQueue.size === 0 || queueSending) return false;
   if (!appConfig.telegramAutoPost && !appConfig.facebookAutoPost) return false;
+  const platforms = (['telegram', 'facebook'] as const).filter(platform =>
+    platform === 'telegram' ? appConfig.telegramAutoPost : appConfig.facebookAutoPost);
+  const dispatchable = [...smartBroadcastQueue.values()].filter(item => platforms.some(platform => canDeliverQueuedItem(item, platform)));
+  if (!dispatchable.length) return false;
 
   // 🌙 فحص ساعات الصمت الليلي لمنع إزعاج المتابعين أثناء الليل
   const quietCheck = isQuietHoursActive();
@@ -1242,12 +1267,7 @@ export async function processSmartBroadcastQueue(): Promise<boolean> {
     return false;
   }
 
-  const retryItems = [...smartBroadcastQueue.values()].filter(item => item.lastError &&
-    (['telegram', 'facebook'] as const).some(platform =>
-      (platform === 'telegram' ? appConfig.telegramAutoPost : appConfig.facebookAutoPost) &&
-      item.targets?.includes(platform) && !item.delivered?.[platform] &&
-      (item.attempts?.[platform] || 0) <= MAX_RETRY_ATTEMPTS &&
-      (item.retryAt?.[platform] || 0) <= Date.now()));
+  const retryItems = dispatchable.filter(item => item.lastError);
   if (retryItems.length) {
     const target = appConfig.telegramAutoPost && appConfig.facebookAutoPost ? 'all' :
       appConfig.telegramAutoPost ? 'telegram' : 'facebook';
@@ -1268,7 +1288,7 @@ export async function processSmartBroadcastQueue(): Promise<boolean> {
     return false;
   }
 
-  const rawQueuedItems = Array.from(smartBroadcastQueue.values()).map(item => ({
+  const rawQueuedItems = dispatchable.map(item => ({
     id: item.id,
     name: item.name,
     oldVal: item.oldVal,
@@ -1373,6 +1393,9 @@ export async function broadcastRateChanges(
   }
 
   console.log(`[SmartBroadcastQueue] 📥 Buffered ${updates.length} items. Current queue size: ${smartBroadcastQueue.size} items.`);
+  addLog('info', 'طابور النشر', `أُضيفت ${updates.length} عملة بعد حفظ الأسعار`, {
+    stage: 'queue', currencies: updates.map(u => u.id || u.name), targets, queueSize: smartBroadcastQueue.size
+  });
 
   persistBroadcastQueue();
   if (isManual) {
@@ -1563,7 +1586,7 @@ export async function executeBroadcast(
   }
   const start = Date.now();
   try {
-    if (!isTest && !await ensureWebRatesReady('parallel')) throw new Error('لم تكتمل مزامنة Web ومعاينة الأسعار؛ التحديث محفوظ في الطابور.');
+    if (!isTest && !await ensureWebRatesReady('parallel')) throw new Error(getWebRatesSyncError('parallel'));
     const result = await broadcastToSocialMedia(formatSmartBroadcastMessage(updates, customHeaderTitle), isTest, target, isManual, 'parallel');
     if (!result.sentTargets.length) return false;
     if (!isTest) recordBroadcast(updates);

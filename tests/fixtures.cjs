@@ -43,7 +43,8 @@ function fixture() {
     return mod.exports;
   }
   const helper = load('server/utils/helpers.ts');
-  return { config, rates, load, helper, Clock, now: () => clock, advance: ms => { clock += ms; } };
+  const logger = load('server/utils/logger.ts');
+  return { config, rates, load, helper, logger, Clock, now: () => clock, advance: ms => { clock += ms; } };
 }
 function fakeSupabase(perform) {
   return { from(table) {

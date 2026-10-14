@@ -7,7 +7,7 @@ function dbService(f, perform = () => ({ data: [], error: null }), extra = {}) {
   return f.load('server/services/db.service.ts', {
     '../db': { db: noopDb, supabase: fakeSupabase(perform), supabaseKey: 'fixture' },
     '../state': { rates: f.rates, history: [] }, '../config': { appConfig: f.config },
-    '../utils/helpers': f.helper, './reporting.service': { updateStats() {} }, '../utils/logger': { addLog() {} }
+    '../utils/helpers': f.helper, './reporting.service': { updateStats() {} }, '../utils/logger': f.logger
   }, extra);
 }
 function scraper(f, db, social = {}, fetch = async () => { throw Error('Unexpected fetch'); }, storage = { db: noopDb, supabase: null }, config = { appConfig: f.config, refreshExtractionTerms: async () => {} }, extra = {}) {
@@ -34,9 +34,10 @@ function socialFixture(f, options = {}) {
       sendMessage: async () => { counts.telegram++; return delayed ? await delayed : !failTG; }, lastError: 'Fixture TG failure'
     }) },
     './telegramSession.service': { getTelegramCredentials: () => ({ apiId: 1, apiHash: 'fixture', sessionString: 'fixture' }) },
-    './db.service': { ensureWebRatesReady: async () => webReady },
+    './db.service': options.dbService || { ensureWebRatesReady: async () => webReady, getWebRatesSyncError: () => 'Fixture Web sync failure' },
     '../config': { appConfig: f.config, setTelegramManager() {} }, '../state': { rates: f.rates },
     '../db': { db, supabase: null, supabaseKey: '' }, './broadcastLog.service': { addBroadcastLog() {} },
+    '../utils/logger': f.logger,
     '../utils/helpers': { ...f.helper, delay: async () => {} }
   };
   const extra = { fetch: async url => {
@@ -151,6 +152,106 @@ test('Publishing readiness rejects old acknowledgements and stale EUR, with boun
   assert.equal(await db.ensureWebRatesReady(), true); assert.equal(requests, 7);
   assert.equal(await db.ensureWebRatesReady(), true); assert.equal(requests, 7);
 });
+
+test('Web HTTP 401 records the authentication cause, blocks delivery and recovers without losing the queue', async () => {
+  const f = fixture(); f.config.facebookAutoPost = false;
+  let unauthorized = true, requests = 0;
+  const db = dbService(f, undefined, {
+    process: { env: { WEB_SERVER_URL: 'https://fixture.invalid/', WORKER_INTERNAL_SECRET: 'fixture-private-secret' } },
+    fetch: async (url, options) => {
+      requests++; assert.equal(options.redirect, 'error');
+      assert.equal(options.headers['x-worker-secret'], 'fixture-private-secret');
+      return { ok: !unauthorized, status: unauthorized ? 401 : 200, json: async () => unauthorized
+        ? { status: 'failed', error: 'Missing authentication' } : { status: 'synchronized', ...f.rates } };
+    }
+  });
+  const env = socialFixture(f, { dbService: db }), social = env.social;
+  await social.broadcastRateChanges([update]);
+  assert.equal((await social.flushBroadcastQueueImmediately('telegram', true)).success, false);
+  assert.equal(requests, 1, 'Authentication errors are not blindly retried');
+  assert.equal(env.counts.telegram, 0); assert.equal(social.smartBroadcastQueue.size, 1);
+  assert.match(social.smartBroadcastQueue.get('USD').lastError, /HTTP 401.*WORKER_INTERNAL_SECRET/);
+  const failure = f.logger.getRecentLogs().find(log => log.level === 'error' && log.category === 'مزامنة Web');
+  const details = JSON.parse(failure.details);
+  assert.equal(details.httpStatus, 401); assert.equal(details.stage, 'web-sync');
+  assert.equal(details.responseError, 'Missing authentication');
+  assert(!JSON.stringify(f.logger.getRecentLogs()).includes('fixture-private-secret'));
+  await social.flushBroadcastQueueImmediately('telegram', true); assert.equal(requests, 1, 'Reuse bounded failure cache');
+  unauthorized = false; f.advance(30001);
+  assert.equal((await social.flushBroadcastQueueImmediately('telegram', true)).success, true);
+  assert.equal(social.smartBroadcastQueue.size, 0); assert.equal(env.counts.telegram, 1);
+});
+
+test('Web failures report HTTP, timeouts and mismatched EUR with bounded attempts and safe detail', async () => {
+  for (const mode of [403, 404, 503, 'timeout', 'stale']) {
+    const f = fixture(); let requests = 0;
+    const db = dbService(f, undefined, {
+      process: { env: { WEB_SERVER_URL: 'https://fixture.invalid', WORKER_INTERNAL_SECRET: 'fixture-only' } },
+      setTimeout: fn => { queueMicrotask(fn); return {}; },
+      fetch: async () => {
+        requests++;
+        if (mode === 'timeout') throw Object.assign(Error('fixture timeout'), { name: 'TimeoutError' });
+        return { ok: mode === 'stale', status: mode === 'stale' ? 200 : mode, json: async () => mode === 'stale'
+          ? { status: 'synchronized', ...f.rates, parallel: { USD: 9.7, EUR: 10.4 } } : { error: 'Fixture rejected' } };
+      }
+    });
+    assert.equal(await db.ensureWebRatesReady('parallel'), false);
+    assert.equal(requests, mode === 403 || mode === 404 ? 1 : 3);
+    const failure = f.logger.getRecentLogs().find(log => log.level === 'error' && log.category === 'مزامنة Web');
+    assert.ok(failure);
+    const details = JSON.parse(failure.details);
+    if (typeof mode === 'number') assert.match(db.getWebRatesSyncError('parallel'), new RegExp('HTTP ' + mode));
+    if (mode === 'timeout') assert.match(failure.message, /مهلة/);
+    if (mode === 'stale') { assert.equal(details.expected.parallel.EUR, 10.5); assert.equal(details.received.parallel.EUR, 10.4); }
+  }
+  const f = fixture(), db = dbService(f);
+  assert.equal(await db.ensureWebRatesReady(), false);
+  assert.match(db.getWebRatesSyncError(), /WEB_SERVER_URL/);
+});
+
+test('Official confirmation never authorizes a stale parallel price; in-flight price changes cannot pass readiness', async () => {
+  const f = fixture(); let mode = 'official', release, requests = 0;
+  const gate = new Promise(resolve => { release = resolve; });
+  const db = dbService(f, undefined, {
+    process: { env: { WEB_SERVER_URL: 'https://fixture.invalid', WORKER_INTERNAL_SECRET: 'fixture-only' } },
+    setTimeout: fn => { queueMicrotask(fn); return {}; },
+    fetch: async () => {
+      requests++; const reply = structuredClone(f.rates);
+      if (mode === 'official') reply.parallel.USD = 9.8;
+      if (mode === 'pending') await gate;
+      return { ok: true, status: 200, json: async () => ({ status: 'synchronized', ...reply }) };
+    }
+  });
+  assert.equal(await db.ensureWebRatesReady('official'), true);
+  assert.equal(await db.ensureWebRatesReady('both'), false); assert.equal(requests, 4);
+  mode = 'pending';
+  const readiness = db.ensureWebRatesReady('parallel');
+  await Promise.resolve(); f.rates.parallel.USD = 9.9; release();
+  assert.equal(await readiness, false, 'Never authorize a price changed during confirmation');
+  mode = 'ready'; assert.equal(await db.ensureWebRatesReady('parallel'), true);
+});
+
+test('Live logs retain safe error details, redact secrets and remain bounded even with circular objects', () => {
+  const f = fixture(), secret = 'fixture-private-secret-long', session = 'fixture-session-long';
+  const logger = f.load('server/utils/logger.ts', {}, { process: { env: { WORKER_INTERNAL_SECRET: secret, TG_SESSION_V2: session } } });
+  const details = { stage: 'web-sync', httpStatus: 401, password: 'not-in-env', authorization: 'Bearer arbitrary',
+    failure: Object.assign(Error('fixture network'), { code: 'ECONNRESET' }), nested: { text: session } };
+  details.self = details;
+  const row = logger.addLog('error', 'مزامنة Web', 'Failure ' + secret, details);
+  const serialized = JSON.stringify(row);
+  for (const value of [secret, session, 'not-in-env', 'Bearer arbitrary']) assert(!serialized.includes(value));
+  assert(serialized.includes('ECONNRESET')); assert(serialized.includes('[Circular]'));
+  const entry = logger.addLog('info', 'Test', 'x'.repeat(4000), 'y'.repeat(12000));
+  assert.equal(entry.message.length, 2000); assert.equal(entry.details.length, 8000);
+  for (let i = 0; i < 250; i++) logger.addLog('info', 'Test', String(i));
+  assert.equal(logger.getRecentLogs(300).length, 200);
+  const service = f.load('server/services/broadcastLog.service.ts', {
+    '../db': { db: noopDb, supabase: null }, '../utils/logger': logger
+  });
+  assert.equal(service.sanitizeErrorMessage(secret), '[REDACTED]', 'Preserve the existing sanitizer export');
+  service.addBroadcastLog({ platform: 'telegram', currency_ids: ['USD'], status: 'failed', attempts: 2, error_message: secret });
+  assert.equal(JSON.parse(logger.getRecentLogs(1)[0].details).error, '[REDACTED]');
+});
 test('Concurrent official/parallel notifications verify their own saved market before final publishing readiness', async () => {
   const f = fixture(); let requests = 0, release;
   const pending = new Promise(resolve => { release = resolve; });
@@ -203,6 +304,22 @@ test('Exhausted retries retain failed items but do not block unrelated new curre
   await s.processSmartBroadcastQueue();
   assert.equal(s.smartBroadcastQueue.has('USD'), true); assert.equal(s.smartBroadcastQueue.has('EUR'), false);
   assert.equal(env.counts.telegram, 1);
+});
+
+test('Queue watchdog does no empty dispatch, Web check or checkpoint after retry exhaustion or before backoff expires', async () => {
+  const f = fixture(); f.config.facebookAutoPost = false;
+  let webChecks = 0;
+  const env = socialFixture(f, { dbService: { ensureWebRatesReady: async () => { webChecks++; return true; } } }), s = env.social;
+  s.smartBroadcastQueue.set('USD', { ...update, firstSeenAt: f.now(), lastSeenAt: f.now(), updateCount: 1,
+    targets: ['telegram'], lastError: 'fixture blocked', attempts: { telegram: 4 }, retryAt: { telegram: f.now() - 1 } });
+  const initialLogs = f.logger.getRecentLogs().length;
+  for (let i = 0; i < 5; i++) { f.advance(30000); assert.equal(await s.processSmartBroadcastQueue(), false); }
+  assert.equal(webChecks, 0); assert.equal(env.checkpoints.size, 0); assert.equal(env.counts.telegram, 0);
+  assert.equal(f.logger.getRecentLogs().length, initialLogs);
+  const item = s.smartBroadcastQueue.get('USD'); item.attempts.telegram = 1; item.retryAt.telegram = f.now() + 60000;
+  assert.equal(await s.processSmartBroadcastQueue(), false); assert.equal(webChecks, 0);
+  assert.equal((await s.flushBroadcastQueueImmediately('telegram', true)).success, true, 'Administrator can explicitly retry');
+  assert.equal(env.counts.telegram, 1); assert.equal(s.smartBroadcastQueue.size, 0);
 });
 test('Official bulletin only completes when all enabled platforms deliver; Facebook-only works', async () => {
   const f = fixture(), env = socialFixture(f), s = env.social;

@@ -21,7 +21,8 @@ async function main() {
     const social = f.load(path.join(root, 'server/services/social.service.ts'), {
       '../../telegramClient': { getTelegramManager: () => manager },
       './telegramSession.service': { getTelegramCredentials: () => ({ apiId: 1, apiHash: 'fixture', sessionString: 'fixture' }) },
-      './db.service': { ensureWebRatesReady: async () => { events.push('Web ready'); return webReady; } },
+      './db.service': { ensureWebRatesReady: async () => { events.push('Web ready'); return webReady; }, getWebRatesSyncError: () => 'Fixture Web sync failure' },
+      '../utils/logger': f.logger,
       '../config': { appConfig: f.config, telegramManager: manager, setTelegramManager() {} },
       '../state': { rates: f.rates }, '../db': { db: noopDb, supabase: null, supabaseKey: '', supabaseAnonKey: '' },
       './broadcastLog.service': { addBroadcastLog() {} }, '../utils/helpers': { ...helper, delay: async () => {} }
@@ -64,6 +65,12 @@ async function main() {
       stalePreview = true; f.rates.parallel.EUR = 10.8;
       await assert.rejects(social.broadcastToSocialMedia(message, false, 'facebook', true));
       assert.equal(payloads.filter(value => value.link).length, posted, 'Never post with a stale Meta preview');
+      const previewFailure = f.logger.getRecentLogs().find(log => log.level === 'error' && log.category === 'معاينة Facebook');
+      const previewDetail = JSON.parse(previewFailure.details);
+      assert.equal(previewDetail.stage, 'facebook-preview');
+      assert.equal(previewDetail.expectedPrices[1].value, 10.8);
+      assert(previewDetail.receivedTitle.includes('10.70'));
+      assert(!JSON.stringify(f.logger.getRecentLogs()).includes('fake-only'));
       stalePreview = false; f.advance(60001);
       await social.broadcastToSocialMedia(message, false, 'facebook', true);
       assert.equal(payloads.filter(value => value.link).length, posted + 1);
@@ -147,7 +154,7 @@ async function main() {
         }
         return { data: [], error: null };
       }) }, '../state': { rates: worker.rates, history: [] }, '../config': { appConfig: worker.config },
-      '../utils/helpers': worker.helper, './reporting.service': { updateStats() {} }, '../utils/logger': { addLog() {} }
+      '../utils/helpers': worker.helper, './reporting.service': { updateStats() {} }, '../utils/logger': worker.logger
     }, { fetch, process: { env: { WEB_SERVER_URL: base, WORKER_INTERNAL_SECRET: 'fixture-only' } } });
     const saved = workerDb.commitParallelRates([
       { code: 'USD', value: 9.8, time: worker.now(), source: 'fixture' },
@@ -169,7 +176,7 @@ async function main() {
       './telegramSession.service': { getTelegramCredentials: () => ({ apiId: 1, apiHash: 'fixture', sessionString: 'fixture' }) },
       './db.service': workerDb, '../config': { appConfig: worker.config, telegramManager: manager, setTelegramManager() {} },
       '../state': { rates: worker.rates }, '../db': { db: noopDb, supabase: null, supabaseKey: '' },
-      './broadcastLog.service': { addBroadcastLog() {} }, '../utils/helpers': { ...worker.helper, delay: async () => {} }
+      './broadcastLog.service': { addBroadcastLog() {} }, '../utils/helpers': { ...worker.helper, delay: async () => {} }, '../utils/logger': worker.logger
     }, { process: { env: { WEB_SERVER_URL: base } }, fetch: async (url, options) => {
       assert.ok(url.startsWith('https://graph.facebook.com/'));
       const body = JSON.parse(options.body);
