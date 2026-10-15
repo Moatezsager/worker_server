@@ -98,9 +98,11 @@ test('Multiline cash-dollar quotes use saved rules without mixing currencies, da
   let publications = 0;
   const source = scraper(f, db, { broadcastRateChanges: async () => { publications++; } });
   const message = '🇺🇲دولار كاش ارضة الآن💲🇺🇲\n\nمطلوق 10.24\n\n🇺🇲الغرفة الرئيسية سوق المشير 🇺🇲';
+  const userMessage = '🇺🇲دولار كاش ارضة الآن💲🇺🇲\n\nمطلوق 10.19\n\n🇺🇲الغرفة الرئيسية سوق المشير 🇺🇲';
   const usd = text => source.extractRatesFromText(text).find(rate => rate.code === 'USD');
-  for (const text of [message, message.replaceAll('\n', '\r\n'), message.replace('10.24', '١٠٫٢٤'), message.replace('10.24', '۱۰,۲۴'), 'دولار كاش\nمطلوب 10.24', 'دولار كاش\n💲10.24']) {
-    assert.equal(usd(text)?.value, 10.24, text);
+  for (const text of [message, userMessage, message.replaceAll('\n', '\r\n'), message.replace('10.24', '١٠٫٢٤'), message.replace('10.24', '۱۰,۲۴'), 'دولار كاش\nمطلوب 10.24', 'دولار كاش\n💲10.24']) {
+    const expected = text.includes('10.19') ? 10.19 : 10.24;
+    assert.equal(usd(text)?.value, expected, text);
   }
   const mixed = source.extractRatesFromText(message + '\nيورو 11.17');
   assert.equal(mixed.find(rate => rate.code === 'USD').value, 10.24);
