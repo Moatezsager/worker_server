@@ -716,14 +716,26 @@ export const extractRatesFromText = (originalText: string) => {
       if (isLineExecutionOrNonPrice(sourceLine)) continue;
       const header = withoutEmoji(sourceLine);
       const quote = withoutEmoji(lines[lineIndex + 1] || '');
-      // Only bridge an explicit cash-dollar heading to its adjacent standalone quote; keep configured regex/bounds authoritative.
-      const cashQuote = header.length <= 100 && !/\d/.test(header) && /(?:دولار|USD)/i.test(header) && /(?:كاش|cash)/i.test(header) &&
-        !/(?:صك|شيك|حوال|تحويل|يورو|استرليني|جنيه|ليرة|ريال|درهم|يوان|رسمي|مصرف|ذهب|فضة|EUR|GBP|TRY|TND|EGP|AED|SAR|CNY)/i.test(header) &&
-        /^(?:(?:مطلوق|مطلوب|معروض|عرض|بيع|شراء|السعر)\s*[:=\-]?\s*)?\d{1,2}[.,]\d{1,4}(?:\s*(?:د\.?\s?ل|دينار))?$/.test(quote)
-        ? `${header} ${quote}` : null;
+      // Only bridge explicit currency headings to adjacent standalone quotes for USD and EUR; keep configured regex/bounds authoritative.
+      const isStandaloneQuote = /^(?:(?:مطلوق|مطلوب|معروض|عرض|بيع|شراء|السعر)\s*)?[:=\-]?\s*\d{1,2}[.,]\d{1,4}(?:\s*(?:د\.?\s?ل|دينار))?$/.test(quote);
+      const cleanHeader = header.replace(/[:=\-]\s*$/, '').trim();
+      const cleanQuote = quote.replace(/^[:=\-]\s*/, '').trim();
+
+      const usdQuote = isStandaloneQuote && cleanHeader.length <= 100 && !/\d/.test(cleanHeader) &&
+        (/(?:دولار|USD|الخضراء|خضراء)/i.test(cleanHeader) || (/(?:كاش|cash)/i.test(cleanHeader) && !/(?:صك|شيك)/i.test(cleanHeader))) &&
+        !/(?:صك|شيك|حوال|تحويل|يورو|استرليني|جنيه|ليرة|ريال|درهم|يوان|رسمي|مصرف|مركزي|ذهب|فضة|EUR|GBP|TRY|TND|EGP|AED|SAR|CNY)/i.test(cleanHeader)
+        ? `${cleanHeader} ${cleanQuote}` : null;
+
+      const eurQuote = isStandaloneQuote && cleanHeader.length <= 100 && !/\d/.test(cleanHeader) &&
+        /(?:يورو|EUR)/i.test(cleanHeader) &&
+        !/(?:صك|شيك|حوال|تحويل|دولار|استرليني|جنيه|ليرة|ريال|درهم|يوان|رسمي|مصرف|مركزي|ذهب|فضة|USD|GBP|TRY|TND|EGP|AED|SAR|CNY)/i.test(cleanHeader)
+        ? `${cleanHeader} ${cleanQuote}` : null;
+
       for (const term of compiledTerms) {
         if (foundCodes.has(term.id)) continue;
-        const line = term.id === 'USD' && cashQuote ? cashQuote : sourceLine;
+        const line = term.id === 'USD' && usdQuote ? usdQuote :
+                     term.id === 'EUR' && eurQuote ? eurQuote :
+                     sourceLine;
         const match = line.match(term.compiledRegex);
         if (!match) continue;
 

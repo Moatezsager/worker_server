@@ -104,11 +104,35 @@ test('Multiline cash-dollar quotes use saved rules without mixing currencies, da
     const expected = text.includes('10.19') ? 10.19 : 10.24;
     assert.equal(usd(text)?.value, expected, text);
   }
+  const eur = text => source.extractRatesFromText(text).find(rate => rate.code === 'EUR');
+  for (const text of [
+    'الدولار \n10.23',
+    'الدولار\n10.23',
+    'الدولار\n: 10.23',
+    'الدولار\n١٠٫٢٣',
+    'الدولار\nمطلوب 10.23',
+    'الدولار\nمطلوق 10.23'
+  ]) {
+    assert.equal(usd(text)?.value, 10.23, text);
+  }
+  for (const text of [
+    'يورو\n11.15',
+    'اليورو\n11.15',
+    'EUR\n11.15',
+    'يورو\n: 11.15'
+  ]) {
+    assert.equal(eur(text)?.value, 11.15, text);
+  }
+  const multiBoth = source.extractRatesFromText('الدولار\n10.23\nيورو\n11.15');
+  assert.equal(multiBoth.find(rate => rate.code === 'USD')?.value, 10.23);
+  assert.equal(multiBoth.find(rate => rate.code === 'EUR')?.value, 11.15);
+
   const mixed = source.extractRatesFromText(message + '\nيورو 11.17');
   assert.equal(mixed.find(rate => rate.code === 'USD').value, 10.24);
   assert.equal(mixed.find(rate => rate.code === 'EUR').value, 11.17);
   for (const text of ['دولار كاش\nيورو 11.17', 'دولار كاش\nالساعة 10:24', 'دولار كاش\nمطلوق 10.24%',
-    'دولار كاش وصكوك\nمطلوق 10.24', 'دولار كاش حوالة\nمطلوق 10.24', 'دولار كاش\n1000 دولار\nمطلوق 10.24', 'دولار كاش\nمطلوق 99.99']) {
+    'دولار كاش وصكوك\nمطلوق 10.24', 'دولار كاش حوالة\nمطلوق 10.24', 'دولار كاش\n1000 دولار\nمطلوق 10.24', 'دولار كاش\nمطلوق 99.99',
+    'الدولار وصكوك\n10.23', 'الدولار حوالة\n10.23']) {
     assert.equal(usd(text), undefined, text);
   }
   assert.equal(JSON.stringify(f.config.terms), originalRules, 'Do not rewrite configured extraction settings');

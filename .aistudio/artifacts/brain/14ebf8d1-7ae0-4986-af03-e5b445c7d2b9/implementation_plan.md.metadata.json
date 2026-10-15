@@ -1,0 +1,6 @@
+{
+  "summary": "Implementation plan for supporting multi-line currency and price extraction (e.g. الدولار / 10.23) for USD and EUR",
+  "updatedAt": "2026-10-15T09:57:12.259707421Z",
+  "requestFeedback": true,
+  "userFacing": true
+}
