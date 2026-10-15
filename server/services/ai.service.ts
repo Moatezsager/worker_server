@@ -1,8 +1,9 @@
 import { GoogleGenAI, Type } from "@google/genai";
+import { createHash } from 'crypto';
 import { appConfig } from '../config';
 import { isNonPriceAnnouncement } from '../utils/helpers';
 
-const aiProcessedTexts = new Set<string>();
+const aiProcessedTexts = new Map<string, { code: string; value: number }[]>();
 let aiQuotaExceededUntil = 0;
 
 export function isAiQuotaExceeded(): boolean {
@@ -24,15 +25,9 @@ export async function extractRatesWithAI(text: string, channel: string): Promise
     return [];
   }
   
-  const cacheKey = channel + "_" + text.substring(0, 30) + text.length;
-  if (aiProcessedTexts.has(cacheKey)) return [];
-  aiProcessedTexts.add(cacheKey);
-  
-  if (aiProcessedTexts.size > 1000) {
-    const arr = Array.from(aiProcessedTexts);
-    aiProcessedTexts.clear();
-    arr.slice(500).forEach(k => aiProcessedTexts.add(k));
-  }
+  const cacheKey = createHash('sha256').update(JSON.stringify([channel, text, appConfig.terms])).digest('hex');
+  const cached = aiProcessedTexts.get(cacheKey);
+  if (cached) return cached.map(item => ({ ...item }));
 
   const currencyTerms = appConfig.terms.filter(t => !t.id.startsWith("GOLD_") && t.id !== "GOLD" && t.id !== "OFFICIAL_USD");
   const termIds = currencyTerms.map(t => t.id).join(", ");
@@ -93,13 +88,17 @@ ${text}
 
     if (response.text) {
       const parsed = JSON.parse(response.text);
-      if (Array.isArray(parsed) && parsed.length > 0) {
+      if (Array.isArray(parsed)) {
         console.log(`[Scraper-AI] AI extracted rates from ${channel}: `, JSON.stringify(parsed));
-        return parsed.filter(item => {
+        const results = parsed.filter(item => {
+          if (!item || typeof item.code !== 'string') return false;
           if (item.code === "GOLD" || item.code.startsWith("GOLD_") || item.code === "OFFICIAL_USD") return false;
           const term = appConfig.terms.find(t => t.id === item.code);
-          return term && typeof item.value === 'number' && item.value >= term.min && item.value <= term.max;
+          return term && Number.isFinite(item.value) && item.value >= term.min && item.value <= term.max;
         });
+        aiProcessedTexts.set(cacheKey, results);
+        if (aiProcessedTexts.size > 1000) aiProcessedTexts.delete(aiProcessedTexts.keys().next().value!);
+        return results.map(item => ({ ...item }));
       }
     }
   } catch (e: any) {

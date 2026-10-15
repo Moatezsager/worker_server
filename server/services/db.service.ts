@@ -324,11 +324,25 @@ export function commitParallelRates(extracted: { code: string; value: number; ti
       }
       const lastTime = Math.max(Date.parse(candidate.lastChanged.parallel[term.id] || '') || 0,
         observed[term.id] || lastObserved[term.id] || 0);
-      if (!isManual && entry.time < lastTime) continue;
+      if (!isManual && (entry.time < lastTime || observed[term.id] !== undefined)) continue;
       const oldVal = candidate.parallel[term.id];
-      const maxDeviation = term.id === 'TND' || term.id === 'EGP' ? 1 : 0.25;
-      if (!isManual && oldVal > 0 && Math.abs(entry.value - oldVal) / oldVal > maxDeviation) {
-        await logErrorArabic('تم رفض قفزة غير منطقية في سعر ' + term.id, 'حماية البيانات');
+      const isCheck = CHECK_TRIO.includes(term.id as typeof CHECK_TRIO[number]);
+      const maxDeviation = term.id === 'USD' || term.id === 'EUR' || isCheck ? 0.03
+        : term.id === 'TND' || term.id === 'EGP' ? 1 : 0.25;
+      // Compare persisted prices, including every check alias that synchronization could overwrite.
+      const baselineCodes = isCheck ? CHECK_TRIO : [term.id];
+      const rejectedBaseline = baselineCodes.find(code => {
+        const previous = rates.parallel[code];
+        return Number.isFinite(previous) && previous > 0 &&
+          Math.abs(entry.value - previous) > previous * maxDeviation + 1e-9;
+      });
+      if (!isManual && rejectedBaseline) {
+        const previous = rates.parallel[rejectedBaseline];
+        addLog('warn', 'حماية الأسعار', `تم رفض تغير غير معتاد في ${term.name}: ${previous} إلى ${entry.value}؛ يلزم التحقق أو الاعتماد اليدوي`, {
+          stage: 'price-validation', code: term.id, baselineCode: rejectedBaseline, source: entry.source,
+          previous, proposed: entry.value, difference: entry.value - previous,
+          changePercent: Math.abs(entry.value - previous) / previous * 100, limitPercent: maxDeviation * 100
+        });
         continue;
       }
       observed[term.id] = entry.time;

@@ -4,6 +4,8 @@ import { appConfig } from "../config";
 import { serverStartTime, getAppBuildSignature } from "../utils/version";
 import { getOrInitTelegramManager } from "../services/social.service";
 import { activeClient } from "../../telegramClient";
+import { requireAdmin } from '../middleware/auth';
+import { sanitizeErrorMessage } from '../utils/logger';
 
 const router = express.Router();
 
@@ -52,14 +54,14 @@ router.get("/status", (req: express.Request, res: express.Response) => {
   });
 });
 
-router.get("/telegram/status", (req: express.Request, res: express.Response) => {
+router.get("/telegram/status", requireAdmin, (req: express.Request, res: express.Response) => {
   const tgMgr = getOrInitTelegramManager();
   const isConnected = !!(activeClient && activeClient.connected);
   const hasBotToken = !!((tgMgr && tgMgr.botToken) || appConfig.telegramBotToken || process.env.TELEGRAM_BOT_TOKEN);
   res.json({
     isConnected: isConnected || hasBotToken,
     isAuthRevoked: tgMgr ? tgMgr.isAuthRevoked : false,
-    lastError: tgMgr ? tgMgr.lastError : "",
+    lastError: sanitizeErrorMessage(tgMgr?.lastError) || '',
     hasBotToken,
     lastFetchTime: tgMgr ? tgMgr.lastFetchTime : 0
   });

@@ -90,7 +90,7 @@ async function main() {
   const root = path.resolve(process.env.WEB_PROJECT_PATH), f = fixture();
   const pass = (_req, _res, next) => next(), empty = () => express.Router();
   const security = Object.fromEntries(['ipBanMiddleware', 'suspiciousActivityMiddleware', 'userAgentMiddleware',
-    'timeoutMiddleware', 'helmetMiddleware', 'permissionsPolicyMiddleware', 'apiLimiter', 'publicApiLimiter'].map(key => [key, pass]));
+    'timeoutMiddleware', 'helmetMiddleware', 'permissionsPolicyMiddleware', 'apiLimiter', 'publicApiLimiter', 'developerApiHeaders'].map(key => [key, pass]));
   let htmlReads = 0;
   let parallelRow, releaseReload, databaseReads = 0;
   const reloadGate = new Promise(resolve => { releaseReload = resolve; });
@@ -147,6 +147,7 @@ async function main() {
     assert.equal(databaseReads, 0);
 
     const worker = fixture(); worker.advance(60000);
+    worker.rates.parallel.EUR = 11;
     const workerDb = worker.load('server/services/db.service.ts', {
       '../db': { db: noopDb, supabaseKey: 'fixture', supabase: fakeSupabase(q => {
         if (q.table === 'parallel_rates' && q.op === 'insert') {

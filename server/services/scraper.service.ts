@@ -707,13 +707,23 @@ export const extractRatesFromText = (originalText: string) => {
   };
 
   const lines = cleanText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const withoutEmoji = (value: string) => value.replace(/[\p{Extended_Pictographic}\p{Regional_Indicator}\uFE0F\u200D]/gu, '').trim();
 
   // 1. Line-by-line pass: prevents multi-line pasted text from bleeding across lines
   if (lines.length > 1) {
-    for (const line of lines) {
-      if (isLineExecutionOrNonPrice(line)) continue;
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+      const sourceLine = lines[lineIndex];
+      if (isLineExecutionOrNonPrice(sourceLine)) continue;
+      const header = withoutEmoji(sourceLine);
+      const quote = withoutEmoji(lines[lineIndex + 1] || '');
+      // Only bridge an explicit cash-dollar heading to its adjacent standalone quote; keep configured regex/bounds authoritative.
+      const cashQuote = header.length <= 100 && !/\d/.test(header) && /(?:دولار|USD)/i.test(header) && /(?:كاش|cash)/i.test(header) &&
+        !/(?:صك|شيك|حوال|تحويل|يورو|استرليني|جنيه|ليرة|ريال|درهم|يوان|رسمي|مصرف|ذهب|فضة|EUR|GBP|TRY|TND|EGP|AED|SAR|CNY)/i.test(header) &&
+        /^(?:(?:مطلوق|مطلوب|معروض|عرض|بيع|شراء|السعر)\s*[:=\-]?\s*)?\d{1,2}[.,]\d{1,4}(?:\s*(?:د\.?\s?ل|دينار))?$/.test(quote)
+        ? `${header} ${quote}` : null;
       for (const term of compiledTerms) {
         if (foundCodes.has(term.id)) continue;
+        const line = term.id === 'USD' && cashQuote ? cashQuote : sourceLine;
         const match = line.match(term.compiledRegex);
         if (!match) continue;
 
@@ -1018,10 +1028,10 @@ export async function fetchParallelRatesFromTelegram(isManual: boolean = false):
       if (foundKeys.length > 0) {
         console.log(`[Scraper] Scrape check completed. Found rates for: ${foundKeys.join(', ')}`);
         
-        const collectedUpdates = await commitParallelRates(foundKeys.map(code => ({
-          code, value: latestRates[code], time: latestTimes[code],
-          source: latestSources[code] || 'Telegram'
-        })));
+        // Newest first: rejected quotes must not hide a valid newer-than-saved alternative.
+        const collectedUpdates = await commitParallelRates(foundKeys.flatMap(code =>
+          priceHistory[code].map(entry => ({ code, value: entry.value, time: entry.time, source: entry.channel }))
+        ));
         const anyChanged = collectedUpdates.length > 0;
         if (anyChanged) {
           if (collectedUpdates.length > 0) {
@@ -1063,10 +1073,8 @@ export async function fetchParallelRatesFromTelegram(isManual: boolean = false):
           }
         }
 
-        lastSuccessfulFetchTime = Date.now();
         return anyChanged;
       }
-      lastSuccessfulFetchTime = Date.now();
       return false;
     } catch (error) {
       console.error("Error fetching from Telegram:", error);

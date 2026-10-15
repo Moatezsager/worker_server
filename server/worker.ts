@@ -47,6 +47,7 @@ import systemRouter from "./routes/system.routes";
 import internalRouter from "./routes/internal.routes";
 import dashboardRouter from "./routes/dashboard.routes";
 import manualRouter from "./routes/manual.routes";
+import { requireAdmin } from './middleware/auth';
 
 // ─── Environment Validation on Bootstrap ───
 if (process.env.NODE_ENV === "production") {
@@ -201,14 +202,7 @@ export function createWorkerApp() {
       service: "lyd-index-worker",
       timestamp: new Date().toISOString(),
       uptimeSeconds: Math.floor(process.uptime()),
-      memory: {
-        rssMb: Math.round(process.memoryUsage().rss / (1024 * 1024)),
-        heapUsedMb: Math.round(process.memoryUsage().heapUsed / (1024 * 1024))
-      },
-      telegramConnected: !!(activeClient && activeClient.connected),
-      whatsappStatus: whatsappManager.getStatus().status,
-      activeJobs: getWorkerJobsStatus(),
-      lastUpdated: rates?.lastUpdated || new Date().toISOString()
+      lastUpdated: rates?.lastUpdated || null
     });
   });
 
@@ -227,7 +221,7 @@ export function createWorkerApp() {
   app.use(dashboardRouter);
 
   // Dedicated Worker Job Status endpoint
-  app.get("/api/worker/jobs", (req: express.Request, res: express.Response) => {
+  app.get("/api/worker/jobs", apiLimiter, requireAdmin, (req: express.Request, res: express.Response) => {
     res.json({
       success: true,
       timestamp: new Date().toISOString(),

@@ -8,12 +8,13 @@ async function listen(app) {
 }
 async function main() {
   const f = fixture(), source = { fetchOfficialRates: async () => true, fetchParallelRatesFromTelegram: async () => false };
+  let monitorWrites = 0;
   const scheduler = f.load('server/schedulers/tasks.scheduler.ts', {
     '../services/maintenance.service': { monitorMemory() {}, cleanupUserLogs() {} },
-    '../services/db.service': { cleanupOldData() {}, logErrorArabic: async () => {}, saveWorkerStateToSupabase: async () => {} },
+    '../services/db.service': { cleanupOldData() {}, logErrorArabic: async () => {}, saveWorkerStateToSupabase: async key => { if (key === 'job_state_connection_monitor') monitorWrites++; } },
     '../services/scraper.service': source, '../state': { rates: f.rates },
     '../services/social.service': {}, '../../telegramClient': {},
-    '../services/whatsapp.service': {}, '../utils/logger': { addLog() {} }
+    '../services/whatsapp.service': {}, '../utils/logger': f.logger
   }, { setTimeout, clearTimeout });
   let release, executions = 0;
   const waiting = new Promise(resolve => { release = resolve; });
@@ -24,6 +25,19 @@ async function main() {
   release(true); await job; await new Promise(resolve => setTimeout(resolve, 1));
   assert.equal(scheduler.isJobRunning('fixture'), false); assert.equal(executions, 1);
   console.log('PASS actual scheduler keeps underlying lock after timeout and releases on completion');
+  for (let i = 0; i < 30; i++) {
+    await scheduler.runJobSafely('connection_monitor', 'fixture', async () => {});
+    f.advance(60000);
+  }
+  assert.equal(monitorWrites, 1);
+  await scheduler.runJobSafely('connection_monitor', 'fixture', async () => {});
+  assert.equal(monitorWrites, 2);
+  await scheduler.runJobSafely('connection_monitor', 'fixture', async () => { throw Error('Bearer private-fixture'); });
+  assert.equal(monitorWrites, 3);
+  assert(!scheduler.getWorkerJobsStatus().find(j => j.id === 'connection_monitor').lastError.includes('private-fixture'));
+  await scheduler.runJobSafely('connection_monitor', 'fixture', async () => {});
+  assert.equal(monitorWrites, 4);
+  console.log('PASS monitor checkpoints are throttled, failures/recovery persist immediately and errors are redacted');
 
   const internal = f.load('server/routes/internal.routes.ts', {
     express, 'express-rate-limit': require('express-rate-limit'),
@@ -69,6 +83,41 @@ async function main() {
   const adminAuth = f.load('server/middleware/auth.ts', { express, '../config': { appConfig: f.config } });
   assert.equal(adminAuth.validateAdminPassword('admin'), false);
   const token = adminAuth.createAdminSession('fixture', 'fixture').token;
+  const systemRoutes = f.load('server/routes/system.routes.ts', {
+    express, '../state': { rates: f.rates }, '../config': { appConfig: f.config },
+    '../utils/version': { serverStartTime: new f.Clock() }, '../../telegramClient': {},
+    '../services/social.service': { getOrInitTelegramManager: () => ({ lastError: 'Bearer fixture-private' }) },
+    '../middleware/auth': adminAuth, '../utils/logger': f.logger
+  }).default;
+  const pass = (req, res, next) => next();
+  const securityFixture = Object.fromEntries(['ipBanMiddleware', 'suspiciousActivityMiddleware', 'userAgentMiddleware',
+    'timeoutMiddleware', 'helmetMiddleware', 'permissionsPolicyMiddleware', 'apiLimiter'].map(key => [key, pass]));
+  const workerApp = f.load('server/worker.ts', {
+    dotenv: { config() {} }, fs: {}, http: {}, express, compression: () => pass,
+    './schedulers/cron.scheduler': {}, './schedulers/tasks.scheduler': scheduler,
+    './services/maintenance.service': {}, './services/db.service': {}, './config': {},
+    './services/social.service': {}, './services/reporting.service': {}, './services/scraper.service': {},
+    './services/whatsapp.service': {}, '../telegramClient': {}, './services/telegramSession.service': {},
+    './services/telegramAuth.service': {}, './services/accountLease.service': {}, './state': { rates: f.rates }, './db': {},
+    './middleware/security': securityFixture, './middleware/auth': adminAuth,
+    './routes/cron.routes': { default: express.Router(), __esModule: true },
+    './routes/system.routes': { default: systemRoutes, __esModule: true },
+    './routes/internal.routes': { default: express.Router(), __esModule: true },
+    './routes/dashboard.routes': { default: express.Router(), __esModule: true },
+    './routes/manual.routes': { default: express.Router(), __esModule: true }
+  }, { process: { env: {}, on() {}, uptime: () => 1 } }).createWorkerApp();
+  const healthHttp = await listen(workerApp);
+  try {
+    const health = await (await fetch(healthHttp.url + '/health')).json();
+    assert.equal(health.status, 'online'); assert.equal(health.activeJobs, undefined); assert.equal(health.memory, undefined);
+    for (const route of ['/api/worker/jobs', '/api/telegram/status']) {
+      assert.equal((await fetch(healthHttp.url + route)).status, 401);
+      const authorized = await fetch(healthHttp.url + route, { headers: { Authorization: 'Bearer ' + token } });
+      assert.equal(authorized.status, 200);
+      assert(!(await authorized.text()).includes('fixture-private'));
+    }
+  } finally { await healthHttp.close(); }
+  console.log('PASS public health omits private telemetry; jobs and Telegram details require a real admin session');
   const waSources = f.load('server/services/whatsapp.service.ts', {
     '@whiskeysockets/baileys': {}, qrcode: {}, pino: () => ({}), fs: { existsSync: () => true },
     './accountLease.service': {}, '../db': { db: noopDb, supabase: null }, '../config': { appConfig: f.config },
@@ -177,16 +226,19 @@ async function main() {
     const retryTimers = [], waiting = new Promise(resolve => { release = resolve; });
     const pass = (_req, _res, next) => next(), empty = () => express.Router();
     const security = Object.fromEntries(['ipBanMiddleware', 'suspiciousActivityMiddleware', 'userAgentMiddleware',
-      'timeoutMiddleware', 'helmetMiddleware', 'permissionsPolicyMiddleware', 'apiLimiter', 'publicApiLimiter'].map(key => [key, pass]));
+      'timeoutMiddleware', 'helmetMiddleware', 'permissionsPolicyMiddleware', 'apiLimiter', 'publicApiLimiter', 'developerApiHeaders'].map(key => [key, pass]));
+    const developerApi = w.load(path.join(webRoot, 'shared/developerApi.ts'));
     const webSecurity = w.load(path.join(webRoot, 'server/middleware/security.ts'), {
-      express, 'express-rate-limit': require('express-rate-limit'), helmet: require('helmet'), '../config': { appConfig: w.config }
+      express, 'express-rate-limit': require('express-rate-limit'), helmet: require('helmet'), '../config': { appConfig: w.config },
+      '../../shared/developerApi': developerApi
     });
     security.userAgentMiddleware = webSecurity.userAgentMiddleware;
     assert.equal(webSecurity.isValidCronSecret('fixture-cron-only-token'), false);
     assert.ok(/const knownKeys = \[\s*process\.env\.CRON_SECRET\s*\]/.test(webSecurity.isValidCronSecret.toString()),
       'Cron authentication has no embedded fallback credential');
     const configuredSecurity = w.load(path.join(webRoot, 'server/middleware/security.ts'), {
-      express, 'express-rate-limit': require('express-rate-limit'), helmet: require('helmet'), '../config': { appConfig: w.config }
+      express, 'express-rate-limit': require('express-rate-limit'), helmet: require('helmet'), '../config': { appConfig: w.config },
+      '../../shared/developerApi': developerApi
     }, { process: { env: { CRON_SECRET: 'fixture-cron-only-token' } } });
     assert.equal(configuredSecurity.isValidCronSecret('fixture-cron-only-token'), true);
     assert.equal(configuredSecurity.isValidCronSecret('  fixture-cron-only-token  '), true);

@@ -54,6 +54,71 @@ function socialFixture(f, options = {}) {
     webReady: v => { webReady = v; } };
 }
 const update = { id: 'USD', name: 'Dollar', flag: 'us', oldVal: 9.7, newVal: 9.8 };
+test('AI cache distinguishes full messages, reuses results and permits retries after transient failures', async () => {
+  const f = fixture(); let calls = 0, fail = false;
+  class GoogleGenAI { models = { generateContent: async () => {
+    calls++; if (fail) throw Error('503 temporary');
+    return { text: '[{"code":"USD","value":9.8}]' };
+  } }; }
+  const ai = f.load('server/services/ai.service.ts', {
+    '@google/genai': { GoogleGenAI, Type: {} }, '../config': { appConfig: f.config }, '../utils/helpers': f.helper
+  }, { process: { env: { GEMINI_API_KEY: 'fixture-only' } } });
+  const prefix = 'Latest cash dollar market bulletin: ';
+  assert.equal((await ai.extractRatesWithAI(prefix + '9.80', 'fixture')).length, 1);
+  assert.equal((await ai.extractRatesWithAI(prefix + '9.90', 'fixture')).length, 1);
+  assert.equal(calls, 2);
+  assert.equal((await ai.extractRatesWithAI(prefix + '9.80', 'fixture')).length, 1); assert.equal(calls, 2);
+  fail = true; assert.equal((await ai.extractRatesWithAI(prefix + '9.85', 'fixture')).length, 0);
+  fail = false; assert.equal((await ai.extractRatesWithAI(prefix + '9.85', 'fixture')).length, 1); assert.equal(calls, 4);
+  f.config.terms = [];
+  assert.equal((await ai.extractRatesWithAI(prefix + '9.80', 'fixture')).length, 0);
+});
+
+test('Telegram falls back from a bad quote without rolling prices back or marking empty fetches successful', async () => {
+  const f = fixture(); f.rates.parallel.USD = 10;
+  const db = dbService(f);
+  let messages = [{ text: 'USD 10.62', date: f.now() }, { text: 'USD 10.20', date: f.now() - 60000 }];
+  const source = scraper(f, db, { getOrInitTelegramManager: () => ({ fetchMessages: async () => messages }) }, undefined, undefined, undefined,
+    { process: { env: {}, memoryUsage: () => ({ rss: 0, heapUsed: 0 }) }, setTimeout: (fn, ms) => { if (ms === 250) queueMicrotask(fn); return {}; } });
+  await source.fetchParallelRatesFromTelegram();
+  assert.equal(f.rates.parallel.USD, 10.2);
+  f.advance(180000); messages = [{ text: 'USD 10.80', date: f.now() }, { text: 'USD 10.10', date: f.now() - 300000 }];
+  await source.fetchParallelRatesFromTelegram(); assert.equal(f.rates.parallel.USD, 10.2);
+  const success = source.lastSuccessfulFetchTime;
+  f.advance(180000); messages = [];
+  await source.fetchParallelRatesFromTelegram(); assert.equal(source.lastSuccessfulFetchTime, success);
+});
+
+test('Multiline cash-dollar quotes use saved rules without mixing currencies, dates or checks', async () => {
+  const f = fixture();
+  const defaults = f.load('server/config.ts', { '../telegramClient': {}, './db': { db: noopDb, supabase: null, supabaseKey: '' } });
+  f.config.terms = defaults.appConfig.terms;
+  const originalRules = JSON.stringify(f.config.terms);
+  const db = dbService(f);
+  let publications = 0;
+  const source = scraper(f, db, { broadcastRateChanges: async () => { publications++; } });
+  const message = '🇺🇲دولار كاش ارضة الآن💲🇺🇲\n\nمطلوق 10.24\n\n🇺🇲الغرفة الرئيسية سوق المشير 🇺🇲';
+  const usd = text => source.extractRatesFromText(text).find(rate => rate.code === 'USD');
+  for (const text of [message, message.replaceAll('\n', '\r\n'), message.replace('10.24', '١٠٫٢٤'), message.replace('10.24', '۱۰,۲۴'), 'دولار كاش\nمطلوب 10.24', 'دولار كاش\n💲10.24']) {
+    assert.equal(usd(text)?.value, 10.24, text);
+  }
+  const mixed = source.extractRatesFromText(message + '\nيورو 11.17');
+  assert.equal(mixed.find(rate => rate.code === 'USD').value, 10.24);
+  assert.equal(mixed.find(rate => rate.code === 'EUR').value, 11.17);
+  for (const text of ['دولار كاش\nيورو 11.17', 'دولار كاش\nالساعة 10:24', 'دولار كاش\nمطلوق 10.24%',
+    'دولار كاش وصكوك\nمطلوق 10.24', 'دولار كاش حوالة\nمطلوق 10.24', 'دولار كاش\n1000 دولار\nمطلوق 10.24', 'دولار كاش\nمطلوق 99.99']) {
+    assert.equal(usd(text), undefined, text);
+  }
+  assert.equal(JSON.stringify(f.config.terms), originalRules, 'Do not rewrite configured extraction settings');
+  f.rates.parallel.USD = 10.20;
+  assert.equal((await source.processWhatsAppMessage('fixture', message, f.now())).processed, true);
+  assert.equal(f.rates.parallel.USD, 10.24); assert.equal(publications, 1);
+  const rule = f.config.terms.find(term => term.id === 'USD');
+  f.config.terms = [{ ...rule, max: 10 }]; assert.equal(usd(message), undefined, 'Saved maximum is authoritative');
+  f.config.terms = [{ ...rule, regex: 'CUSTOM\\s+(\\d+\\.\\d+)' }]; assert.equal(usd(message), undefined, 'No bypass of custom regex');
+  f.config.terms = [{ ...rule, isInverse: true, min: 0.09, max: 0.1 }]; assert.equal(usd(message).value, 1 / 10.24);
+  f.config.terms = []; assert.equal(source.extractRatesFromText(message).length, 0, 'Deleted rules remain deleted');
+});
 test('Database failure cannot commit RAM, history or publish; same price can retry', async () => {
   const f = fixture(); let fail = true, inserts = 0, publications = 0;
   const db = dbService(f, query => {
@@ -79,6 +144,58 @@ test('Older, invalid, future and anomalous source prices cannot overwrite newer 
   await db.commitParallelRates(entry(9.9, f.now() + 3600000)); assert.equal(f.rates.parallel.USD, 9.8);
   await db.commitParallelRates(entry(19, f.now()), true); assert.equal(f.rates.parallel.USD, 19);
 });
+test('Automatic liquid-currency jumps are rejected before writes and publishing; manual approval remains available', async () => {
+  for (const code of ['USD', 'EUR', 'USD_CHECKS', 'USD_JBANK', 'USD_NCB']) {
+    const f = fixture(); let inserts = 0, publications = 0;
+    if (!f.config.terms.some(term => term.id === code)) f.config.terms.push({ id: code, name: code, min: 5.5, max: 20 });
+    f.rates.parallel[code] = 10;
+    const db = dbService(f, query => {
+      if (query.op === 'insert') inserts++;
+      return { data: [], error: null };
+    });
+    const before = JSON.stringify(f.rates);
+    for (const value of [10.31, 9.69, 10.62]) {
+      assert.equal((await db.commitParallelRates([{ code, value, time: f.now(), source: 'fixture' }])).length, 0);
+    }
+    assert.equal(JSON.stringify(f.rates), before); assert.equal(inserts, 0);
+    const log = f.logger.getRecentLogs(1)[0];
+    assert.equal(log.category, 'حماية الأسعار');
+    assert.equal(JSON.parse(log.details).limitPercent, 3);
+    if (code === 'USD') {
+      const source = scraper(f, db, { broadcastRateChanges: async () => { publications++; } });
+      await source.processWhatsAppMessage('fixture', 'USD 10.62', f.now());
+      assert.equal(publications, 0); assert.equal(inserts, 0);
+    }
+    await db.commitParallelRates([{ code, value: 10.3, time: f.now() - 1000, source: 'fixture' }]);
+    assert.equal(f.rates.parallel[code], 10.3, 'Boundary accepted; rejection must not advance observation time');
+    await db.commitParallelRates([{ code, value: 10.2, time: f.now(), source: 'fixture' }]);
+    assert.equal(f.rates.parallel[code], 10.2);
+    await db.commitParallelRates([{ code, value: 12, time: f.now(), source: 'manual' }], true);
+    assert.equal(f.rates.parallel[code], 12);
+  }
+});
+
+test('Check aliases and incremental entries cannot bypass the persisted-price guard', async () => {
+  const f = fixture();
+  for (const id of ['USD_CHECKS', 'USD_JBANK', 'USD_NCB']) f.config.terms.push({ id, name: id, min: 5.5, max: 20 });
+  f.rates.parallel.USD_CHECKS = 12;
+  f.rates.parallel.USD = 10;
+  const db = dbService(f);
+  assert.equal((await db.commitParallelRates([{ code: 'USD_NCB', value: 15, time: f.now(), source: 'fixture' }])).length, 0);
+  assert.equal(f.rates.parallel.USD_NCB, undefined);
+  await db.commitParallelRates([
+    { code: 'USD', value: 10.2, time: f.now(), source: 'fixture' },
+    { code: 'USD', value: 10.4, time: f.now(), source: 'fixture' },
+    { code: 'EUR', value: 10.6, time: f.now(), source: 'fixture' }
+  ]);
+  assert.equal(f.rates.parallel.USD, 10.2); assert.equal(f.rates.parallel.EUR, 10.6);
+  await db.commitParallelRates([{ code: 'USD_NCB', value: 12.1, time: f.now(), source: 'fixture' }]);
+  assert.equal(f.rates.parallel.USD_CHECKS, 12.1, 'Checks must not be compared against cash USD');
+  const fresh = fixture(); fresh.rates.parallel = {};
+  await dbService(fresh).commitParallelRates([{ code: 'USD', value: 10.24, time: fresh.now(), source: 'fixture' }]);
+  assert.equal(fresh.rates.parallel.USD, 10.24, 'No invented baseline on first collection');
+});
+
 test('Primary save stays successful if compatibility history copy fails', async () => {
   const f = fixture();
   const db = dbService(f, q => ({ error: q.table === 'exchange_rates' ? { message: 'fixture auxiliary failure' } : null }));

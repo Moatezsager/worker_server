@@ -11,7 +11,7 @@ import { rates } from "../state";
 import { getOrInitTelegramManager } from "../services/social.service";
 import { initializeTelegram, activeClient } from "../../telegramClient";
 import { whatsappManager, hasSavedSession } from "../services/whatsapp.service";
-import { addLog } from "../utils/logger";
+import { addLog, sanitizeErrorMessage } from "../utils/logger";
 
 export type JobStatus = 'idle' | 'running' | 'timed_out' | 'failed' | 'success';
 
@@ -31,6 +31,7 @@ export interface WorkerJob {
 }
 
 export const jobRegistry = new Map<string, WorkerJob>();
+const jobCheckpoints = new Map<string, { state: string; time: number }>();
 
 function getOrCreateJob(id: string, name: string): WorkerJob {
   let job = jobRegistry.get(id);
@@ -165,7 +166,7 @@ export async function runJobSafely<T>(
     return result;
   } catch (error: any) {
     const endTime = Date.now();
-    const errorMsg = error?.message || String(error);
+    const errorMsg = sanitizeErrorMessage(error) || 'Unknown job error';
 
     if (isTimedOut || controller.signal.aborted) {
       job.status = 'timed_out';
@@ -193,7 +194,11 @@ export async function runJobSafely<T>(
     }
 
     // Persist critical job state to Supabase in background
-    saveWorkerStateToSupabase(`job_state_${jobId}`, {
+    const state = JSON.stringify([job.status, job.lastError]);
+    const checkpoint = jobCheckpoints.get(jobId);
+    if (jobId !== 'connection_monitor' || !checkpoint || checkpoint.state !== state || Date.now() - checkpoint.time >= 30 * 60000) {
+      jobCheckpoints.set(jobId, { state, time: Date.now() });
+      saveWorkerStateToSupabase(`job_state_${jobId}`, {
       id: job.id,
       name: job.name,
       status: job.status,
@@ -201,7 +206,8 @@ export async function runJobSafely<T>(
       lastRunDurationMs: job.lastRunDurationMs,
       consecutiveFailures: job.consecutiveFailures,
       lastError: job.lastError
-    }).catch(() => {});
+      }).catch(() => { jobCheckpoints.delete(jobId); });
+    }
   }
 }
 
@@ -386,4 +392,5 @@ export function resetSchedulerForTesting() {
   stopBackgroundTasks();
   isSchedulerShuttingDown = false;
   jobRegistry.clear();
+  jobCheckpoints.clear();
 }
