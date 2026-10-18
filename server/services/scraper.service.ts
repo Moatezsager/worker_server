@@ -214,13 +214,17 @@ export async function fetchFromCBL(maxRetries: number = 3, isManualAdmin = false
     attempt++;
     const startTime = Date.now();
     try {
-      const response = await fetch('https://cbl.gov.ly/currency-exchange-rates/', { 
+      const dateRange = `${status.currentLibyaDate} - ${status.currentLibyaDate}`;
+      const response = await fetch('https://cbl.gov.ly/currency-exchange-rates/', {
+        method: 'POST',
         signal: AbortSignal.timeout(Math.max(1, Math.min(15000, remainingMs))),
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'ar,en-US;q=0.7,en;q=0.3'
-        }
+          'Accept-Language': 'ar,en-US;q=0.7,en;q=0.3',
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: `pub_date=${encodeURIComponent(dateRange)}`
       });
       
       const durationMs = Date.now() - startTime;

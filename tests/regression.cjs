@@ -628,6 +628,19 @@ test('Actual CBL job rejects stale/missing dates and commits only after saving i
   assert.equal(await s.fetchOfficialRates(), false); assert.equal(f.rates.official.USD, 6.4);
   assert.equal(s.lastOfficialFetchDate, '');
 });
+test('CBL requests the bulletin for the current Tripoli date instead of the page default', async () => {
+  const f = fixture(); f.advance(-3 * 3600000);
+  let request;
+  const s = scraper(f, { saveToSupabase: async () => true, saveWorkerStateToSupabase: async () => {} }, {},
+    async (url, options) => {
+      request = { url, options };
+      return { ok: true, text: async () => cblHtml('2026-10-12') };
+    });
+  assert.equal(await s.fetchOfficialRates(), true);
+  assert.equal(request.url, 'https://cbl.gov.ly/currency-exchange-rates/');
+  assert.equal(request.options.method, 'POST');
+  assert.equal(request.options.body, 'pub_date=2026-10-12%20-%202026-10-12');
+});
 test('CBL enforces Tripoli 09:00 <= time < 11:00, even for forced manual requests', async () => {
   for (const [time, allowed] of [['06:59:59', false], ['07:00:00', true], ['08:59:59', true], ['09:00:00', false], ['10:00:00', false]]) {
     const f = fixture(); f.advance(Date.parse('2026-10-12T' + time + 'Z') - f.now());
