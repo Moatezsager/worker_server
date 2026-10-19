@@ -19,6 +19,7 @@ async function main() {
       if (failFirst) { failFirst = false; return false; } return true;
     } };
     const social = f.load(path.join(root, 'server/services/social.service.ts'), {
+      './accountLease.service': { ensureAccountLease: async () => true, ownsAccountLease: () => true, getAccountLeaseGeneration: () => 1 },
       '../../telegramClient': { getTelegramManager: () => manager },
       './telegramSession.service': { getTelegramCredentials: () => ({ apiId: 1, apiHash: 'fixture', sessionString: 'fixture' }) },
       './db.service': { ensureWebRatesReady: async () => { events.push('Web ready'); return webReady; }, getWebRatesSyncError: () => 'Fixture Web sync failure' },
@@ -173,6 +174,7 @@ async function main() {
     const title = readyHtml.match(/property="og:title" content="([^"]+)"/)[1];
     const manager = { sendMessage: async () => { sequence.push('telegram'); return true; } };
     const sender = worker.load('server/services/social.service.ts', {
+      './accountLease.service': { ensureAccountLease: async () => true, ownsAccountLease: () => true, getAccountLeaseGeneration: () => 1 },
       '../../telegramClient': { getTelegramManager: () => manager },
       './telegramSession.service': { getTelegramCredentials: () => ({ apiId: 1, apiHash: 'fixture', sessionString: 'fixture' }) },
       './db.service': workerDb, '../config': { appConfig: worker.config, telegramManager: manager, setTelegramManager() {} },

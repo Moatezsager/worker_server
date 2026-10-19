@@ -73,6 +73,30 @@ async function main() {
   } finally { await http.close(); }
   console.log('PASS real internal HTTP routes: authentication, allowlist, dispatch, toggle and broadcast validation');
 
+  for (const root of [process.cwd(), ...(process.env.WEB_PROJECT_PATH ? [process.env.WEB_PROJECT_PATH] : [])]) {
+    const mocks = { express, 'express-rate-limit': require('express-rate-limit'), helmet: require('helmet'), '../config': { appConfig: f.config } };
+    if (root === process.env.WEB_PROJECT_PATH) mocks['../../shared/developerApi'] = f.load(path.join(root, 'shared/developerApi.ts'));
+    const security = f.load(path.join(root, 'server/middleware/security.ts'), mocks,
+      { process: { env: { CRON_SECRET: 'fixture-cleanup-only-secret' } } });
+    let cleanups = 0, fails = false;
+    const cron = f.load(path.join(root, 'server/routes/cron.routes.ts'), {
+      express, '../middleware/security': security, '../state': { rates: f.rates }, '../services/scraper.service': source,
+      '../services/db.service': { cleanupOldData: async () => { cleanups++; if (fails) throw Error('Fixture boundary read failed'); return { total_removed_rates: 2 }; } }
+    }).default;
+    const app = express(); app.use('/api', cron);
+    const http = await listen(app);
+    try {
+      assert.equal((await fetch(http.url + '/api/cleanup-db')).status, 403); assert.equal(cleanups, 0);
+      const options = { headers: { 'x-cron-secret': 'fixture-cleanup-only-secret' } };
+      const response = await fetch(http.url + '/api/cleanup-db?key=fixture-cleanup-only-secret', options);
+      assert.equal(response.status, 200); assert.equal((await response.json()).details.total_removed_rates, 2);
+      fails = true;
+      assert.equal((await fetch(http.url + '/api/cleanup-db?key=fixture-cleanup-only-secret', options)).status, 500);
+      assert.equal(cleanups, 2);
+    } finally { await http.close(); }
+  }
+  console.log('PASS paired authenticated cleanup routes share retention logic and report failed cleanup honestly');
+
   let saveFails = true, sessionSaveFails = false, configSaveFails = false, privateSessionSaves = 0, settingsWrites = 0;
   const db = f.load('server/services/db.service.ts', {
     '../db': { db: noopDb, supabaseKey: 'fixture', supabase: fakeSupabase(q =>
@@ -92,7 +116,7 @@ async function main() {
   const pass = (req, res, next) => next();
   const securityFixture = Object.fromEntries(['ipBanMiddleware', 'suspiciousActivityMiddleware', 'userAgentMiddleware',
     'timeoutMiddleware', 'helmetMiddleware', 'permissionsPolicyMiddleware', 'apiLimiter'].map(key => [key, pass]));
-  const workerApp = f.load('server/worker.ts', {
+  const workerDependencies = {
     dotenv: { config() {} }, fs: {}, http: {}, express, compression: () => pass,
     './schedulers/cron.scheduler': {}, './schedulers/tasks.scheduler': scheduler,
     './services/maintenance.service': {}, './services/db.service': {}, './config': {},
@@ -105,7 +129,9 @@ async function main() {
     './routes/internal.routes': { default: express.Router(), __esModule: true },
     './routes/dashboard.routes': { default: express.Router(), __esModule: true },
     './routes/manual.routes': { default: express.Router(), __esModule: true }
-  }, { process: { env: {}, on() {}, uptime: () => 1 } }).createWorkerApp();
+  };
+  const workerApp = f.load('server/worker.ts', workerDependencies,
+    { process: { env: {}, on() {}, uptime: () => 1 } }).createWorkerApp();
   const healthHttp = await listen(workerApp);
   try {
     const health = await (await fetch(healthHttp.url + '/health')).json();
@@ -118,6 +144,28 @@ async function main() {
     }
   } finally { await healthHttp.close(); }
   console.log('PASS public health omits private telemetry; jobs and Telegram details require a real admin session');
+  for (const pendingFlush of [false, true]) {
+    const steps = []; let release;
+    const flush = pendingFlush ? new Promise(resolve => { release = resolve; }) : Promise.resolve();
+    const shutdown = f.load('server/worker.ts', { ...workerDependencies,
+      './schedulers/tasks.scheduler': { stopBackgroundTasks: () => steps.push('stop jobs'), getWorkerJobsStatus: () => [] },
+      './schedulers/cron.scheduler': { stopCronSchedulers() {} },
+      './services/social.service': { stopSocialPublishing: () => steps.push('stop publishing'),
+        flushBroadcastQueueState: () => { steps.push('flush'); return flush; } },
+      './services/whatsapp.service': { whatsappManager: { closeOnly() {} }, backupAuthToStorage: async () => {} },
+      '../telegramClient': { disconnectTelegram: async () => {} },
+      './services/telegramAuth.service': { closeTelegramLogin: async () => {} },
+      './services/accountLease.service': { stopAccountLease() {}, releaseAccountLease: async () => { steps.push('release'); } }
+    }, { process: { env: {}, on() {}, exit: code => steps.push('exit ' + code) },
+      setTimeout: (fn, ms) => { if (ms === 5000) queueMicrotask(fn); return { unref() {} }; } });
+    await shutdown.gracefulShutdown();
+    assert(steps.indexOf('stop publishing') < steps.indexOf('flush'));
+    assert.equal(steps.includes('release'), !pendingFlush, 'Keep ownership until a pending old checkpoint has settled');
+    if (!pendingFlush) assert(steps.indexOf('flush') < steps.indexOf('release'));
+    assert(steps.includes('exit 0'));
+    release?.();
+  }
+  console.log('PASS shutdown stops publication and preserves ownership until queue writes settle');
   const waSources = f.load('server/services/whatsapp.service.ts', {
     '@whiskeysockets/baileys': {}, qrcode: {}, pino: () => ({}), fs: { existsSync: () => true },
     './accountLease.service': {}, '../db': { db: noopDb, supabase: null }, '../config': { appConfig: f.config },
@@ -175,6 +223,25 @@ async function main() {
     assert.equal((await adminPost('manual-rates-batch', { items: [{ code: 'USD', selected: true, newRate: 9.8 }] })).status, 500);
     assert.equal(f.rates.parallel.USD, 9.7);
     saveFails = false;
+    const originalInterval = f.config.minBroadcastIntervalMinutes;
+    assert.equal((await adminPost('broadcast/settings/save', { minBroadcastIntervalMinutes: 30 }, false)).status, 401);
+    for (const body of [{ telegramAutoPost: 'false' }, { aggregationWindowSeconds: 'Infinity' },
+      { hourlyPostLimit: 1.5 }, { quietHoursStart: '25:00' }, { aggregationWindowSeconds: 301 }]) {
+      assert.equal((await adminPost('broadcast/settings/save', body)).status, 400);
+    }
+    configSaveFails = true;
+    const failedSettings = await adminPost('broadcast/settings/save', { minBroadcastIntervalMinutes: 30 });
+    assert.equal(failedSettings.status, 503); assert.equal(f.config.minBroadcastIntervalMinutes, originalInterval);
+    for (const [route, body] of [
+      ['accounts/facebook/save', { pageId: 'fixture' }],
+      ['sources/telegram/add', { channel: 'fixture-channel' }]
+    ]) {
+      const failed = await adminPost(route, body);
+      assert.equal(failed.status, 503, 'Never announce successful remote persistence on ' + route);
+    }
+    configSaveFails = false;
+    assert.equal((await adminPost('broadcast/settings/save', { minBroadcastIntervalMinutes: 30, telegramAutoPost: false })).status, 200);
+    assert.equal(f.config.minBroadcastIntervalMinutes, 30); assert.equal(f.config.telegramAutoPost, false);
     const response = await adminPost('update-rate', { code: 'USD', rate: 9.8 });
     assert.equal(response.status, 200); assert.equal((await response.json()).success, true);
     assert.equal(f.rates.parallel.USD, 9.8);

@@ -32,6 +32,7 @@ export interface WorkerJob {
 
 export const jobRegistry = new Map<string, WorkerJob>();
 const jobCheckpoints = new Map<string, { state: string; time: number }>();
+const monitoringStartedAt = Date.now();
 
 function getOrCreateJob(id: string, name: string): WorkerJob {
   let job = jobRegistry.get(id);
@@ -270,13 +271,13 @@ export function initBackgroundTasks(port: number) {
   }, 15 * 60 * 1000);
   activeIntervals.push(userLogsInterval);
 
-  // 3. Database Downsampling & Cleanup (Initial run + every 24 hours)
-  runJobSafely('database_cleanup', 'تنظيف وضغط السجلات التاريخية', async () => {
+  // 3. Price history retention (initial run + every 24 hours)
+  runJobSafely('database_cleanup', 'تنظيف البيانات القديمة وحفظ سجل الشهر', async () => {
     await cleanupOldData(cleanupUserLogs);
   }, { timeoutMs: 120000 });
 
   const dbCleanupInterval = setInterval(() => {
-    runJobSafely('database_cleanup', 'تنظيف وضغط السجلات التاريخية', async () => {
+    runJobSafely('database_cleanup', 'تنظيف البيانات القديمة وحفظ سجل الشهر', async () => {
       await cleanupOldData(cleanupUserLogs);
     }, { timeoutMs: 120000 });
   }, 24 * 60 * 60 * 1000);
@@ -290,7 +291,7 @@ export function initBackgroundTasks(port: number) {
       
       // Active market hours (09:00 - 01:00)
       if (currentLibyaHour >= 9 || currentLibyaHour < 1) {
-        const hoursSinceSuccess = (Date.now() - lastSuccessfulFetchTime) / (1000 * 60 * 60);
+        const hoursSinceSuccess = (Date.now() - (lastSuccessfulFetchTime || monitoringStartedAt)) / (1000 * 60 * 60);
         if (hoursSinceSuccess > 4) {
           console.warn(`[Watchdog] ⚠️ No successful scrape for ${hoursSinceSuccess.toFixed(1)} hours!`);
           const tgMgr = getOrInitTelegramManager();

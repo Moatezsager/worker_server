@@ -2,7 +2,7 @@ import { db, supabase, supabaseKey } from '../db';
 import { rates, history } from '../state';
 import { appConfig } from '../config';
 import { HistoryPoint, PriceChangeLog, RateMap, AppConfig } from '../types';
-import { isSignificantChange, METAL_IDS } from '../utils/helpers';
+import { isSignificantChange, METAL_IDS, getPriceHistoryCutoff } from '../utils/helpers';
 import { updateStats } from './reporting.service';
 import { addLog, sanitizeErrorMessage } from '../utils/logger';
 
@@ -14,6 +14,12 @@ export const HISTORY_CACHE_TTL = 60 * 1000; // 1 minute
 export let cachedHistory: HistoryPoint[] | null = null;
 
 export const recentChangesLog: PriceChangeLog[] = [];
+export const pipelineStatus = { lastSavedAt: 0, lastWebSyncAt: 0, lastWebSyncError: '' };
+const rejectedRates = new Map<string, { code: string; name: string; previous: number; proposed: number; source: string; observedAt: string; rejectedAt: number }>();
+
+export function getRejectedRates() {
+  return [...rejectedRates.values()].sort((a, b) => b.rejectedAt - a.rejectedAt);
+}
 
 export function clearDbCache() {
   cachedHistory = null;
@@ -297,6 +303,7 @@ export async function saveToSupabase(
     if (error) console.warn('[DB] Compatibility copy failed after authoritative save:', String(error?.message || error));
   }
   clearDbCache();
+  pipelineStatus.lastSavedAt = Date.now();
   addLog('success', 'حفظ الأسعار', 'حُفظت الأسعار؛ بدء تأكيد مزامنة Web قبل النشر', {
     stage: 'persist', market: type, recordedAt, parallel: { USD: saved.parallel.USD, EUR: saved.parallel.EUR },
     official: { USD: saved.official.USD, EUR: saved.official.EUR }
@@ -338,6 +345,10 @@ export function commitParallelRates(extracted: { code: string; value: number; ti
       });
       if (!isManual && rejectedBaseline) {
         const previous = rates.parallel[rejectedBaseline];
+        rejectedRates.delete(term.id);
+        rejectedRates.set(term.id, { code: term.id, name: term.name, previous, proposed: entry.value,
+          source: entry.source, observedAt: new Date(entry.time).toISOString(), rejectedAt: Date.now() });
+        if (rejectedRates.size > 50) rejectedRates.delete(rejectedRates.keys().next().value!);
         addLog('warn', 'حماية الأسعار', `تم رفض تغير غير معتاد في ${term.name}: ${previous} إلى ${entry.value}؛ يلزم التحقق أو الاعتماد اليدوي`, {
           stage: 'price-validation', code: term.id, baselineCode: rejectedBaseline, source: entry.source,
           previous, proposed: entry.value, difference: entry.value - previous,
@@ -387,6 +398,7 @@ export function commitParallelRates(extracted: { code: string; value: number; ti
     rates.previousParallel = candidate.previousParallel;
     rates.lastChanged.parallel = candidate.lastChanged.parallel;
     rates.lastUpdated = candidate.lastUpdated;
+    for (const change of changes) rejectedRates.delete(change.id);
     Object.assign(lastObserved, observed);
     history.push({ time: candidate.lastUpdated, usdParallel: rates.parallel.USD,
       usdOfficial: rates.official.USD, ratesParallel: { ...rates.parallel }, ratesOfficial: { ...rates.official } });
@@ -584,97 +596,63 @@ export async function syncCheckRates(source: string = "تزامن تلقائي",
   return false;
 }
 
-export async function downsampleTable(tableName: string) {
-  try {
-    if (!supabase || !['parallel_rates', 'official_rates'].includes(tableName)) return;
-    const cutoff = new Date(Date.now() - 7 * 86400000).toISOString();
-    const { data, error } = await supabase.from(tableName)
-      .select('id, recorded_at, usd, rates').lt('recorded_at', cutoff)
-      .order('recorded_at', { ascending: true }).limit(10000);
-    if (error || !data?.length) return;
-    const days = new Map<string, any[]>();
-    for (const row of data) {
-      const day = String(row.recorded_at).split('T')[0];
-      days.set(day, [...(days.get(day) || []), row]);
-    }
-    const finalDay = String(data[data.length - 1].recorded_at).split('T')[0];
-    const ids: any[] = [];
-    for (const [day, rows] of days) {
-      // The final day may be truncated by the query limit or cutoff.
-      if (day === finalDay || rows.length <= 4) continue;
-      const keep = new Set([rows[0].id, rows[rows.length - 1].id]);
-      const codes = new Set(rows.flatMap(row => Object.keys(row.rates || {})));
-      codes.add('USD');
-      for (const code of codes) {
-        const points = rows.filter(row => Number.isFinite(code === 'USD' ? row.usd : row.rates?.[code]));
-        if (!points.length) continue;
-        const value = (row: any) => code === 'USD' ? row.usd : row.rates[code];
-        keep.add(points.reduce((a, b) => value(a) < value(b) ? a : b).id);
-        keep.add(points.reduce((a, b) => value(a) > value(b) ? a : b).id);
+let cleanupRun: Promise<Record<string, number | string>> | null = null;
+
+export function cleanupOldData(onUserLogsCleanup?: () => void): Promise<Record<string, number | string>> {
+  if (!supabase || !supabaseKey || supabaseKey.includes('dummy')) return Promise.reject(new Error('Cleanup database unavailable'));
+  if (!cleanupRun) cleanupRun = (async () => {
+    const cutoff30 = getPriceHistoryCutoff();
+    const cutoff1 = new Date(Date.now() - 86400000).toISOString();
+    const signal = AbortSignal.timeout(10000);
+    const removed: Record<string, number> = {};
+    const tables = ['exchange_rates', 'parallel_rates', 'official_rates', 'metal_rates', 'error_logs', 'price_changes_log'];
+    const failures: string[] = [];
+    for (const table of tables) {
+      const priceTable = table.endsWith('_rates');
+      let cutoff = priceTable ? cutoff30 : cutoff1;
+      try {
+        if (priceTable) {
+          const latest = await supabase!.from(table).select('recorded_at').lt('recorded_at', cutoff)
+            .order('recorded_at', { ascending: false }).limit(1).abortSignal(signal);
+          if (latest.error) throw latest.error;
+          if (!Array.isArray(latest.data)) throw new Error('Missing cleanup boundary');
+          if (!latest.data.length) { removed[table] = 0; continue; }
+          const boundary = Date.parse(latest.data[0].recorded_at);
+          if (!Number.isFinite(boundary) || boundary >= Date.parse(cutoff)) throw new Error('Invalid cleanup boundary');
+          // Retain the last pre-month observation; never delete the only/latest quote.
+          cutoff = new Date(boundary).toISOString();
+        }
+        const result = await supabase!.from(table).delete({ count: 'exact' })
+          .lt(priceTable ? 'recorded_at' : 'created_at', cutoff).abortSignal(signal);
+        if (result.error) throw result.error;
+        removed[table] = result.count || 0;
+      } catch (error: any) {
+        if (['42P01', 'PGRST205'].includes(error?.code) && !['parallel_rates', 'official_rates'].includes(table)) {
+          removed[table] = 0;
+        } else {
+          failures.push(table);
+          console.error(`[Cleanup] ${table} failed:`, sanitizeErrorMessage(error));
+        }
       }
-      for (const row of rows) if (!keep.has(row.id)) ids.push(row.id);
     }
-    for (let i = 0; i < ids.length; i += 200) {
-      const { error } = await supabase.from(tableName).delete().in('id', ids.slice(i, i + 200));
-      if (error) throw error;
+    clearDbCache();
+    if (failures.length) {
+      addLog('error', 'Cleanup', 'لم يكتمل تنظيف البيانات؛ لم تُضغط قراءات الشهر.', { tables: failures });
+      throw new Error(`Cleanup incomplete: ${failures.join(', ')}`);
     }
-    if (ids.length) console.log(`[Cleanup] Downsampled ${tableName}: ${ids.length} redundant rows.`);
-  } catch (err) { console.error(`[Cleanup] Error downsampling ${tableName}:`, err); }
+    const details = {
+      removed_exchange_rates: removed.exchange_rates, removed_parallel_rates: removed.parallel_rates,
+      removed_official_rates: removed.official_rates, removed_metal_rates: removed.metal_rates,
+      total_removed_rates: removed.exchange_rates + removed.parallel_rates + removed.official_rates + removed.metal_rates,
+      removed_logs: removed.error_logs, removed_changes: removed.price_changes_log,
+      cutoff_rates_date: cutoff30, cutoff_logs_date: cutoff1
+    };
+    console.log('[Cleanup] Completed; monthly observations and boundary quotes preserved.', details);
+    addLog('success', 'Cleanup', 'اكتمل التنظيف مع الاحتفاظ بقراءات الشهر وآخر سعر سابق.', details);
+    return details;
+  })().finally(() => { cleanupRun = null; });
+  return cleanupRun.then(details => { onUserLogsCleanup?.(); return details; });
 }
-
-export const cleanupOldData = async (onUserLogsCleanup?: () => void) => {
-  if (!supabase || !supabaseKey || supabaseKey.includes('dummy')) return;
-  
-  try {
-    console.log("Running scheduled database cleanup...");
-    
-    await downsampleTable('parallel_rates');
-    await downsampleTable('official_rates');
-    
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    const cutoff30 = thirtyDaysAgo.toISOString();
-
-    const oneDayAgo = new Date();
-    oneDayAgo.setDate(oneDayAgo.getDate() - 1);
-    const cutoff1 = oneDayAgo.toISOString();
-
-    const [legacyRes, parallelRes, officialRes, metalRes, logsRes, changesRes] = await Promise.all([
-      supabase.from('exchange_rates').delete({ count: 'exact' }).lt('recorded_at', cutoff30),
-      supabase.from('parallel_rates').delete({ count: 'exact' }).lt('recorded_at', cutoff30),
-      supabase.from('official_rates').delete({ count: 'exact' }).lt('recorded_at', cutoff30),
-      supabase.from('metal_rates').delete({ count: 'exact' }).lt('recorded_at', cutoff30),
-      supabase.from('error_logs').delete({ count: 'exact' }).lt('created_at', cutoff1),
-      supabase.from('price_changes_log').delete({ count: 'exact' }).lt('created_at', cutoff1)
-    ]);
-
-    const removedRates = (legacyRes.count || 0) + (parallelRes.count || 0) + (officialRes.count || 0) + (metalRes.count || 0);
-    const removedLogs = logsRes.count || 0;
-    const removedChanges = changesRes.count || 0;
-
-    const errors = [legacyRes.error, parallelRes.error, officialRes.error, metalRes.error, logsRes.error, changesRes.error]
-      .filter(err => err && err.code !== '42P01');
-
-    if (errors.length > 0) {
-      console.error("Cleanup partial error:", { 
-        legacy: legacyRes.error?.message, 
-        parallel: parallelRes.error?.message, 
-        official: officialRes.error?.message, 
-        metal: metalRes.error?.message,
-        logs: logsRes.error?.message,
-        changes: changesRes.error?.message
-      });
-    }
-
-    console.log(`Database cleanup completed. Removed ${removedRates} rates (older than 30 days), ${removedLogs} logs, and ${removedChanges} price changes (older than 1 day).`);
-    
-    if (onUserLogsCleanup) {
-      onUserLogsCleanup();
-    }
-  } catch (error) {
-    console.error("Failed to run database cleanup:", error);
-  }
-};
 
 /**
  * Notifies the Web Server that rates have been updated in Supabase.
@@ -713,6 +691,7 @@ export function notifyWebServers(snapshot?: typeof rates, market: WebMarket = 'b
     const revision = webRevision(snapshot || rates, market);
     const message = !webUrl ? 'WEB_SERVER_URL مفقود في Worker؛ لا يمكن تأكيد المزامنة.'
       : 'WORKER_INTERNAL_SECRET مفقود في Worker؛ لا يمكن توثيق طلب المزامنة.';
+    pipelineStatus.lastWebSyncError = message;
     if (failedWeb[market]?.message !== message || Date.now() - failedWeb[market]!.at >= 30000) {
       addLog('error', 'مزامنة Web', message, { stage: 'web-sync', market, code: 'MISSING_CONFIGURATION' });
     }
@@ -781,6 +760,10 @@ export function notifyWebServers(snapshot?: typeof rates, market: WebMarket = 'b
               }
             }
             synchronized = true;
+            if (expected) {
+              pipelineStatus.lastWebSyncAt = Date.now();
+              pipelineStatus.lastWebSyncError = '';
+            }
             addLog('success', 'مزامنة Web', expected ? 'أكد Web تحميل الأسعار وتحديث المعاينة والبث اللحظي' : 'استلم Web إشعار التحديث (استلام فقط)',
               { ...diagnostic, duration_ms: Date.now() - started });
             break;
@@ -807,6 +790,7 @@ export function notifyWebServers(snapshot?: typeof rates, market: WebMarket = 'b
       }
       if (!synchronized) {
         lastFailure = sanitizeErrorMessage(lastFailure) || 'لم يكتمل تأكيد مزامنة Web.';
+        pipelineStatus.lastWebSyncError = lastFailure;
         addLog('error', 'مزامنة Web', lastFailure, { ...diagnostic, duration_ms: Date.now() - started });
         console.error('[Notify]', lastFailure);
         if (expected) {

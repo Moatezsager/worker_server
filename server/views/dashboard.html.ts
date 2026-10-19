@@ -711,6 +711,12 @@ export function renderDashboardHtml(initialState?: any): string {
       border-color: #059669;
     }
 
+    .pipeline-strip { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; padding:14px 0; border-block:1px solid #334155; margin-bottom:14px; }
+    .pipeline-strip dt { font-size:13px; color:#94a3b8; margin-bottom:6px; }
+    .pipeline-strip dd { margin:0; color:#e2e8f0; font-size:13px; overflow-wrap:anywhere; }
+    .rejected-row { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; padding:12px 0; border-bottom:1px solid #334155; }
+    .rejected-row button { min-height:44px; }
+    .rejected-row > div { min-width:0; flex:1 1 200px; overflow-wrap:anywhere; }
     /* ─── DEDICATED MANUAL EDITABLE TABLE ─── */
     .manual-table-wrapper {
       width: 100%;
@@ -1164,6 +1170,15 @@ export function renderDashboardHtml(initialState?: any): string {
 
     <!-- TAB 1: RATES & MARKET -->
     <div id="tab-content-rates">
+      <h2 style="font-size:15px; margin:0 0 6px;">مسار الأسعار</h2>
+      <p style="font-size:12px; color:#94a3b8; margin:0 0 10px;">آخر نشاط مؤكد منذ تشغيل هذه النسخة</p>
+      <dl class="pipeline-strip" id="pipeline-status"></dl>
+      <p id="pipeline-error" role="status" style="color:#fca5a5; font-size:13px; overflow-wrap:anywhere;"></p>
+      <p id="weekly-report-status" role="status" style="color:#cbd5e1; font-size:13px; overflow-wrap:anywhere;"></p>
+      <details style="margin-bottom:18px;">
+        <summary style="cursor:pointer; padding:12px 0; min-height:44px;">أسعار تحتاج مراجعة <span id="rejected-count">0</span></summary>
+        <div id="rejected-rates"></div>
+      </details>
       
       <!-- Quick Action Buttons -->
       <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; margin-bottom:8px;">
@@ -2526,6 +2541,39 @@ export function renderDashboardHtml(initialState?: any): string {
 
     function renderUI(data) {
       if (!data) return;
+      if (data.pipeline) {
+        const p = data.pipeline;
+        const stamp = value => value ? new Date(value).toLocaleString('ar-LY', { timeZone:'Africa/Tripoli' }) : 'لم يُسجّل بعد';
+        const stages = [
+          ['قراءة تيليجرام', p.sources?.telegram?.lastReadAt], ['سعر مقبول من تيليجرام', p.sources?.telegram?.lastValidAt],
+          ['قراءة واتساب', p.sources?.whatsapp?.lastReadAt], ['سعر مقبول من واتساب', p.sources?.whatsapp?.lastValidAt],
+          ['حفظ الأسعار', p.lastSavedAt], ['تأكيد مزامنة Web', p.lastWebSyncAt],
+          ['نشر Telegram', p.telegram?.lastSuccessTime], ['نشر Facebook', p.facebook?.lastSuccessTime],
+          ['حفظ الطابور سحابيًا', data.broadcastQueue?.checkpoint?.lastSavedAt]
+        ];
+        document.getElementById('pipeline-status').innerHTML = stages.map(([label, value]) =>
+          '<div><dt>' + escapeHtml(label) + '</dt><dd>' + escapeHtml(stamp(value)) + '</dd></div>').join('');
+        document.getElementById('pipeline-error').textContent = [p.sources?.telegram?.lastError, p.sources?.whatsapp?.lastError,
+          p.lastWebSyncError, data.broadcastQueue?.checkpoint?.lastError, data.broadcastQueue?.weekly?.lastError].filter(Boolean).join(' | ');
+        const weekly = data.broadcastQueue?.weekly;
+        const reportState = platform => weekly?.delivered?.[platform] ? 'تم الإرسال' :
+          !data.broadcastConfig?.[platform + 'AutoPost'] ? 'غير مفعّل' : (weekly?.attempts?.[platform] || 0) > 3 ? 'يتطلب مراجعة' : 'بانتظار المحاولة';
+        document.getElementById('weekly-report-status').textContent = weekly?.date ?
+          'الحصاد الأسبوعي ' + weekly.date + ' · Telegram: ' + reportState('telegram') + ' · Facebook: ' + reportState('facebook') : '';
+      }
+      if (Array.isArray(data.rejectedRates)) {
+        document.getElementById('rejected-count').textContent = String(data.rejectedRates.length);
+        const content = data.rejectedRates.map(item => '<div class="rejected-row"><div><strong>' + escapeHtml(item.name) +
+          '</strong><div style="font-size:13px; color:#cbd5e1; margin-top:6px;">المحفوظ: ' + escapeHtml(item.previous) +
+          ' د.ل · المقترح: ' + escapeHtml(item.proposed) + ' د.ل</div><div style="font-size:12px; color:#94a3b8; margin-top:4px;">' +
+          escapeHtml(item.source) + ' · تجاوز حد التغير المسموح</div></div><button class="btn btn-secondary" onclick="openRateModal(' +
+          jsArg(item.code) + ', ' + jsArg(item.name) + ', ' + Number(item.proposed) + ')">مراجعة السعر</button></div>').join('');
+        const container = document.getElementById('rejected-rates');
+        if (container.dataset.snapshot !== content) {
+          container.innerHTML = content || '<p style="color:#94a3b8;">لا توجد أسعار مرفوضة تحتاج مراجعة.</p>';
+          container.dataset.snapshot = content;
+        }
+      }
 
       // 1. KPIs
       if (data.rates && data.rates.parallel) {

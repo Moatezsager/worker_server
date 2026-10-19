@@ -30,13 +30,14 @@ function socialFixture(f, options = {}) {
     get: key => checkpoints.has(key) ? { value: checkpoints.get(key) } : undefined, all: () => []
   }) };
   const mocks = {
+    './accountLease.service': options.lease || { ensureAccountLease: async () => true, ownsAccountLease: () => true, getAccountLeaseGeneration: () => 1 },
     '../../telegramClient': { getTelegramManager: () => ({
       sendMessage: async () => { counts.telegram++; return delayed ? await delayed : !failTG; }, lastError: 'Fixture TG failure'
     }) },
     './telegramSession.service': { getTelegramCredentials: () => ({ apiId: 1, apiHash: 'fixture', sessionString: 'fixture' }) },
     './db.service': options.dbService || { ensureWebRatesReady: async () => webReady, getWebRatesSyncError: () => 'Fixture Web sync failure' },
     '../config': { appConfig: f.config, setTelegramManager() {} }, '../state': { rates: f.rates },
-    '../db': { db, supabase: null, supabaseKey: '' }, './broadcastLog.service': { addBroadcastLog() {} },
+    '../db': { db, supabase: options.supabase || null, supabaseKey: options.supabase ? 'fixture' : '' }, './broadcastLog.service': { addBroadcastLog() {} },
     '../utils/logger': f.logger,
     '../utils/helpers': { ...f.helper, delay: async () => {} }
   };
@@ -432,7 +433,9 @@ test('Price queued during in-flight publishing is retained and sent later', asyn
   await s.broadcastRateChanges([update]);
   let release; env.delayTG(new Promise(resolve => { release = resolve; }));
   const send = s.flushBroadcastQueueImmediately('telegram', true);
-  await Promise.resolve(); await s.broadcastRateChanges([{ ...update, newVal: 9.9 }]);
+  for (let i = 0; i < 100 && env.counts.telegram === 0; i++) await Promise.resolve();
+  assert.equal(env.counts.telegram, 1, 'Queue a newer price only after the older delivery has actually started');
+  await s.broadcastRateChanges([{ ...update, newVal: 9.9 }]);
   release(true); await send;
   assert.equal(s.smartBroadcastQueue.get('USD').newVal, 9.9);
   env.delayTG(null); await s.flushBroadcastQueueImmediately('telegram', true);
@@ -597,17 +600,50 @@ test('SQLite ingestion stores real observations without synthetic startup prices
     assert.equal(sqlite.prepare('SELECT count(*) n FROM ingested_messages').get().n, 1);
   } finally { sqlite.close(); }
 });
-test('Downsampling preserves open, close and EUR extremes; incomplete final day is untouched', async () => {
-  const f = fixture(), deleted = [];
-  const data = Array.from({ length: 8 }, (_, i) => ({ id: i, usd: 9.7,
-    recorded_at: '2026-09-30T0' + i + ':00:00Z', rates: { USD: 9.7, EUR: i === 2 ? 12 : i === 4 ? 8 : 10 } }));
-  data.push({ id: 8, usd: 9.7, recorded_at: '2026-10-01T00:00:00Z', rates: { EUR: 10 } });
-  const db = dbService(f, q => {
-    if (q.op === 'delete') deleted.push(...q.args.in[1]);
-    return { data, error: null };
-  });
-  await db.downsampleTable('parallel_rates');
-  assert.ok(deleted.length > 0); for (const id of [0, 2, 4, 7, 8]) assert.ok(!deleted.includes(id));
+test('Paired cleanup retains the complete Tripoli month, extrema, boundary and only/latest quotes', async () => {
+  const path = require('node:path');
+  for (const root of [process.cwd(), ...(process.env.WEB_PROJECT_PATH ? [process.env.WEB_PROJECT_PATH] : [])]) {
+    const f = fixture();
+    assert.equal(f.helper.getPriceHistoryCutoff(new f.Clock('2026-10-12T21:59:59Z')), '2026-09-11T22:00:00.000Z');
+    assert.equal(f.helper.getPriceHistoryCutoff(new f.Clock('2026-10-12T22:00:00Z')), '2026-09-12T22:00:00.000Z');
+    assert.equal(f.helper.getPriceHistoryCutoff(new f.Clock('2027-01-01T01:00:00Z')), '2026-12-01T22:00:00.000Z');
+    assert.equal(f.helper.getPriceHistoryCutoff(new f.Clock('2028-03-01T01:00:00Z')), '2028-01-30T22:00:00.000Z');
+    const daily = Array.from({ length: 10 }, (_, i) => ({ id: i, usd: i === 2 ? 12 : i === 4 ? 8 : 10,
+      recorded_at: `2026-10-01T${String(i).padStart(2, '0')}:00:00Z`, rates: { EUR: i === 3 ? 13 : 11 } }));
+    const before = [{ id: 'oldest', recorded_at: '2026-08-01T00:00:00Z' },
+      { id: 'boundary', recorded_at: '2026-09-10T23:00:00Z' }];
+    const tables = { parallel_rates: [...before, ...daily, { id: 'cutoff', recorded_at: '2026-09-11T22:00:00Z' }],
+      official_rates: [{ id: 'only', recorded_at: '2026-08-01T00:00:00Z', usd: 6.4444, rates: { USD: 6.4444 } }],
+      metal_rates: [...before, ...daily], exchange_rates: [], error_logs: [], price_changes_log: [] };
+    let reads = 0, broken = false, optionalMissing = false;
+    const supabase = fakeSupabase(q => {
+      if (broken && q.table === 'official_rates') return { error: { message: 'Fixture read failed' } };
+      if (optionalMissing && q.table === 'exchange_rates') return { error: { code: 'PGRST205' } };
+      const [column, cutoff] = q.args.lt;
+      const eligible = tables[q.table].filter(row => Date.parse(row[column]) < Date.parse(cutoff));
+      if (q.op === 'select') {
+        reads++; return { data: eligible.sort((a, b) => Date.parse(b.recorded_at) - Date.parse(a.recorded_at)).slice(0, 1), error: null };
+      }
+      tables[q.table] = tables[q.table].filter(row => !eligible.includes(row));
+      return { count: eligible.length, error: null };
+    });
+    const db = f.load(path.join(root, 'server/services/db.service.ts'), {
+      '../db': { db: noopDb, supabase, supabaseKey: 'fixture', supabaseAnonKey: 'fixture' },
+      '../state': { rates: f.rates, history: [] }, '../config': { appConfig: f.config },
+      '../utils/helpers': f.helper, '../utils/logger': f.logger,
+      './reporting.service': { updateStats() {} }, './alert.service': { checkAndAlertIfCritical: async () => {} }
+    });
+    const [result, duplicate] = await Promise.all([db.cleanupOldData(), db.cleanupOldData()]);
+    assert.equal(result, duplicate); assert.equal(reads, 4, 'Overlapping cleanup calls coalesce');
+    assert.equal(result.total_removed_rates, 2);
+    assert.equal(tables.parallel_rates.length, 12); assert.equal(tables.metal_rates.length, 11);
+    for (const row of daily) assert(tables.parallel_rates.includes(row), 'Every monthly observation survives, not only extrema');
+    assert.equal(tables.official_rates[0].usd, 6.4444, 'Stale last available official quote is never deleted or averaged');
+    assert.equal((await db.cleanupOldData()).total_removed_rates, 0, 'Repeated cleanup is idempotent');
+    broken = true; await assert.rejects(db.cleanupOldData(), /Cleanup incomplete: official_rates/);
+    assert.equal(tables.official_rates.length, 1, 'Failed boundary reads prohibit deletion');
+    broken = false; optionalMissing = true; await db.cleanupOldData();
+  }
 });
 test('Actual CBL job rejects stale/missing dates and commits only after saving in the morning window', async () => {
   for (const date of [null, '2026-10-11', '2026-10-12']) {
@@ -1080,6 +1116,149 @@ test('Explicit manual override cannot silently skip an older request timestamp o
   await db.commitParallelRates([{ code: 'USD', value: 9.9, time: f.now() - 1000, source: 'manual' }], true);
   assert.equal(f.rates.parallel.USD, 9.9);
   await assert.rejects(db.commitParallelRates([{ code: 'UNKNOWN', value: 9.9, time: f.now(), source: 'manual' }], true));
+});
+test('Source health distinguishes old messages, failed saves and stable valid prices', async () => {
+  for (const scenario of ['old', 'failed', 'stable']) {
+    const f = fixture();
+    const db = dbService(f, q => ({ data: [], error: scenario === 'failed' && q.table === 'parallel_rates' ? { message: 'fixture failure' } : null }));
+    const source = scraper(f, db, { getOrInitTelegramManager: () => ({ fetchMessages: async () => [{
+      text: scenario === 'stable' ? 'USD 9.70' : 'USD 9.80', date: scenario === 'old' ? f.now() - 86400000 : f.now()
+    }] }) }, undefined, undefined, undefined,
+    { process: { env: {}, memoryUsage: () => ({ rss: 0, heapUsed: 0 }) }, setTimeout: (fn, ms) => { if (ms === 250) queueMicrotask(fn); return {}; } });
+    assert.equal(source.lastSuccessfulFetchTime, 0);
+    if (scenario === 'failed') await assert.rejects(source.fetchParallelRatesFromTelegram());
+    else await source.fetchParallelRatesFromTelegram();
+    assert.equal(source.sourceHealth.telegram.lastReadAt, f.now());
+    assert.equal(source.lastSuccessfulFetchTime, scenario === 'stable' ? f.now() : 0);
+    assert.equal(f.rates.parallel.USD, 9.7);
+    if (scenario === 'failed') assert(source.sourceHealth.telegram.lastError);
+  }
+});
+test('IP bans use the trusted Express address, expire correctly and stay bounded', async () => {
+  const f = fixture();
+  const security = f.load('server/middleware/security.ts', { express: require('express'),
+    'express-rate-limit': require('express-rate-limit'), helmet: require('helmet'), '../config': { appConfig: f.config } });
+  const response = { statusCode: 0, status(code) { this.statusCode = code; return this; }, json() {} };
+  const request = prefix => ({ path: '/.env', ip: '198.51.100.25', socket: { remoteAddress: '127.0.0.1' },
+    headers: { 'x-forwarded-for': prefix + ', 198.51.100.25' } });
+  security.suspiciousActivityMiddleware(request('203.0.113.1'), response, () => {});
+  let passed = false;
+  security.ipBanMiddleware(request('203.0.113.2'), response, () => { passed = true; });
+  assert.equal(passed, false); assert.equal(response.statusCode, 403);
+  for (let i = 0; i < 10000; i++) security.bannedIPs.set('fixture-' + i, f.now() + 60000);
+  security.bannedIPs.delete('198.51.100.25');
+  security.suspiciousActivityMiddleware(request('changed'), response, () => {});
+  assert.equal(security.bannedIPs.size, 10000);
+  f.advance(31 * 86400000);
+  security.ipBanMiddleware(request('changed'), response, () => { passed = true; });
+  assert.equal(passed, true);
+});
+test('Rejected jumps remain reviewable and disappear only after a successful manual save', async () => {
+  const f = fixture(); let fails = false;
+  const db = dbService(f, q => ({ data: [], error: fails && q.table === 'parallel_rates' ? { message: 'fixture failure' } : null }));
+  await db.commitParallelRates([{ code: 'USD', value: 11, time: f.now(), source: 'fixture' }]);
+  assert.equal(db.getRejectedRates()[0].proposed, 11); assert.equal(f.rates.parallel.USD, 9.7);
+  fails = true;
+  await assert.rejects(db.commitParallelRates([{ code: 'USD', value: 11, time: f.now(), source: 'manual' }], true));
+  assert.equal(db.getRejectedRates().length, 1);
+  fails = false;
+  await db.commitParallelRates([{ code: 'USD', value: 11, time: f.now(), source: 'manual' }], true);
+  assert.equal(db.getRejectedRates().length, 0);
+});
+test('Failed remote settings never replace the last saved local configuration', async () => {
+  const f = fixture(); let failed = true, writes = 0;
+  const config = f.load('server/config.ts', {
+    '../telegramClient': {}, './db': { supabaseKey: 'fixture', supabase: fakeSupabase(() => ({ error: failed ? { message: 'fixture failure' } : null })),
+      db: { ...noopDb, prepare: () => ({ get() {}, all: () => [], run: () => { writes++; } }) } }
+  });
+  const candidate = { ...config.appConfig, minBroadcastIntervalMinutes: 30 };
+  const startupWrites = writes;
+  assert.equal(await config.saveConfigToSupabase(candidate), false); assert.equal(writes, startupWrites);
+  failed = false;
+  assert.equal(await config.saveConfigToSupabase(candidate), true); assert(writes > startupWrites);
+});
+test('Only the owning Worker sends bot/Facebook publications; shutdown stops new sends', async () => {
+  const f = fixture(); let owns = false;
+  const env = socialFixture(f, { lease: { ensureAccountLease: async () => owns, ownsAccountLease: () => owns, getAccountLeaseGeneration: () => 1 } });
+  env.failFB(false);
+  await assert.rejects(env.social.broadcastToSocialMedia('fixture', false, 'all', true));
+  assert.deepEqual(env.counts, { telegram: 0, facebook: 0 });
+  owns = true; await env.social.broadcastToSocialMedia('fixture', false, 'all', true);
+  assert.deepEqual(env.counts, { telegram: 1, facebook: 1 });
+  env.social.stopSocialPublishing();
+  await assert.rejects(env.social.broadcastToSocialMedia('fixture', false, 'all', true));
+  assert.deepEqual(env.counts, { telegram: 1, facebook: 1 });
+});
+test('Ownership handoff reloads delivered cloud state instead of replaying an older local queue', async () => {
+  const f = fixture(); let owns = false, checkpoint;
+  const env = socialFixture(f, {
+    lease: { ensureAccountLease: async () => owns, ownsAccountLease: () => owns, getAccountLeaseGeneration: () => 2 },
+    supabase: fakeSupabase(q => q.op === 'select' ? { data: q.filters.key === 'worker_broadcast_queue' ? { value: checkpoint } : null, error: null }
+      : { data: [], error: null })
+  });
+  await env.social.broadcastRateChanges([update]);
+  f.advance(1000);
+  checkpoint = JSON.stringify({ items: [], savedAt: f.now() });
+  owns = true; await env.social.flushBroadcastQueueImmediately('all', true);
+  assert.equal(env.social.smartBroadcastQueue.size, 0);
+  assert.deepEqual(env.counts, { telegram: 0, facebook: 0 });
+});
+test('Cloud queue checkpoint failures are visible without losing in-memory items', async () => {
+  const f = fixture(), env = socialFixture(f, { supabase: fakeSupabase(() => ({ error: { message: 'fixture checkpoint failure' } })) });
+  await env.social.broadcastRateChanges([update]); await env.social.flushBroadcastQueueState();
+  assert(env.social.getBroadcastQueueStatus().checkpoint.lastError.includes('fixture checkpoint failure'));
+  assert.equal(env.social.smartBroadcastQueue.size, 1);
+});
+test('A price arriving during ownership restore survives the delayed cloud response', async () => {
+  const f = fixture(); let release, reading = false;
+  const blocked = new Promise(resolve => { release = resolve; });
+  const env = socialFixture(f, { supabase: fakeSupabase(async q => {
+    if (q.op === 'select' && q.filters.key === 'worker_broadcast_queue') {
+      reading = true; await blocked;
+      return { data: { value: JSON.stringify({ items: [], savedAt: f.now() }) }, error: null };
+    }
+    return { data: null, error: null };
+  }) });
+  await env.social.broadcastRateChanges([update]);
+  const restoring = env.social.loadBroadcastQueueState(true);
+  for (let i = 0; i < 100 && !reading; i++) await Promise.resolve();
+  assert(reading);
+  await env.social.broadcastRateChanges([{ ...update, newVal: 9.9 }]);
+  release(); await restoring;
+  assert.equal(env.social.smartBroadcastQueue.get('USD').newVal, 9.9);
+});
+test('Recent post recovery uses ISO for Supabase and milliseconds for SQLite', async () => {
+  const f = fixture(); let filter;
+  const env = socialFixture(f, { supabase: fakeSupabase(q => {
+    if (q.table === 'broadcast_log') { filter = q.args.gte; return { data: [{ created_at: new f.Clock().toISOString() }], error: null }; }
+    return { data: null, error: null };
+  }) });
+  await env.social.loadRecentBroadcastTimestamps();
+  assert.equal(filter[0], 'created_at'); assert.equal(filter[1], new f.Clock(f.now() - 3600000).toISOString());
+  assert.equal(env.social.getBroadcastQueueStatus().recentPostsThisHour, 1);
+});
+test('Weekly report reads beyond the first 1000 rows and refuses partial data', async () => {
+  const f = fixture(); let queued = 0, message = '', fail = false, pages = [];
+  const rows = Array.from({ length: 1001 }, (_, i) => ({ id: i, recorded_at: new f.Clock().toISOString(), rates: { USD: i === 1000 ? 10.2 : 9.7 } }));
+  const report = f.load('server/services/reporting.service.ts', {
+    '../state': { rates: f.rates }, '../config': { appConfig: f.config }, '../utils/helpers': f.helper,
+    '../db': { supabaseKey: 'fixture', supabase: fakeSupabase(q => {
+      const [from, to] = q.args.range; pages.push([from, to]);
+      return { data: rows.slice(from, to + 1), error: fail && from === 1000 ? { message: 'fixture failure' } : null };
+    }) }, './social.service': { queueWeeklyReport: async text => { queued++; message = text; } }
+  });
+  await report.broadcastWeeklyReport();
+  assert.equal(queued, 1); assert(message.includes('إغلاق: 10.200')); assert.equal(pages.length, 3);
+  fail = true; await assert.rejects(report.broadcastWeeklyReport()); assert.equal(queued, 1);
+});
+test('Weekly platform progress survives restart and never replays the successful target', async () => {
+  const f = fixture(), env = socialFixture(f);
+  await env.social.queueWeeklyReport('Weekly fixture https://tinyurl.com/2j7667u2', '2026-10-12');
+  assert.equal(env.counts.telegram, 1); assert.equal(env.social.getBroadcastQueueStatus().weekly.delivered.telegram, true);
+  const restored = env.restore(); await restored.loadBroadcastQueueState();
+  env.failFB(false); f.advance(600000);
+  assert.equal(await restored.processWeeklyBroadcastQueue(), true);
+  assert.equal(env.counts.telegram, 1); assert.equal(restored.getBroadcastQueueStatus().weekly.delivered.facebook, true);
 });
 (async () => {
   let failures = 0;

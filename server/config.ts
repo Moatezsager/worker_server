@@ -337,6 +337,16 @@ loadConfigFromStorage();
 
 export async function saveConfigToSupabase(newConfig: AppConfig) {
   // shortcut: whole-row settings writes can race across services; use a verified DB-side atomic patch before concurrent administration.
+  const remoteConfigured = !!supabase && !!supabaseKey && !supabaseKey.includes('dummy');
+  if (remoteConfigured) {
+    try {
+      const { error } = await supabase!.from('app_config').upsert({ id: 1, config: newConfig });
+      if (error) throw error;
+    } catch (err) {
+      console.error('Failed to save config to Supabase', err);
+      return false;
+    }
+  }
   try {
     db.prepare(`
       INSERT INTO server_config (key, value) VALUES ('app_config', ?)
@@ -345,21 +355,7 @@ export async function saveConfigToSupabase(newConfig: AppConfig) {
     syncTermsToDatabase(newConfig.terms);
   } catch (e) {
     console.error("[Storage] Failed to save config to SQLite:", e);
+    return remoteConfigured;
   }
-
-  if (!supabase || !supabaseKey || supabaseKey.includes('dummy')) return true;
-  try {
-    const { error } = await supabase
-      .from('app_config')
-      .upsert({ id: 1, config: newConfig });
-      
-    if (error) {
-      console.error("Error saving config to Supabase:", error);
-    }
-
-    return !error;
-  } catch (err) {
-    console.error("Failed to save config to Supabase", err);
-    return false;
-  }
+  return true;
 }

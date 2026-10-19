@@ -7,6 +7,7 @@ import { addBroadcastLog } from './broadcastLog.service';
 import { ensureWebRatesReady, getWebRatesSyncError } from './db.service';
 import { addLog, sanitizeErrorMessage } from '../utils/logger';
 import { delay, getPublicAppUrl, getLibyaTimeInfo, getTelegramShareUrl } from '../utils/helpers';
+import { ensureAccountLease, ownsAccountLease, getAccountLeaseGeneration } from './accountLease.service';
 
 interface FacebookApiResponse {
   error?: {
@@ -47,13 +48,14 @@ export async function loadRecentBroadcastTimestamps(): Promise<void> {
 
     // محاولة Supabase أولاً
     if (supabase) {
-      // Support both integer millisecond and ISO string timestamp schemas in Supabase
       const { data, error } = await supabase
         .from('broadcast_log')
         .select('created_at')
         .eq('status', 'success')
-        .or(`created_at.gte.${oneHourAgo},created_at.gte.${new Date(oneHourAgo).toISOString()}`)
+        .gte('created_at', new Date(oneHourAgo).toISOString())
         .order('created_at', { ascending: true });
+
+      if (error) addLog('warn', 'النشر', 'تعذر استعادة حد النشر من السحابة؛ استخدام السجل المحلي', { error: error.message });
 
       if (!error && data && data.length > 0) {
         recentBroadcastTimestamps.length = 0;
@@ -75,9 +77,9 @@ export async function loadRecentBroadcastTimestamps(): Promise<void> {
       const rows = db
         .prepare(
           `SELECT created_at FROM broadcast_log
-           WHERE status = 'success' AND (created_at >= ? OR created_at >= ?)`
+           WHERE status = 'success' AND created_at >= ?`
         )
-        .all(oneHourAgo, new Date(oneHourAgo).toISOString()) as { created_at: string | number }[];
+        .all(oneHourAgo) as { created_at: string | number }[];
 
       recentBroadcastTimestamps.length = 0;
       for (const row of rows) {
@@ -355,6 +357,7 @@ export async function broadcastToSocialMedia(
   market?: 'parallel' | 'official' | 'both'
 ) {
   const sentTargets: ('telegram' | 'facebook')[] = [];
+  if (!await ensurePublishingOwnership()) throw new Error('النشر متوقف في هذه النسخة بانتظار استلام ملكية Worker أو استعادة حالة الطابور.');
 
   const isOfficial = market === 'official' || (!market && (message.includes('مصرف ليبيا المركزي') || message.includes('نشرة أسعار مصرف ليبيا المركزي')));
   const targetMarket: 'parallel' | 'official' | 'both' = market || (isOfficial ? 'official' : 'parallel');
@@ -405,6 +408,7 @@ export async function broadcastToSocialMedia(
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
+          if (publishingStopped || !ownsAccountLease()) throw new Error('توقفت ملكية النشر أثناء الإرسال.');
           success = await manager.sendMessage(tgChannel, tgMessage, { linkPreview: true });
           if (success) {
             break;
@@ -485,6 +489,7 @@ export async function broadcastToSocialMedia(
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
+          if (publishingStopped || !ownsAccountLease()) throw new Error('توقفت ملكية النشر أثناء الإرسال.');
           if (!isTest && fbMessage.includes('https://tinyurl.com/2j7667u2')) await refreshFacebookPricePreview();
           const targetId = appConfig.facebookPageId.trim() || 'me';
           let url = `https://graph.facebook.com/v20.0/${targetId}/feed`;
@@ -681,6 +686,7 @@ export async function broadcastOfficialRates(
   target: 'all' | 'telegram' | 'facebook' = 'all',
   isManual: boolean = false
 ): Promise<boolean> {
+  if (!await ensurePublishingOwnership()) return false;
   if (!Number.isFinite(rates.official.USD) || rates.official.USD <= 0) return false;
   const now = new Date();
   const libyaDateObj = new Date(now.toLocaleString('en-US', { timeZone: 'Africa/Tripoli' }));
@@ -1040,6 +1046,9 @@ export function getBroadcastQueueStatus() {
 
   return {
     queueSize: smartBroadcastQueue.size,
+    checkpoint: { ...queueCheckpointStatus },
+    weekly: { date: weeklyDelivery.date, delivered: weeklyDelivery.delivered, attempts: weeklyDelivery.attempts,
+      retryAt: weeklyDelivery.retryAt, lastError: weeklyDelivery.lastError || '' },
     items,
     lastSocialBroadcastTime,
     isCooldownActive,
@@ -1102,29 +1111,121 @@ export function resetBroadcastCooldown(toZero: boolean = false): { cooldownRemai
 }
 
 let queueSending = false;
+let publishingStopped = false;
+let publishingGeneration = -1;
+let publishingRestore: Promise<boolean> | null = null;
+export const queueCheckpointStatus = { lastSavedAt: 0, lastError: '' };
+let weeklyDelivery: {
+  date: string; message: string;
+  delivered: Partial<Record<'telegram' | 'facebook', boolean>>;
+  attempts: Partial<Record<'telegram' | 'facebook', number>>;
+  retryAt: Partial<Record<'telegram' | 'facebook', number>>;
+  lastError?: string;
+} = { date: '', message: '', delivered: {}, attempts: {}, retryAt: {} };
+let weeklySending = false;
+
+export async function queueWeeklyReport(message: string, date: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !message || message.length > 10000) throw new Error('Invalid weekly bulletin');
+  if (!await ensurePublishingOwnership()) throw new Error('بانتظار ملكية Worker لتجهيز النشرة الأسبوعية.');
+  if (weeklyDelivery.date !== date) weeklyDelivery = { date, message, delivered: {}, attempts: {}, retryAt: {} };
+  persistBroadcastQueue();
+  await flushBroadcastQueueState();
+  return processWeeklyBroadcastQueue();
+}
+
+export async function processWeeklyBroadcastQueue(): Promise<boolean> {
+  if (weeklySending || !weeklyDelivery.message || publishingStopped) return false;
+  const required = (['telegram', 'facebook'] as const).filter(platform =>
+    platform === 'telegram' ? appConfig.telegramAutoPost : appConfig.facebookAutoPost);
+  const pending = required.filter(platform => !weeklyDelivery.delivered[platform] &&
+    (weeklyDelivery.attempts[platform] || 0) <= MAX_RETRY_ATTEMPTS && (weeklyDelivery.retryAt[platform] || 0) <= Date.now());
+  if (!pending.length || isQuietHoursActive().isActive || !canBroadcastNow()) return false;
+  weeklySending = true;
+  try {
+    if (!await ensurePublishingOwnership()) return false;
+    for (const platform of pending) {
+      if (weeklyDelivery.delivered[platform]) continue;
+      await flushBroadcastQueueState();
+      if (queueCheckpointStatus.lastError) return false;
+      try {
+        await broadcastToSocialMedia(weeklyDelivery.message, false, platform);
+        weeklyDelivery.delivered[platform] = true;
+        recentBroadcastTimestamps.push(Date.now());
+        addBroadcastLog({ platform, currency_ids: ['WEEKLY'], status: 'success', attempts: (weeklyDelivery.attempts[platform] || 0) + 1 });
+      } catch (err) {
+        const attempt = (weeklyDelivery.attempts[platform] || 0) + 1;
+        weeklyDelivery.attempts[platform] = attempt;
+        weeklyDelivery.retryAt[platform] = Date.now() + RETRY_BASE_DELAY_MS * 2 ** Math.min(attempt - 1, 3);
+        weeklyDelivery.lastError = sanitizeErrorMessage(err) || 'فشل إرسال الحصاد الأسبوعي';
+        addBroadcastLog({ platform, currency_ids: ['WEEKLY'], status: 'failed', attempts: attempt, error_message: weeklyDelivery.lastError });
+      }
+      persistBroadcastQueue();
+      await flushBroadcastQueueState();
+    }
+    const complete = required.length > 0 && required.every(platform => weeklyDelivery.delivered[platform]);
+    if (complete) {
+      weeklyDelivery.lastError = '';
+      persistBroadcastQueue();
+      await flushBroadcastQueueState();
+    }
+    return complete;
+  } finally { weeklySending = false; }
+}
+
+async function ensurePublishingOwnership(): Promise<boolean> {
+  if (publishingStopped || !await ensureAccountLease()) return false;
+  const generation = getAccountLeaseGeneration();
+  if (publishingGeneration !== generation) {
+    if (!publishingRestore) publishingRestore = (async () => {
+      if (!await loadBroadcastQueueState(true)) return false;
+      await loadRecentBroadcastTimestamps();
+      if (!ownsAccountLease() || publishingStopped) return false;
+      publishingGeneration = generation;
+      return true;
+    })().finally(() => { publishingRestore = null; });
+    if (!await publishingRestore) return false;
+  }
+  return !publishingStopped && ownsAccountLease();
+}
+
+export function stopSocialPublishing() {
+  publishingStopped = true;
+  if (smartBroadcastWatchdogInterval) clearInterval(smartBroadcastWatchdogInterval);
+  if (smartBroadcastAggregationTimer) clearTimeout(smartBroadcastAggregationTimer);
+  smartBroadcastWatchdogInterval = null;
+  smartBroadcastAggregationTimer = null;
+}
 let queueBackupTimer: NodeJS.Timeout | null = null;
 let queueBackupWrite: Promise<unknown> = Promise.resolve();
 function queueSnapshot() {
-  return JSON.stringify({ items: [...smartBroadcastQueue.entries()], official: officialDelivery,
+  return JSON.stringify({ items: [...smartBroadcastQueue.entries()], official: officialDelivery, weekly: weeklyDelivery,
     lastSocialBroadcastTime, savedAt: Date.now() });
 }
 function persistBroadcastQueue() {
   try { db?.prepare('INSERT OR REPLACE INTO server_config (key, value) VALUES (?, ?)').run('worker_broadcast_queue', queueSnapshot()); }
   catch (err) { console.error('[Queue] Local checkpoint failed:', err); }
-  if (queueBackupTimer || !supabase) return;
+  if (queueBackupTimer || !supabase || !ownsAccountLease() || publishingStopped) return;
   queueBackupTimer = setTimeout(() => { void flushBroadcastQueueState(); }, 1000);
 }
 export async function flushBroadcastQueueState() {
   if (queueBackupTimer) clearTimeout(queueBackupTimer);
   queueBackupTimer = null;
-  if (!supabase) return;
+  if (!supabase || !ownsAccountLease()) return;
+  if (publishingGeneration !== getAccountLeaseGeneration() && !await ensurePublishingOwnership()) return;
   const value = queueSnapshot();
+  const generation = getAccountLeaseGeneration();
   queueBackupWrite = queueBackupWrite.catch(() => {}).then(async () => {
+    if (!ownsAccountLease() || generation !== getAccountLeaseGeneration()) return;
     const { error } = await supabase.from('server_config').upsert({
       key: 'worker_broadcast_queue', value, updated_at: new Date().toISOString()
     });
-    if (error) console.error('[Queue] Remote checkpoint failed:', error.message);
-  }).catch(err => console.error('[Queue] Remote checkpoint failed:', err));
+    if (error) throw error;
+    queueCheckpointStatus.lastSavedAt = Date.now();
+    queueCheckpointStatus.lastError = '';
+  }).catch(err => {
+    queueCheckpointStatus.lastError = sanitizeErrorMessage(err) || 'تعذر حفظ الطابور سحابيًا';
+    addLog('error', 'حفظ الطابور', queueCheckpointStatus.lastError, { stage: 'queue-checkpoint' });
+  });
   await queueBackupWrite;
 }
 
@@ -1139,8 +1240,9 @@ function validDeliveryProgress(state: any): boolean {
   });
 }
 
-export async function loadBroadcastQueueState() {
+export async function loadBroadcastQueueState(mergePending = false): Promise<boolean> {
   let saved: any;
+  const pendingAtStart = new Map(smartBroadcastQueue);
   try {
     const row = db?.prepare('SELECT value FROM server_config WHERE key = ?').get('worker_broadcast_queue') as {value: string} | undefined;
     if (row?.value) {
@@ -1149,11 +1251,19 @@ export async function loadBroadcastQueueState() {
     }
     if (supabase) {
       const { data, error } = await supabase.from('server_config').select('value').eq('key', 'worker_broadcast_queue').single();
+      if (mergePending && error && error.code !== 'PGRST116') throw error;
       if (!error && data?.value) {
         try {
           const remote = JSON.parse(data.value);
-          if (Array.isArray(remote?.items) && (!saved || remote.savedAt > saved.savedAt)) saved = remote;
-        } catch { console.warn('[Queue] Ignoring malformed remote checkpoint.'); }
+          if (mergePending && !Array.isArray(remote?.items)) throw new Error('Invalid remote queue checkpoint');
+          if (Array.isArray(remote?.items) && (mergePending || !saved || remote.savedAt > saved.savedAt)) saved = remote;
+        } catch (err) { if (mergePending) throw err; console.warn('[Queue] Ignoring malformed remote checkpoint.'); }
+      }
+    }
+    if (mergePending && Number.isFinite(saved?.savedAt)) {
+      const remoteKeys = new Set((saved.items || []).map(([key]: [string, any]) => key));
+      for (const [key, item] of smartBroadcastQueue) {
+        if (!remoteKeys.has(key) && item === pendingAtStart.get(key) && item.lastSeenAt <= saved.savedAt) smartBroadcastQueue.delete(key);
       }
     }
     for (const entry of (Array.isArray(saved?.items) ? saved.items : []).slice(0, 100)) {
@@ -1166,7 +1276,8 @@ export async function loadBroadcastQueueState() {
             item.targets.every((target: string) => ['telegram', 'facebook'].includes(target))) &&
           (item.headerTitle === undefined || typeof item.headerTitle === 'string') &&
           (item.lastError === undefined || typeof item.lastError === 'string') && validDeliveryProgress(item)) {
-        smartBroadcastQueue.set(key, item);
+        const pending = smartBroadcastQueue.get(key);
+        if (!mergePending || !pending || pending === pendingAtStart.get(key) && pending.lastSeenAt <= item.lastSeenAt) smartBroadcastQueue.set(key, item);
       }
     }
     if (Number.isFinite(saved?.lastSocialBroadcastTime)) lastSocialBroadcastTime = saved.lastSocialBroadcastTime;
@@ -1174,8 +1285,16 @@ export async function loadBroadcastQueueState() {
         saved.official.delivered && saved.official.attempts && saved.official.retryAt && validDeliveryProgress(saved.official)) {
       officialDelivery = saved.official;
     }
+    if (typeof saved?.weekly?.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(saved.weekly.date) &&
+        typeof saved.weekly.message === 'string' && saved.weekly.message.length <= 10000 && validDeliveryProgress(saved.weekly) &&
+        saved.weekly.delivered && saved.weekly.attempts && saved.weekly.retryAt) weeklyDelivery = saved.weekly;
 
-  } catch (err) { console.warn('[Queue] Restore failed:', err); }
+    return true;
+  } catch (err) {
+    queueCheckpointStatus.lastError = sanitizeErrorMessage(err) || 'تعذر استعادة الطابور';
+    console.warn('[Queue] Restore failed:', queueCheckpointStatus.lastError);
+    return false;
+  }
 }
 
 async function deliverQueuedUpdates(
@@ -1184,6 +1303,8 @@ async function deliverQueuedUpdates(
   isManual: boolean,
   customHeaderTitle?: string
 ) {
+  if (queueSending) return { success: false, count: 0, message: 'هناك نشر قيد التنفيذ، يرجى الانتظار.' };
+  if (!await ensurePublishingOwnership()) return { success: false, count: 0, message: 'بانتظار استلام ملكية النشر أو استعادة حالة الطابور.' };
   if (queueSending) return { success: false, count: 0, message: 'هناك نشر قيد التنفيذ، يرجى الانتظار.' };
   queueSending = true;
   const snapshot = [...smartBroadcastQueue.entries()].filter(([, item]) =>
@@ -1321,6 +1442,7 @@ export async function processSmartBroadcastQueue(): Promise<boolean> {
 // Queue watchdog timer running every 30 seconds
 if (!smartBroadcastWatchdogInterval) {
   smartBroadcastWatchdogInterval = setInterval(() => {
+    processWeeklyBroadcastQueue().catch(e => console.error('[Weekly Queue] Retry failed:', sanitizeErrorMessage(e)));
     if (smartBroadcastQueue.size > 0 && !smartBroadcastAggregationTimer) {
       processSmartBroadcastQueue().catch(e => console.error("[SmartBroadcastQueue] Watchdog cycle error:", e));
     }
@@ -1334,6 +1456,7 @@ export async function broadcastRateChanges(
   isManual: boolean = false,
   customHeaderTitle?: string
 ) {
+  if ((isManual || isTest) && !await ensurePublishingOwnership()) throw new Error('بانتظار استلام ملكية النشر في نسخة Worker الحالية.');
   if (!isTest && !isManual && !appConfig.telegramAutoPost && !appConfig.facebookAutoPost) {
     return;
   }

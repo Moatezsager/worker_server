@@ -158,9 +158,14 @@ export async function loadCblStateFromSupabase(): Promise<void> {
   }
 }
 
-export let lastSuccessfulFetchTime = Date.now();
+export let lastSuccessfulFetchTime = 0;
 export let isScraping = false;
-export let lastSuccessfulScrape = new Date();
+export let lastSuccessfulScrape = new Date(0);
+export const sourceHealth = {
+  telegram: { lastReadAt: 0, lastValidAt: 0, lastError: '' },
+  whatsapp: { lastReadAt: 0, lastValidAt: 0, lastError: '' },
+  cbl: { lastReadAt: 0, lastValidAt: 0, lastError: '' }
+};
 export let lastAttemptTime = 0;
 export let channelStatusTracker: Record<string, ChannelStatusInfo> = {};
 export let liveFeed: LiveFeedMessage[] = [];
@@ -509,6 +514,7 @@ async function fetchOfficialRatesJob(force: boolean, isManualAdmin: boolean): Pr
 
   // 2. PARSE & 3. VALIDATE
   const { cblDate, rates: cblRates } = cblResult;
+  sourceHealth.cbl.lastReadAt = Date.now();
   console.log(`[CBL] Bulletin date extracted = ${cblDate}`);
 
   if (!cblDate) {
@@ -594,10 +600,10 @@ async function fetchOfficialRatesJob(force: boolean, isManualAdmin: boolean): Pr
 
   // Update success state ONLY after DB persistence & in-memory commit succeed
   lastOfficialFetchDate = currentLibyaDate;
-  setLastSuccessfulFetchTime(Date.now());
+  sourceHealth.cbl.lastValidAt = Date.now();
+  sourceHealth.cbl.lastError = '';
 
   await saveWorkerStateToSupabase('last_official_fetch_date', currentLibyaDate);
-  await saveWorkerStateToSupabase('last_successful_fetch_time', String(Date.now()));
 
   try {
     if (db) {
@@ -997,8 +1003,7 @@ export async function fetchParallelRatesFromTelegram(isManual: boolean = false):
       }
 
       if (successfulChannels > 0) {
-        lastSuccessfulScrape = new Date();
-        setLastSuccessfulFetchTime(Date.now());
+        sourceHealth.telegram.lastReadAt = Date.now();
         console.log(`[Scraper] Successfully processed ${totalMessagesProcessed} messages from ${successfulChannels} channels.`);
       } else {
         console.warn("[Scraper] Failed to fetch any messages from any channels (They might be empty or blocked).");
@@ -1049,6 +1054,14 @@ export async function fetchParallelRatesFromTelegram(isManual: boolean = false):
           priceHistory[code].map(entry => ({ code, value: entry.value, time: entry.time, source: entry.channel }))
         ));
         const anyChanged = collectedUpdates.length > 0;
+        const validUnchangedPrice = foundKeys.some(code => latestRates[code] === rates.parallel[code] &&
+          latestTimes[code] <= Date.now() + 300000 &&
+          latestTimes[code] >= (Date.parse(rates.lastChanged.parallel[code] || '') || 0));
+        if (anyChanged || validUnchangedPrice) {
+          sourceHealth.telegram.lastValidAt = Date.now();
+          sourceHealth.telegram.lastError = '';
+          setLastSuccessfulFetchTime(Date.now());
+        }
         if (anyChanged) {
           if (collectedUpdates.length > 0) {
             // توحيد الصكوك: استبعاد صكوك الجمهورية والتجاري من النشر، والاكتفاء بنشر دولار صكوك فقط
@@ -1093,8 +1106,9 @@ export async function fetchParallelRatesFromTelegram(isManual: boolean = false):
       }
       return false;
     } catch (error) {
+      sourceHealth.telegram.lastError = 'تعذر إكمال استخراج الأسعار أو حفظها. راجع سجل الأخطاء.';
       console.error("Error fetching from Telegram:", error);
-      return false;
+      throw error;
     } finally {
       isScraping = false;
     }
@@ -1112,7 +1126,8 @@ export async function fetchParallelRatesFromTelegram(isManual: boolean = false):
     // If the timeout is reached, the underlying scraperPromise is still running.
     // Releasing the lock here causes a race condition where a new scrape could start concurrently.
     // The finally block of scraperPromise will release the lock when it actually finishes.
-    return null;
+    if (err instanceof Error && err.message === 'Global Scraper Timeout') return null;
+    throw err;
   }
 }
 
@@ -1143,6 +1158,7 @@ export async function processWhatsAppMessage(
     }
 
     await refreshExtractionTerms();
+    sourceHealth.whatsapp.lastReadAt = Date.now();
     // 2. Extract rates using regex rules (Gold is handled manually by Admin)
     let extracted = extractRatesFromText(rawText).filter(r => !r.code.startsWith('GOLD_') && r.code !== 'GOLD');
 
@@ -1201,13 +1217,19 @@ export async function processWhatsAppMessage(
     const collectedUpdates = await commitParallelRates(extracted.map(entry => ({
       ...entry, time: msgTime, source: 'واتساب - ' + chatName
     })));
+    if (collectedUpdates.length || extracted.some(entry => entry.value === rates.parallel[entry.code] &&
+        msgTime >= (Date.parse(rates.lastChanged.parallel[entry.code] || '') || 0))) {
+      sourceHealth.whatsapp.lastValidAt = Date.now();
+      sourceHealth.whatsapp.lastError = '';
+      setLastSuccessfulFetchTime(Date.now());
+    }
     if (collectedUpdates.length) {
-      lastSuccessfulFetchTime = Date.now();
       await broadcastRateChanges(collectedUpdates);
     }
 
     return { processed: true, extractedCount: extracted.length, rates: extracted };
   } catch (err: any) {
+    sourceHealth.whatsapp.lastError = 'تعذر استخراج رسالة واتساب أو حفظ سعرها.';
     console.error('[WhatsApp Scraper] Error processing message:', err);
     await logErrorArabic(`خطأ في معالجة رسالة واتساب: ${err?.message || err}`, 'واتساب');
     return { processed: false, extractedCount: 0 };

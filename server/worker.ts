@@ -17,7 +17,7 @@ import {
   logErrorArabic 
 } from "./services/db.service";
 import { loadConfigFromSupabase } from "./config";
-import { loadRecentBroadcastTimestamps, loadBroadcastQueueState, flushBroadcastQueueState } from "./services/social.service";
+import { loadRecentBroadcastTimestamps, loadBroadcastQueueState, flushBroadcastQueueState, stopSocialPublishing } from "./services/social.service";
 import { initStatsIfEmpty } from "./services/reporting.service";
 import { fetchParallelRatesFromTelegram, loadCblStateFromSupabase } from "./services/scraper.service";
 import { whatsappManager, restoreAuthFromStorage, backupAuthToStorage } from "./services/whatsapp.service";
@@ -101,6 +101,7 @@ export const gracefulShutdown = async (signal: string = 'SIGTERM') => {
   // 1. Stop all timers, schedulers and reject any new jobs from starting
   stopBackgroundTasks();
   stopCronSchedulers();
+  stopSocialPublishing();
   stopAccountLease();
 
   // 2. Wait up to 6 seconds for active jobs to finish cleanly
@@ -130,11 +131,14 @@ export const gracefulShutdown = async (signal: string = 'SIGTERM') => {
   await closeTelegramLogin().catch(() => {});
   await disconnectTelegram();
   await backupAuthToStorage();
-  await releaseAccountLease().catch(() => console.warn('[Accounts] Lease release unconfirmed; awaiting expiry.'));
+  let queueFlushSettled = false;
   await Promise.race([
-    flushBroadcastQueueState(),
+    flushBroadcastQueueState().finally(() => { queueFlushSettled = true; }),
     new Promise(resolve => setTimeout(resolve, 5000))
   ]);
+  // An unfinished old write must settle before a replacement can own the queue.
+  if (queueFlushSettled) await releaseAccountLease().catch(() => console.warn('[Accounts] Lease release unconfirmed; awaiting expiry.'));
+  else console.warn('[Accounts] Queue flush still pending; preserving the lease until expiry.');
   // 5. Close local SQLite database cleanly
   try {
     if (db) {

@@ -8,13 +8,14 @@ import {
   fetchOfficialRates, fetchParallelRatesFromTelegram, 
   isCblFetchEnabled, setCblFetchEnabled, 
   isTelegramFetchEnabled, setTelegramFetchEnabled, 
-  isWhatsAppFetchEnabled, setWhatsAppFetchEnabled 
+  isWhatsAppFetchEnabled, setWhatsAppFetchEnabled, sourceHealth
 } from "../services/scraper.service";
-import { cleanupOldData, commitParallelRates } from "../services/db.service";
+import { cleanupOldData, commitParallelRates, pipelineStatus, getRejectedRates } from "../services/db.service";
 import { cleanupUserLogs, monitorMemory } from "../services/maintenance.service";
 import { extractRatesWithAI } from "../services/ai.service";
 import { 
   broadcastToSocialMedia, 
+  telegramBroadcastStatus, facebookBroadcastStatus,
   broadcastRateChanges,
   broadcastOfficialRates,
   getBroadcastDisplayRank,
@@ -204,6 +205,8 @@ dashboardRouter.get(["/", "/dashboard", "/admin"], (req: Request, res: Response)
       facebookAutoPost: !!appConfig.facebookAutoPost
     },
     broadcastQueue: getBroadcastQueueStatus(),
+    pipeline: { sources: sourceHealth, ...pipelineStatus, telegram: telegramBroadcastStatus, facebook: facebookBroadcastStatus },
+    rejectedRates: getRejectedRates(),
     terms: appConfig.terms.filter(t => t && t.id !== 'OFFICIAL_USD'),
     ingestedMessages: getRecentIngestedRecords(30)
   };
@@ -277,6 +280,8 @@ dashboardRouter.get("/api/dashboard/stats", (req: Request, res: Response) => {
       facebookAutoPost: !!appConfig.facebookAutoPost
     },
     broadcastQueue: getBroadcastQueueStatus(),
+    pipeline: { sources: sourceHealth, ...pipelineStatus, telegram: telegramBroadcastStatus, facebook: facebookBroadcastStatus },
+    rejectedRates: getRejectedRates(),
     terms: appConfig.terms.filter(t => t && t.id !== 'OFFICIAL_USD'),
     ingestedMessages: getRecentIngestedRecords(30)
   });
@@ -358,7 +363,7 @@ dashboardRouter.post("/api/dashboard/trigger", async (req: Request, res: Respons
       case "maintenance": {
         const result = await runJobSafely(
           "database_cleanup",
-          "تنظيف وضغط السجلات والمخلفات (يدوي من اللوحة)",
+          "تنظيف البيانات القديمة وحفظ سجل الشهر (يدوي من اللوحة)",
           async () => {
             await cleanupOldData();
             await cleanupUserLogs();
@@ -366,7 +371,8 @@ dashboardRouter.post("/api/dashboard/trigger", async (req: Request, res: Respons
             return true;
           }
         );
-        return res.json({ success: true, message: "تم تنفيذ مهام الصيانة وتنظيف السجلات", result });
+        return res.status(result === true ? 200 : 503).json({ success: result === true,
+          message: result === true ? "تم تنفيذ الصيانة مع الحفاظ على قراءات الشهر" : "لم يكتمل التنظيف؛ راجع حالة المهمة وسجل العمليات", result });
       }
 
       case "gc": {
@@ -661,41 +667,38 @@ dashboardRouter.post("/api/dashboard/broadcast/settings/save", async (req: Reque
     quietHoursEnd
   } = req.body || {};
 
-  if (minBroadcastIntervalMinutes !== undefined && !isNaN(Number(minBroadcastIntervalMinutes))) {
-    appConfig.minBroadcastIntervalMinutes = Math.max(1, Number(minBroadcastIntervalMinutes));
+  const numericSettings = { minBroadcastIntervalMinutes, minPriceChangeThreshold, aggregationWindowSeconds, hourlyPostLimit };
+  const bounds = { minBroadcastIntervalMinutes: [1, 180], minPriceChangeThreshold: [0.001, 10000],
+    aggregationWindowSeconds: [10, 300], hourlyPostLimit: [1, 20] };
+  const candidate = { ...appConfig };
+  for (const [key, value] of Object.entries(numericSettings)) {
+    if (value === undefined) continue;
+    const [min, max] = bounds[key];
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max ||
+        (key !== 'minPriceChangeThreshold' && !Number.isInteger(value))) {
+      return res.status(400).json({ success: false, error: 'قيم شروط النشر خارج النطاق المسموح.' });
+    }
+    candidate[key] = value;
   }
-  if (minPriceChangeThreshold !== undefined && !isNaN(Number(minPriceChangeThreshold))) {
-    appConfig.minPriceChangeThreshold = Math.max(0.001, Number(minPriceChangeThreshold));
+  for (const [key, value] of Object.entries({ smartConsolidatedPost, telegramAutoPost, facebookAutoPost, quietHoursEnabled })) {
+    if (value === undefined) continue;
+    if (typeof value !== 'boolean') return res.status(400).json({ success: false, error: 'حالة التفعيل يجب أن تكون منطقية.' });
+    candidate[key] = value;
   }
-  if (aggregationWindowSeconds !== undefined && !isNaN(Number(aggregationWindowSeconds))) {
-    appConfig.aggregationWindowSeconds = Math.max(10, Number(aggregationWindowSeconds));
+  for (const [key, value] of Object.entries({ quietHoursStart, quietHoursEnd })) {
+    if (value === undefined) continue;
+    if (typeof value !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(value)) {
+      return res.status(400).json({ success: false, error: 'أدخل وقتًا صحيحًا بصيغة HH:mm.' });
+    }
+    candidate[key] = value;
   }
-  if (hourlyPostLimit !== undefined && !isNaN(Number(hourlyPostLimit))) {
-    appConfig.hourlyPostLimit = Math.max(1, Number(hourlyPostLimit));
+  if (!await saveConfigToSupabase(candidate)) {
+    return res.status(503).json({ success: false, error: 'تعذر حفظ إعدادات النشر. أعد المحاولة.' });
   }
-  if (smartConsolidatedPost !== undefined) {
-    appConfig.smartConsolidatedPost = Boolean(smartConsolidatedPost);
-  }
-  if (telegramAutoPost !== undefined) {
-    appConfig.telegramAutoPost = Boolean(telegramAutoPost);
-  }
-  if (facebookAutoPost !== undefined) {
-    appConfig.facebookAutoPost = Boolean(facebookAutoPost);
-  }
-  if (quietHoursEnabled !== undefined) {
-    appConfig.quietHoursEnabled = Boolean(quietHoursEnabled);
-  }
-  if (quietHoursStart !== undefined && typeof quietHoursStart === 'string' && quietHoursStart.includes(':')) {
-    appConfig.quietHoursStart = quietHoursStart.trim();
-  }
-  if (quietHoursEnd !== undefined && typeof quietHoursEnd === 'string' && quietHoursEnd.includes(':')) {
-    appConfig.quietHoursEnd = quietHoursEnd.trim();
-  }
+  Object.assign(appConfig, candidate);
 
   const quietInfo = appConfig.quietHoursEnabled ? ` | صمت ليلي (${appConfig.quietHoursStart} - ${appConfig.quietHoursEnd})` : '';
   addLog("info", "إعدادات النشر", `تم تحديث شروط النشر التلقائي: فاصل ${appConfig.minBroadcastIntervalMinutes}د | فارق ${appConfig.minPriceChangeThreshold}د.ل | تجميع ${appConfig.aggregationWindowSeconds}ث${quietInfo}`);
-  await saveConfigToSupabase(appConfig);
-
   res.json({
     success: true,
     message: "تم حفظ إعدادات وشروط النشر التلقائي بنجاح",
@@ -748,7 +751,7 @@ dashboardRouter.post("/api/dashboard/sources/telegram/add", async (req: Request,
 
     appConfig.channels.push(cleanChannel);
     addLog("info", "إدارة المصادر", `تم إضافة قناة تيليجرام جديدة: @${cleanChannel}`);
-    await saveConfigToSupabase(appConfig);
+    if (!await saveConfigToSupabase(appConfig)) return res.status(503).json({ success: false, error: 'تعذر حفظ الإعدادات في قاعدة البيانات. أعد المحاولة.' });
 
     res.json({
       success: true,
@@ -776,7 +779,7 @@ dashboardRouter.post("/api/dashboard/sources/telegram/edit", async (req: Request
 
     appConfig.channels[idx] = cleanNew;
     addLog("info", "إدارة المصادر", `تم تعديل اسم قناة تيليجرام من @${cleanOld} إلى @${cleanNew}`);
-    await saveConfigToSupabase(appConfig);
+    if (!await saveConfigToSupabase(appConfig)) return res.status(503).json({ success: false, error: 'تعذر حفظ الإعدادات في قاعدة البيانات. أعد المحاولة.' });
 
     res.json({
       success: true,
@@ -799,7 +802,7 @@ dashboardRouter.post("/api/dashboard/sources/telegram/delete", async (req: Reque
     if (idx !== -1) {
       appConfig.channels.splice(idx, 1);
       addLog("info", "إدارة المصادر", `تم حذف قناة تيليجرام: @${cleanChannel}`);
-      await saveConfigToSupabase(appConfig);
+      if (!await saveConfigToSupabase(appConfig)) return res.status(503).json({ success: false, error: 'تعذر حفظ الإعدادات في قاعدة البيانات. أعد المحاولة.' });
     }
 
     res.json({
@@ -850,7 +853,7 @@ dashboardRouter.post("/api/dashboard/sources/whatsapp/toggle", async (req: Reque
     }
 
     addLog("info", "إدارة المصادر", `تم ${item.enabled ? 'تفعيل' : 'تعطيل'} استخراج الأسعار من مصدر واتساب: ${item.name}`);
-    await saveConfigToSupabase(appConfig);
+    if (!await saveConfigToSupabase(appConfig)) return res.status(503).json({ success: false, error: 'تعذر حفظ الإعدادات في قاعدة البيانات. أعد المحاولة.' });
 
     res.json({ success: true, item, whatsappSources: whatsappManager.getSources() });
   } catch (err: any) {
@@ -877,7 +880,7 @@ dashboardRouter.post("/api/dashboard/sources/whatsapp/add", async (req: Request,
     });
 
     addLog("info", "إدارة المصادر", `تم إضافة مصدر واتساب جديد يدوياً: ${name}`);
-    await saveConfigToSupabase(appConfig);
+    if (!await saveConfigToSupabase(appConfig)) return res.status(503).json({ success: false, error: 'تعذر حفظ الإعدادات في قاعدة البيانات. أعد المحاولة.' });
 
     res.json({ success: true, message: "تم إضافة مصدر واتساب بنجاح", whatsappSources: whatsappManager.getSources() });
   } catch (err: any) {
@@ -897,7 +900,7 @@ dashboardRouter.post("/api/dashboard/sources/whatsapp/delete", async (req: Reque
     if (appConfig.whatsappSources) {
       appConfig.whatsappSources = appConfig.whatsappSources.filter(s => s.jid !== jid);
       addLog("info", "إدارة المصادر", `تم حذف مصدر واتساب: ${jid}`);
-      await saveConfigToSupabase(appConfig);
+      if (!await saveConfigToSupabase(appConfig)) return res.status(503).json({ success: false, error: 'تعذر حفظ الإعدادات في قاعدة البيانات. أعد المحاولة.' });
     }
 
     res.json({ success: true, message: "تم حذف المصدر بنجاح", whatsappSources: whatsappManager.getSources() });
@@ -1106,7 +1109,7 @@ dashboardRouter.post("/api/dashboard/accounts/facebook/save", async (req: Reques
   if (autoPost !== undefined) appConfig.facebookAutoPost = Boolean(autoPost);
 
   addLog("info", "حسابات", "تم حفظ إعدادات الربط مع فيسبوك");
-  await saveConfigToSupabase(appConfig);
+  if (!await saveConfigToSupabase(appConfig)) return res.status(503).json({ success: false, error: 'تعذر حفظ الإعدادات في قاعدة البيانات. أعد المحاولة.' });
 
   return res.json({
     success: true,
@@ -1156,7 +1159,7 @@ dashboardRouter.post("/api/dashboard/toggles", async (req: Request, res: Respons
     addLog("info", "التحكم", `تم ${facebookAutoPost ? 'تفعيل' : 'تعطيل'} النشر التلقائي في فيسبوك`);
   }
 
-  await saveConfigToSupabase(appConfig);
+  if (!await saveConfigToSupabase(appConfig)) return res.status(503).json({ success: false, error: 'تعذر حفظ الإعدادات في قاعدة البيانات. أعد المحاولة.' });
 
   return res.json({
     success: true,
@@ -1248,7 +1251,7 @@ dashboardRouter.post("/api/dashboard/settings/terms/save", async (req: Request, 
   addLog("info", "إعدادات العملات", `تم حفظ شروط العملة [${termName} (${termId})] بنطاق [${numMin} - ${numMax}]`);
 
   // Persist to database
-  await saveConfigToSupabase(appConfig);
+  if (!await saveConfigToSupabase(appConfig)) return res.status(503).json({ success: false, error: 'تعذر حفظ الإعدادات في قاعدة البيانات. أعد المحاولة.' });
 
   return res.json({
     success: true,
@@ -1277,7 +1280,7 @@ dashboardRouter.post("/api/dashboard/settings/terms/delete", async (req: Request
 
   addLog("warn", "إعدادات العملات", `تم حذف العملة [${deletedTerm.name} (${deletedTerm.id})] من شروط الاستخراج`);
 
-  await saveConfigToSupabase(appConfig);
+  if (!await saveConfigToSupabase(appConfig)) return res.status(503).json({ success: false, error: 'تعذر حفظ الإعدادات في قاعدة البيانات. أعد المحاولة.' });
 
   return res.json({
     success: true,

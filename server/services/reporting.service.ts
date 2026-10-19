@@ -1,8 +1,8 @@
 import { CurrencyStat } from '../types';
 import { rates } from '../state';
 import { appConfig } from '../config';
-import { supabase, supabaseAnonKey } from '../db';
-import { broadcastToSocialMedia, getOrInitTelegramManager } from './social.service';
+import { supabase, supabaseKey } from '../db';
+import { broadcastToSocialMedia, getOrInitTelegramManager, queueWeeklyReport } from './social.service';
 import { getPublicAppUrl } from '../utils/helpers';
 
 export const dailyStats: Record<string, CurrencyStat> = {};
@@ -97,7 +97,7 @@ export async function broadcastDailyReport() {
 
 export async function broadcastWeeklyReport(isTest: boolean = false) {
   if (!isTest && !appConfig.telegramAutoPost && !appConfig.facebookAutoPost) return;
-  if (!supabase || !supabaseAnonKey || supabaseAnonKey.includes('dummy')) {
+  if (!supabase || !supabaseKey || supabaseKey.includes('dummy')) {
     console.warn("Supabase not configured, cannot generate accurate weekly report.");
     if (isTest) throw new Error("Supabase is required for accurate weekly report.");
     return;
@@ -109,16 +109,20 @@ export async function broadcastWeeklyReport(isTest: boolean = false) {
   const dateStr = now.toLocaleDateString('ar-LY', { timeZone: 'Africa/Tripoli' });
   const pastWeek = pastWeekDate.toLocaleDateString('ar-LY', { timeZone: 'Africa/Tripoli' });
   
-  const { data, error } = await supabase
-    .from('parallel_rates')
-    .select('rates, recorded_at')
-    .gte('recorded_at', pastWeekDate.toISOString())
-    .lte('recorded_at', now.toISOString())
-    .order('recorded_at', { ascending: true });
-    
-  if (error || !data || data.length === 0) {
-    console.error("[Weekly Report] Error fetching weekly data from Supabase:", error);
-    if (isTest) throw new Error("No data found in Supabase for the past week.");
+  const data: { rates: Record<string, number>; recorded_at: string }[] = [];
+  const pageSize = 500, maxRows = 20000;
+  for (let offset = 0; offset < maxRows; offset += pageSize) {
+    const result = await supabase.from('parallel_rates').select('id, rates, recorded_at')
+      .gte('recorded_at', pastWeekDate.toISOString()).lte('recorded_at', now.toISOString())
+      .order('recorded_at', { ascending: true }).order('id', { ascending: true })
+      .range(offset, offset + pageSize - 1);
+    if (result.error || !result.data) throw new Error('تعذر تحميل بيانات الأسبوع كاملة؛ لم يُجهّز التقرير للنشر.');
+    data.push(...result.data);
+    if (result.data.length < pageSize) break;
+    if (offset + pageSize === maxRows) throw new Error('تجاوزت بيانات الأسبوع الحد الآمن؛ يلزم تجميع البيانات قبل نشر التقرير.');
+  }
+  if (!data.length) {
+    if (isTest) throw new Error('No data found in Supabase for the past week.');
     return;
   }
 
@@ -128,7 +132,7 @@ export async function broadcastWeeklyReport(isTest: boolean = false) {
     const rowRates = row.rates || {};
     for (const cid in rowRates) {
        const val = rowRates[cid];
-       if (!val) continue;
+       if (!Number.isFinite(val) || val <= 0) continue;
        
        if (!stats[cid]) {
          stats[cid] = { high: val, low: val, start: val, end: val, sum: 0, count: 0 };
@@ -242,7 +246,7 @@ export async function broadcastWeeklyReport(isTest: boolean = false) {
   if (isTest) {
     await broadcastToSocialMedia(message, true, 'all');
   } else {
-    broadcastToSocialMedia(message, false, 'all').catch(e => console.error("[Background Weekly Broadcast] Error:", e));
+    await queueWeeklyReport(message, now.toLocaleDateString('en-CA', { timeZone: 'Africa/Tripoli' }));
   }
 
   return message;

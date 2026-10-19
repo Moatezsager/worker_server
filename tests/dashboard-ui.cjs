@@ -8,15 +8,19 @@ async function main() {
   const quoted = "USD'quoted";
   f.rates.parallel[quoted] = 9.8;
   const queue = { queueSize: 1, items: [{ id: 'USD', name: 'Dollar ' + attack, newVal: 9.8, oldVal: 9.7, diff: .1, ageSeconds: 60,
-    targets: ['telegram', 'facebook'], delivered: { telegram: true }, attempts: { facebook: 4 }, lastError: 'Fixture failed ' + attack }] };
+    targets: ['telegram', 'facebook'], delivered: { telegram: true }, attempts: { facebook: 4 }, lastError: 'Fixture failed ' + attack }],
+    weekly: { date: '2026-10-12', delivered: { telegram: true }, attempts: { facebook: 4 } } };
   const state = { rates: f.rates, terms: f.config.terms, activeJobs: [], broadcastQueue: queue,
+    pipeline: { sources: { telegram: { lastReadAt: f.now(), lastValidAt: f.now() }, whatsapp: {} }, lastSavedAt: f.now(),
+      lastWebSyncAt: f.now(), lastWebSyncError: attack, telegram: {}, facebook: {} },
+    rejectedRates: [{ code: 'USD', name: 'Dollar ' + attack, previous: 9.7, proposed: 11, source: attack }],
     recentLogs: [
       { id: 'notify-401', level: 'error', category: 'مزامنة Web', timestamp: new f.Clock().toISOString(),
         message: 'HTTP 401 ' + attack, details: JSON.stringify({ stage: 'web-sync', httpStatus: 401, expected: { EUR: 10.5 }, received: { EUR: 10.4 }, attack }) },
       { id: 'queue', level: 'warn', category: 'طابور النشر', timestamp: new f.Clock().toISOString(), message: 'التحديث محفوظ في الطابور' },
       { id: 'success', level: 'success', category: 'حفظ الأسعار', timestamp: new f.Clock().toISOString(), message: '</script><script>window.__fixtureInitial=true</script>' }
     ],
-    accounts: { telegram: {}, whatsapp: {}, facebook: {} }, memory: {}, broadcastConfig: {} };
+    accounts: { telegram: {}, whatsapp: {}, facebook: {} }, memory: {}, broadcastConfig: { telegramAutoPost: true, facebookAutoPost: true } };
   const browser = await chromium.launch({ headless: true, channel: process.env.UI_BROWSER_CHANNEL || undefined });
   try {
     for (const width of [390, 768, 1440]) {
@@ -41,6 +45,19 @@ async function main() {
       });
       await page.goto('http://worker.fixture/dashboard');
       await page.waitForFunction(() => typeof renderQueueUI === 'function');
+      await page.evaluate(state => renderUI(state), state);
+      assert.equal(await page.locator('#pipeline-status > div').count(), 9);
+      assert.equal(await page.locator('#rejected-rates img').count(), 0);
+      assert.equal(await page.locator('#pipeline-error img').count(), 0);
+      assert((await page.locator('#weekly-report-status').innerText()).includes('Telegram: تم الإرسال'));
+      assert((await page.locator('#weekly-report-status').innerText()).includes('Facebook: يتطلب مراجعة'));
+      await page.locator('#rejected-rates').evaluate(el => el.closest('details').open = true);
+      await page.getByRole('button', { name: 'مراجعة السعر', exact: true }).click();
+      assert.equal(await page.locator('#modal-code').inputValue(), 'USD');
+      assert.equal(await page.locator('#modal-input').inputValue(), '11');
+      await page.evaluate(() => closeRateModal());
+      await page.evaluate(() => window.scrollTo(0, 0));
+      if (process.env.UI_ARTIFACT_DIR) await page.screenshot({ path: path.join(process.env.UI_ARTIFACT_DIR, 'worker-pipeline-' + width + '.png'), fullPage: true });
       await page.evaluate(async () => { await fetchIngestedMessages(); });
       assert.equal(await page.evaluate(() => window.__fixtureXss || window.__fixtureInitial || false), false);
       await page.locator('#tab-btn-sources').click();

@@ -12,6 +12,7 @@ let nextCheck = 0;
 let timer: NodeJS.Timeout | null = null;
 let stopped = false;
 let ticking = false;
+let generation = 0;
 let acquired = async () => {};
 let lost = async () => {};
 
@@ -40,6 +41,7 @@ async function refreshLease(): Promise<boolean> {
       : await supabase.from('server_config').insert({ key: KEY, value, updated_at: new Date().toISOString() })
         .select('key').abortSignal(AbortSignal.timeout(10000));
     if (result.error || !result.data?.length) return false;
+    if (!heldValue) generation++;
     heldValue = value;
     expiresAt = until;
     return !stopped;
@@ -66,6 +68,8 @@ function loseLease(): Promise<void> {
 export function ownsAccountLease(): boolean {
   return !!heldValue && expiresAt > Date.now();
 }
+
+export function getAccountLeaseGeneration(): number { return generation; }
 
 export async function ensureAccountLease(): Promise<boolean> {
   if (stopped) return false;

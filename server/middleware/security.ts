@@ -29,9 +29,22 @@ export const apiStats = {
 };
 
 export const bannedIPs = new Map<string, number>();
+const MAX_BANNED_IPS = 10000;
+let lastBanCleanup = 0;
+
+function banIp(ip: string, until: number) {
+  const now = Date.now();
+  if (now - lastBanCleanup >= 60000) {
+    for (const [key, expiry] of bannedIPs) if (expiry <= now) bannedIPs.delete(key);
+    lastBanCleanup = now;
+  }
+  if (!bannedIPs.has(ip) && bannedIPs.size >= MAX_BANNED_IPS) bannedIPs.delete(bannedIPs.keys().next().value!);
+  bannedIPs.set(ip, until);
+  apiStats.bannedIPsCount = bannedIPs.size;
+}
 
 export const ipBanMiddleware = (req: express.Request, res: express.Response, next: express.NextFunction) => {
-  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress) as string;
+  const ip = req.ip || req.socket.remoteAddress;
   if (ip && bannedIPs.has(ip)) {
     const banExpiry = bannedIPs.get(ip)!;
     if (Date.now() < banExpiry) {
@@ -39,6 +52,7 @@ export const ipBanMiddleware = (req: express.Request, res: express.Response, nex
       return;
     } else {
       bannedIPs.delete(ip);
+      apiStats.bannedIPsCount = bannedIPs.size;
     }
   }
   next();
@@ -47,9 +61,9 @@ export const ipBanMiddleware = (req: express.Request, res: express.Response, nex
 export const suspiciousRoutes = ['/.env', '/wp-admin', '/wp-login.php', '/config.php', '/phpmyadmin'];
 export const suspiciousActivityMiddleware = (req: express.Request, res: express.Response, next: express.NextFunction) => {
   if (suspiciousRoutes.some(route => req.path.toLowerCase().includes(route))) {
-    const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress) as string;
+    const ip = req.ip || req.socket.remoteAddress;
     if (ip) {
-      bannedIPs.set(ip, Date.now() + 30 * 24 * 60 * 60 * 1000);
+      banIp(ip, Date.now() + 30 * 24 * 60 * 60 * 1000);
       console.warn(`[Security] Banned IP ${ip} for accessing suspicious route: ${req.path}`);
     }
     res.status(403).json({ success: false, error: "Suspicious activity detected. IP banned." });
@@ -202,7 +216,7 @@ export const cronParallelLimiter = rateLimit({
     return isValidCronSecret(key);
   },
   handler: (req: express.Request, res: express.Response) => {
-    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const ip = req.ip || req.socket.remoteAddress;
     console.warn(`[Cron-RateLimit] Rate limit exceeded for /api/refresh-parallel from IP: ${ip}`);
     res.status(429).json({ success: false, error: "Too many requests. Please try again later." });
   }
@@ -218,7 +232,7 @@ export const cronOfficialLimiter = rateLimit({
     return isValidCronSecret(key);
   },
   handler: (req: express.Request, res: express.Response) => {
-    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const ip = req.ip || req.socket.remoteAddress;
     console.warn(`[Cron-RateLimit] Rate limit exceeded for /api/refresh-official from IP: ${ip}`);
     res.status(429).json({ success: false, error: "Too many requests. Please try again later." });
   }
@@ -234,7 +248,7 @@ export const cronCleanupLimiter = rateLimit({
     return isValidCronSecret(key);
   },
   handler: (req: express.Request, res: express.Response) => {
-    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const ip = req.ip || req.socket.remoteAddress;
     console.warn(`[Cron-RateLimit] Rate limit exceeded for /api/cleanup-db from IP: ${ip}`);
     res.status(429).json({ success: false, error: "Too many requests. Please try again later." });
   }
@@ -254,12 +268,11 @@ export const publicApiLimiter = rateLimit({
   windowMs: appConfig.apiConfig?.rateLimitWindowMs || 60000,
   max: appConfig.apiConfig?.rateLimitMaxRequests || 20,
   handler: (req, res, next, options) => {
-    const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress) as string;
+    const ip = req.ip || req.socket.remoteAddress;
     if (ip) {
       const banDuration = appConfig.apiConfig?.banDurationMinutes || 5;
-      bannedIPs.set(ip, Date.now() + banDuration * 60 * 1000);
+      banIp(ip, Date.now() + banDuration * 60 * 1000);
       console.warn(`[Security] Banned IP ${ip} for ${banDuration} minutes due to rate limit exceeded.`);
-      apiStats.bannedIPsCount++;
     }
     apiStats.public.failedRequests++;
     res.status(options.statusCode).json({ success: false, error: `Too many requests. Your IP is temporarily banned.` });

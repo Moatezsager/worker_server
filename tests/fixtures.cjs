@@ -50,7 +50,7 @@ function fakeSupabase(perform) {
   return { from(table) {
     const query = { table, op: 'select', args: {}, filters: {} };
     const chain = {};
-    for (const method of ['select', 'insert', 'upsert', 'update', 'delete', 'eq', 'lt', 'in', 'order', 'limit', 'single', 'maybeSingle', 'abortSignal']) {
+    for (const method of ['select', 'insert', 'upsert', 'update', 'delete', 'eq', 'lt', 'gte', 'lte', 'range', 'in', 'order', 'limit', 'single', 'maybeSingle', 'abortSignal']) {
       chain[method] = (...args) => {
         query.args[method] = args;
         if (method === 'eq') query.filters[args[0]] = args[1];
