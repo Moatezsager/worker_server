@@ -404,12 +404,15 @@ export async function broadcastToSocialMedia(
 
       // One fresh website URL per publication; immediate retries reuse it.
       const shareUrl = getTelegramShareUrl();
-      const tgMessage = message.replace(/https:\/\/tinyurl\.com\/2j7667u2|https:\/\/dollar-price-qp14\.onrender\.com(?:\/[^\s<>"')\]]*)?/g, () => shareUrl);
+      const tgText = isOfficial ? message.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') : message;
+      const safeShareUrl = shareUrl.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+      const tgMessage = tgText.replace(/https:\/\/tinyurl\.com\/2j7667u2|https:\/\/dollar-price-qp14\.onrender\.com(?:\/[^\s<>"')\]]*)?/g,
+        () => isOfficial ? `<a href="${safeShareUrl}">tinyurl.com/2j7667u2</a>` : shareUrl);
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
           if (publishingStopped || !ownsAccountLease()) throw new Error('توقفت ملكية النشر أثناء الإرسال.');
-          success = await manager.sendMessage(tgChannel, tgMessage, { linkPreview: true });
+          success = await manager.sendMessage(tgChannel, tgMessage, { linkPreview: true, ...(isOfficial ? { parseMode: 'html' as const } : {}) });
           if (success) {
             break;
           } else {
@@ -659,9 +662,9 @@ let officialDelivery: {
 
 
 const OFFICIAL_CURRENCIES_INFO: Record<string, { name: string; flag: string; rank: number }> = {
-  USD: { name: 'دولار أمريكي', flag: '🇺🇸', rank: 1 },
-  EUR: { name: 'يورو أوروبي', flag: '🇪🇺', rank: 2 },
-  GBP: { name: 'جنيه إسترليني', flag: '🇬🇧', rank: 3 },
+  USD: { name: 'دولار أمريكي', flag: '💵', rank: 1 },
+  EUR: { name: 'يورو أوروبي', flag: '💶', rank: 2 },
+  GBP: { name: 'جنيه إسترليني', flag: '💷', rank: 3 },
   TND: { name: 'دينار تونسي', flag: '🇹🇳', rank: 4 },
   EGP: { name: 'جنيه مصري', flag: '🇪🇬', rank: 5 },
   TRY: { name: 'ليرة تركية', flag: '🇹🇷', rank: 6 },
@@ -672,14 +675,49 @@ const OFFICIAL_CURRENCIES_INFO: Record<string, { name: string; flag: string; ran
   BHD: { name: 'دينار بحريني', flag: '🇧🇭', rank: 11 },
   QAR: { name: 'ريال قطري', flag: '🇶🇦', rank: 12 },
   CNY: { name: 'يوان صيني', flag: '🇨🇳', rank: 13 },
-  CAD: { name: 'دولار كندي', flag: '🇨🇦', rank: 14 },
-  AUD: { name: 'دولار أسترالي', flag: '🇦🇺', rank: 15 },
   CHF: { name: 'فرنك سويسري', flag: '🇨🇭', rank: 16 },
-  JPY: { name: 'ين ياباني', flag: '🇯🇵', rank: 17 },
-  SEK: { name: 'كرونة سويدية', flag: '🇸🇪', rank: 18 },
-  NOK: { name: 'كرونة نرويجية', flag: '🇳🇴', rank: 19 },
-  DKK: { name: 'كرونة دنماركية', flag: '🇩🇰', rank: 20 },
 };
+
+export function formatOfficialBulletin(
+  prices: Record<string, number>, bulletinTime: Date | null,
+  previous?: { prices: Record<string, number>; recordedAt: string }
+) {
+  const dateLabel = bulletinTime ? '' : 'وقت إعداد النشرة: ';
+  bulletinTime = bulletinTime || new Date();
+  const valid = (value: number) => Number.isFinite(value) && value > 0;
+  const previousTime = Date.parse(previous?.recordedAt || '');
+  const bulletinDay = getLibyaTimeInfo(bulletinTime).dateStr;
+  const previousDay = Number.isFinite(previousTime) ? getLibyaTimeInfo(new Date(previousTime)).dateStr : '';
+  const comparable = previousDay && previousDay < bulletinDay ? previous : undefined;
+  const difference = (code: string) => comparable && valid(comparable.prices[code]) && valid(prices[code])
+    ? (Math.round(prices[code] * 10000) - Math.round(comparable.prices[code] * 10000)) / 10000 : null;
+  const date = bulletinTime.toLocaleDateString('ar-LY-u-nu-latn', { timeZone: 'Africa/Tripoli', weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+  const time = bulletinTime.toLocaleTimeString('ar-LY-u-nu-latn', { timeZone: 'Africa/Tripoli', hour: '2-digit', minute: '2-digit', hour12: true });
+  const lines = ['🏦 نشرة مصرف ليبيا المركزي الرسمية', `📅 ${dateLabel}${date} | ⏰ ${time} · طرابلس`, '━━━━━━━━━━━━━━━━━━━', ''];
+  const currencyIds: string[] = [];
+  for (const [title, codes] of [
+    ['', ['USD', 'EUR', 'GBP', 'TND', 'EGP']],
+    ['دول الخليج', ['AED', 'SAR', 'KWD', 'QAR', 'BHD']],
+    ['عملات أخرى', ['JOD', 'TRY', 'CNY', 'CHF']],
+  ] as const) {
+    const available = codes.filter(code => valid(prices[code]));
+    if (!available.length) continue;
+    if (title) lines.push('', `─ ─ ─ ${title} ─ ─ ─`);
+    for (const code of available) {
+      const info = OFFICIAL_CURRENCIES_INFO[code], delta = !title ? difference(code) : null;
+      lines.push(`${info.flag} ${info.name}  ${prices[code].toFixed(4)} د.ل${delta === null ? '' : delta > 0 ? '  ↑' : delta < 0 ? '  ↓' : '  ━'}`);
+      currencyIds.push('OFFICIAL_' + code);
+    }
+  }
+  const delta = difference('USD');
+  const yesterday = getLibyaTimeInfo(new Date(Date.parse(bulletinDay + 'T00:00:00+02:00') - 86400000)).dateStr;
+  const comparison = previousDay === yesterday ? 'بالأمس' : `بنشرة ${previousDay.split('-').reverse().join('/')}`;
+  const summary = delta === null ? 'لم تتوفر قراءة سابقة موثوقة للدولار للمقارنة.'
+    : delta === 0 ? `الدولار ثابت مقارنة ${comparison}`
+    : `الدولار ${delta > 0 ? 'ارتفع' : 'انخفض'} ${Math.abs(delta).toFixed(4)} د.ل مقارنة ${comparison}`;
+  lines.push('━━━━━━━━━━━━━━━━━━━', `💡 ${summary}`, '', '🌐 https://tinyurl.com/2j7667u2', '📱 المصدر: مصرف ليبيا المركزي');
+  return { message: lines.join('\n'), currencyIds };
+}
 
 export async function broadcastOfficialRates(
   isTest: boolean = false, 
@@ -695,7 +733,6 @@ export async function broadcastOfficialRates(
   const dd = String(libyaDateObj.getDate()).padStart(2, '0');
   const todayLibyaKey = `${yyyy}-${mm}-${dd}`;
   const dateStr = now.toLocaleDateString('ar-LY', { timeZone: 'Africa/Tripoli' });
-  const timeStr = now.toLocaleTimeString('ar-LY', { timeZone: 'Africa/Tripoli', hour: '2-digit', minute: '2-digit' });
   
   if (!isTest && !isManual && (lastOfficialBroadcastDate === todayLibyaKey || lastOfficialBroadcastDate === dateStr)) {
     console.log(`[Official Broadcast] Already broadcasted for today (${todayLibyaKey}). Skipping duplicate post.`);
@@ -708,40 +745,31 @@ export async function broadcastOfficialRates(
     return false;
   }
 
-  const dayNames = ["الأحد", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"];
-  let dayName = "الخميس";
-  try {
-    const dayIndex = libyaDateObj.getDay();
-    dayName = dayNames[dayIndex];
-  } catch (e) {}
-
-  let message = `🏦 *نشرة أسعار مصرف ليبيا المركزي الرسمية* 🏦\n`;
-  message += `━━━━━━━━━━━━━━━━━━━\n`;
-  message += `🗓 ${dayName}، ${dateStr} | ⏰ ${timeStr}\n\n`;
-
-  const officialEntries = Object.entries(rates.official)
-    .filter(([key, val]) => typeof val === 'number' && val > 0 && key !== 'OFFICIAL_USD')
-    .sort(([keyA], [keyB]) => {
-      const rankA = OFFICIAL_CURRENCIES_INFO[keyA]?.rank || 999;
-      const rankB = OFFICIAL_CURRENCIES_INFO[keyB]?.rank || 999;
-      return rankA - rankB;
-    });
-
-  if (officialEntries.length === 0) {
-    console.warn("[Official Broadcast] No official rates available to publish.");
-    return false;
+  const prices = { ...rates.official };
+  let bulletinTime: Date | null = null, previous: { prices: Record<string, number>; recordedAt: string } | undefined;
+  if (supabase) {
+    try {
+      const latest = await supabase.from('official_rates').select('usd,rates,recorded_at')
+        .lte('recorded_at', now.toISOString()).order('recorded_at', { ascending: false }).limit(1).abortSignal(AbortSignal.timeout(5000));
+      if (latest.error) throw latest.error;
+      const row = latest.data?.[0], time = Date.parse(row?.recorded_at || '');
+      const saved = { ...row?.rates, USD: row?.rates?.USD ?? row?.usd };
+      // previousOfficial remembers a different price, not necessarily yesterday's bulletin.
+      if (Number.isFinite(time) && time > 0 && time <= now.getTime() && Object.keys(OFFICIAL_CURRENCIES_INFO).filter(code => Number.isFinite(prices[code]) && prices[code] > 0)
+        .every(code => Number.isFinite(saved[code]) && Math.round(saved[code] * 10000) === Math.round(prices[code] * 10000))) {
+        bulletinTime = new Date(time);
+        const start = new Date(getLibyaTimeInfo(bulletinTime).dateStr + 'T00:00:00+02:00').toISOString();
+        const older = await supabase.from('official_rates').select('usd,rates,recorded_at')
+          .lt('recorded_at', start).order('recorded_at', { ascending: false }).limit(1).abortSignal(AbortSignal.timeout(5000));
+        if (older.error) throw older.error;
+        const prior = older.data?.[0];
+        if (prior) previous = { prices: { ...prior.rates, USD: prior.rates?.USD ?? prior.usd }, recordedAt: prior.recorded_at };
+      }
+    } catch (error) {
+      addLog('warn', 'النشر الرسمي', 'تعذرت قراءة النشرة السابقة؛ سيُنشر السعر دون مقارنة غير مؤكدة', { error: sanitizeErrorMessage(error) });
+    }
   }
-
-  for (const [code, val] of officialEntries) {
-    const info = OFFICIAL_CURRENCIES_INFO[code];
-    const name = info?.name || appConfig.terms.find(t => t.id === code)?.name || code;
-    const flag = info?.flag || '💰';
-    message += `${flag} *${name}*: ${val.toFixed(4)} د.ل\n`;
-  }
-
-  message += `\n━━━━━━━━━━━━━━━━━━━\n`;
-  message += `🔗 *لمزيد من التفاصيل والبيانات الحية:*\n🌐 https://tinyurl.com/2j7667u2\n`;
-  message += `📱 *المصدر:* مصرف ليبيا المركزي`;
+  const { message, currencyIds } = formatOfficialBulletin(prices, bulletinTime, previous);
 
   if (officialSending) return false;
   officialSending = true;
@@ -761,7 +789,7 @@ export async function broadcastOfficialRates(
       try {
         await broadcastToSocialMedia(message, isTest, platform, isManual || isTest, 'official');
         if (!isTest) officialDelivery.delivered[platform] = true;
-        addBroadcastLog({ platform, currency_ids: officialEntries.map(([id]) => 'OFFICIAL_' + id),
+        addBroadcastLog({ platform, currency_ids: currencyIds,
           status: 'success', attempts: 1, is_test: isTest ? 1 : isManual ? 2 : 0 });
       } catch (err: any) {
         if (isTest) throw err;
@@ -769,7 +797,7 @@ export async function broadcastOfficialRates(
         officialDelivery.attempts[platform] = attempt;
         officialDelivery.retryAt[platform] = Date.now() + RETRY_BASE_DELAY_MS * 2 ** Math.min(attempt - 1, 3);
         officialDelivery.lastError = sanitizeErrorMessage(err) || 'فشل النشر الرسمي';
-        addBroadcastLog({ platform, currency_ids: officialEntries.map(([id]) => 'OFFICIAL_' + id),
+        addBroadcastLog({ platform, currency_ids: currencyIds,
           status: 'failed', attempts: attempt, error_message: officialDelivery.lastError, is_test: isManual ? 2 : 0 });
       }
       if (!isTest) {

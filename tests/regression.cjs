@@ -32,7 +32,7 @@ function socialFixture(f, options = {}) {
   const mocks = {
     './accountLease.service': options.lease || { ensureAccountLease: async () => true, ownsAccountLease: () => true, getAccountLeaseGeneration: () => 1 },
     '../../telegramClient': { getTelegramManager: () => ({
-      sendMessage: async () => { counts.telegram++; return delayed ? await delayed : !failTG; }, lastError: 'Fixture TG failure'
+      sendMessage: async (...args) => { options.onTelegram?.(...args); counts.telegram++; return delayed ? await delayed : !failTG; }, lastError: 'Fixture TG failure'
     }) },
     './telegramSession.service': { getTelegramCredentials: () => ({ apiId: 1, apiHash: 'fixture', sessionString: 'fixture' }) },
     './db.service': options.dbService || { ensureWebRatesReady: async () => webReady, getWebRatesSyncError: () => 'Fixture Web sync failure' },
@@ -41,11 +41,12 @@ function socialFixture(f, options = {}) {
     '../utils/logger': f.logger,
     '../utils/helpers': { ...f.helper, delay: async () => {} }
   };
-  const extra = { fetch: async url => {
+  const extra = { fetch: async (url, request) => {
     assert.ok(url.startsWith('https://graph.facebook.com/'));
     if (url.endsWith('/v20.0/')) return { ok: !failFB, json: async () => failFB
       ? { error: { code: 190 } } : { og_object: { title: `دولار: ${f.rates.parallel.USD.toFixed(2)} | يورو: ${f.rates.parallel.EUR.toFixed(2)}` } } };
     if (url.endsWith('/comments')) return { json: async () => ({ id: 'fixture-comment' }) };
+    options.onFacebook?.(JSON.parse(request.body));
     counts.facebook++;
     return { json: async () => failFB ? { error: { code: 190, message: 'Fixture FB failure' } } : { id: 'fixture-post' } };
   } };
@@ -467,6 +468,70 @@ test('Queue watchdog does no empty dispatch, Web check or checkpoint after retry
   assert.equal((await s.flushBroadcastQueueImmediately('telegram', true)).success, true, 'Administrator can explicitly retry');
   assert.equal(env.counts.telegram, 1); assert.equal(s.smartBroadcastQueue.size, 0);
 });
+test('Official bulletin is concise, grouped and uses genuine prior daily readings at four-decimal precision', async () => {
+  const f = fixture(), env = socialFixture(f), format = env.social.formatOfficialBulletin;
+  const prices = { USD: 6.4228, EUR: 7.2243, GBP: 8.6104, TND: 2.1479, EGP: .1246,
+    AED: 1.7487, SAR: 1.7122, KWD: 20.5178, QAR: 1.7418, JOD: 8.9422, BHD: 16.8617,
+    TRY: .1294, CNY: .9623, CHF: 7.826, CAD: 5, AUD: 5, JPY: 5, SEK: 5, NOK: 5, DKK: 5, OFFICIAL_USD: 99 };
+  const date = new Date('2026-10-22T07:29:00Z');
+  const previous = { recordedAt: '2026-10-21T07:30:00Z', prices: { ...prices, EUR: 7.2242, GBP: 8.6103, EGP: .1247 } };
+  const { message, currencyIds } = format(prices, date, previous);
+  assert(message.startsWith('🏦 نشرة مصرف ليبيا المركزي الرسمية\n📅 الخميس'));
+  assert(message.includes('22 أكتوبر 2026')); assert(message.includes('09:29 ص'));
+  assert(message.includes('دولار أمريكي  6.4228 د.ل  ━'));
+  assert(message.includes('يورو أوروبي  7.2243 د.ل  ↑')); assert(message.includes('جنيه مصري  0.1246 د.ل  ↓'));
+  assert(message.includes('فرنك سويسري  7.8260 د.ل')); assert(message.includes('الدولار ثابت مقارنة بالأمس'));
+  assert.deepEqual(Array.from(currencyIds), ['USD','EUR','GBP','TND','EGP','AED','SAR','KWD','QAR','BHD','JOD','TRY','CNY','CHF'].map(id=>'OFFICIAL_'+id));
+  assert(message.indexOf('دول الخليج') < message.indexOf('درهم إماراتي'));
+  assert(message.indexOf('دينار أردني') > message.indexOf('عملات أخرى'), 'Jordan is not a Gulf state');
+  for(const name of ['كندي','أسترالي','ياباني','سويدية','نرويجية','دنماركية']) assert(!message.includes(name));
+  for(const [price,word] of [[6.4229,'ارتفع 0.0001'],[6.4227,'انخفض 0.0001']]) {
+    assert(format({...prices,USD:price},date,previous).message.includes(word));
+  }
+  const weekend=format(prices,date,{...previous,recordedAt:'2026-10-19T08:00:00Z'}).message;
+  assert(weekend.includes('بنشرة 19/10/2026'));assert(!weekend.includes('بالأمس'));
+  for(const prior of [undefined,{...previous,recordedAt:'bad'},{...previous,recordedAt:'2026-10-22T06:00:00Z'},
+    {...previous,recordedAt:'2026-10-23T06:00:00Z'}, {...previous,prices:{USD:NaN}}]) {
+    const missing=format(prices,date,prior).message;
+    assert(missing.includes('لم تتوفر قراءة سابقة موثوقة للدولار'));assert(!missing.includes('الدولار ثابت'));
+  }
+  const sparse=format({USD:6.4,AED:NaN,SAR:0,KWD:Infinity,CHF:-1},date).message;
+  assert(!sparse.includes('دول الخليج'));assert(!sparse.includes('عملات أخرى'));assert(!sparse.includes('NaN'));
+});
+
+test('Official sends use saved bulletin dates, bounded prior-row reads, short visible Telegram links and unchanged Facebook attachment', async () => {
+  const f=fixture(); f.rates.official={USD:6.4228,EUR:7.2243};f.rates.previousOfficial={USD:1,EUR:1};
+  const queries=[], messages=[], posts=[];
+  const latest={usd:6.4228,rates:{USD:6.4228,EUR:7.2243},recorded_at:'2026-10-11T08:00:00Z'};
+  const prior={usd:6.4228,rates:{USD:6.4228,EUR:7.2242},recorded_at:'2026-10-10T08:00:00Z'};
+  const env=socialFixture(f,{supabase:fakeSupabase(q=>{
+    if(q.table==='official_rates'){queries.push(q);return {data:[q.args.lt?prior:latest],error:null};}
+    return {data:null,error:null};
+  }),onTelegram:(_channel,text,opts)=>messages.push({text,opts}),onFacebook:payload=>posts.push(payload)});
+  env.failFB(false);assert.equal(await env.social.broadcastOfficialRates(false),true);
+  assert.equal(queries.length,2);
+  assert(queries.every(q=>q.args.limit[0]===1 && q.args.abortSignal[0]),'Each bounded lookup reads at most one row with a deadline');
+  assert.equal(queries[1].args.lt[1],'2026-10-10T22:00:00.000Z','Prior bulletin is before saved quote day, not publication day');
+  assert(messages[0].text.includes('11 أكتوبر 2026'),'A delayed post never dates yesterday\'s quote as today');
+  assert(messages[0].text.includes('الدولار ثابت مقارنة بالأمس'),'Do not compare the stale last-different RAM price');
+  assert.equal(messages[0].opts.parseMode,'html');
+  assert.match(messages[0].text,/<a href="https:\/\/dollar-price-qp14\.onrender\.com\/\?r=\d{6,32}">tinyurl\.com\/2j7667u2<\/a>/);
+  const {HTMLParser}=require('telegram/extensions/html');
+  const [visible,entities]=HTMLParser.parse(messages[0].text);
+  assert(visible.includes('tinyurl.com/2j7667u2'));assert(!visible.includes('onrender.com'));
+  assert(entities.some(entity=>entity.className==='MessageEntityTextUrl' && /^https:\/\/dollar-price-qp14\.onrender\.com\/\?r=\d{6,32}$/.test(entity.url)),
+    'The real account parser makes the short caption clickable without losing the cache-busted preview destination');
+  const post=posts.find(payload=>payload.link);
+  assert.equal(post.link,'https://tinyurl.com/2j7667u2');assert(!post.message.includes('?r='));
+  const broken=fixture(), fails=socialFixture(broken,{supabase:fakeSupabase(q=>q.table==='official_rates'
+    ? {data:null,error:{message:'Fixture unavailable'}}:{data:null,error:null}),onTelegram:(_channel,text)=>messages.push({text})});
+  broken.config.facebookAutoPost=false;
+  assert.equal(await fails.social.broadcastOfficialRates(false),true,'Missing comparison must not block a valid price publication');
+  assert(messages.at(-1).text.includes('لم تتوفر قراءة سابقة موثوقة للدولار'));
+  assert(messages.at(-1).text.includes('وقت إعداد النشرة:'),'An unknown saved quote date is never presented as the CBL bulletin date');
+  assert(broken.logger.getRecentLogs().some(row=>row.category==='النشر الرسمي'&&row.level==='warn'));
+});
+
 test('Official bulletin only completes when all enabled platforms deliver; Facebook-only works', async () => {
   const f = fixture(), env = socialFixture(f), s = env.social;
   assert.equal(await s.broadcastOfficialRates(false), false); assert.equal(s.lastOfficialBroadcastDate, '');
