@@ -1112,13 +1112,29 @@ export async function processFacebookSchedule(): Promise<boolean> {
         addLog('info', 'نشرات فيسبوك', `تجاوز نشرة ${slot}: لا تغير في الأسعار منذ آخر نشرة.`, { stage: 'facebook-schedule', date: local.dateStr, slot });
         persistBroadcastQueue(); await flushBroadcastQueueState(); return false;
       }
-      const title = ['السوق في لقطة | مؤشر الدينار', 'متابعة السوق | العملات والمعادن', 'آخر رصد للسوق | مؤشر الدينار'][times.indexOf(slot)];
-      const observed = new Date(timestamp).toLocaleString('ar-LY', { timeZone: 'Africa/Tripoli', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' });
-      const lines = (items: string[][]) => items.map(([id, name]) => `${name}: ${prices[id].toFixed(id === 'EGP' ? 4 : 3)} د.ل`).join('\n');
+      const period = local.hour < 12 ? 'صباحًا' : local.hour < 16 ? 'ظهرًا' : 'مساءً';
+      const time = `${String(local.hour % 12 || 12).padStart(2, '0')}:${String(local.minute).padStart(2, '0')}`;
+      const title = `تحديث ${time} ${period} | سوق المشير`;
+      const previousPrices = new Map<string, number>();
+      try {
+        const saved = JSON.parse(facebookSchedule.revision || '[]');
+        if (Array.isArray(saved)) for (const entry of saved) {
+          if (Array.isArray(entry) && typeof entry[0] === 'string' && typeof entry[1] === 'number' && Number.isFinite(entry[1]) && entry[1] > 0) previousPrices.set(entry[0], entry[1]);
+        }
+      } catch { /* An older checkpoint without prices cannot establish a comparison. */ }
+      const lines = (items: string[][]) => items.map(([id, name]) => {
+        const digits = id === 'EGP' ? 4 : 3;
+        const price = prices[id].toFixed(digits), previous = previousPrices.get(id);
+        const change = previous === undefined ? '' : Number(price) - Number(previous.toFixed(digits));
+        const direction = change === '' ? '' : change > 0 ? ' ↑' : change < 0 ? ' ↓' : ' ━';
+        return `${name}: ${price} د.ل${direction}`;
+      }).join('\n');
+      const comparison = [...shownCurrencies, ...shownMetals].some(([id]) => previousPrices.has(id))
+        ? '\n\nمقارنة بآخر نشرة فيسبوك: ↑ ارتفاع · ↓ انخفاض · ━ استقرار' : '';
       const difference = prices.USD_CHECKS - prices.USD;
       const gap = prices.USD_CHECKS > 0 ? Math.abs(difference) < 0.0005 ? '\nسعر الدولار بالكاش والصكوك متقارب؛ الفارق أقل من 0.001 د.ل.' :
         `\nالدولار بالصكوك ${difference > 0 ? 'أعلى من' : 'أقل من'} الكاش بـ ${Math.abs(difference).toFixed(3)} د.ل لكل دولار.` : '';
-      message = `${title}\nآخر لقطة محفوظة: ${observed}\n\nالسوق الموازي — لكل وحدة عملة\n${lines(shownCurrencies)}${shownMetals.length ? '\n\nالمعادن — سعر الجرام\n' + lines(shownMetals) : ''}\n${gap}\n\nالأسعار للاسترشاد وليست عروض تنفيذ ملزمة.`;
+      message = `${title}\nمؤشر الدينار | العملات والمعادن\n\nالسوق الموازي · الأسعار المتاحة لكل وحدة عملة\n${lines(shownCurrencies)}${shownMetals.length ? '\n\nالمعادن · سعر الجرام\n' + lines(shownMetals) : ''}${comparison}\n${gap}\n\nالأسعار للاسترشاد وليست عروض تنفيذ ملزمة.`;
     }
     if (Date.now() >= Date.parse(`${local.dateStr}T${slot}:00+02:00`) + 30 * 60000) return false;
     // A crash after provider acceptance is ambiguous: never blindly replay this slot.

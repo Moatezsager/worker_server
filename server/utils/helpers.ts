@@ -235,5 +235,5 @@ export function facebookPostText(message: string): string {
   const lines = message.replace(/<a\b[^>]*>(.*?)<\/a>/gi, '$1').replace(/[*_`]/g, '').split('\n')
     .map(line => line.replace(/(?:https?:\/\/|www\.)[^\s<>]+|\b(?:tinyurl\.com|t\.me|facebook\.com|dollar-price-qp14\.onrender\.com)\/[^\s<>]*/gi, '').trim())
     .filter(line => !/^[\s🌐📱📢👉🔗:|─━-]*$/u.test(line) && !/^(?:الموقع|رابط الموقع|تابعنا|للمتابعة|التفاصيل|لمتابعة التحديثات)[\s:]*$/.test(line));
-  return lines.join('\n').trim() + '\n\nرابط الموقع والمتابعة في أول تعليق.';
+  return lines.join('\n').trim() + '\n\nتابع كل التحديثات لحظة بلحظة؛ روابط الموقع وتيليجرام في أول تعليق.';
 }

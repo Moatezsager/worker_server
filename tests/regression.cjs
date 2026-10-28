@@ -1363,7 +1363,7 @@ test('Weekly image and caption use the durable per-platform queue without replay
   assert.equal(telegramFile[0], 'fixture'); assert(telegramFile[1] instanceof Buffer); assert.equal(telegramFile[2].parseMode, 'html');
   assert.equal(facebookPhoto, undefined, 'Facebook waits for a fixed bulletin slot; Telegram goes immediately');
   await env.social.processWeeklyBroadcastQueue(true);
-  assert.equal(facebookPhoto.get('caption'), '📊 أسبوع ثابت\n\nرابط الموقع والمتابعة في أول تعليق.');
+  assert.equal(facebookPhoto.get('caption'), '📊 أسبوع ثابت\n\nتابع كل التحديثات لحظة بلحظة؛ روابط الموقع وتيليجرام في أول تعليق.');
   assert(!facebookPhoto.get('alt_text_custom').includes('https'));
   assert.equal((await facebookPhoto.get('source').arrayBuffer()).byteLength, 256);
   env.failFB(false); f.advance(600000);
@@ -1393,9 +1393,9 @@ test('Facebook comment failure never repeats the successful post; Telegram paylo
   assert(f.logger.getRecentLogs().some(log => log.category === 'نشر فيسبوك' && log.level === 'warn'));
 });
 
-function scheduledFixture(f) {
+function scheduledFixture(f, options = {}) {
   let writesFail = false, reads = 0;
-  const env = socialFixture(f, { supabase: fakeSupabase(q => {
+  const env = socialFixture(f, { ...options, supabase: fakeSupabase(q => {
     if (q.table === 'server_config') return { data: null, error: writesFail && q.op === 'upsert' ? { message: 'Fixture checkpoint unavailable' } : null };
     if (q.table === 'parallel_rates') { reads++; return { data: [{ rates: { ...f.rates.parallel }, recorded_at: f.rates.lastUpdated }], error: null }; }
     return { data: [], error: null };
@@ -1422,6 +1422,32 @@ test('Facebook uses only fixed Tripoli slots, skips unchanged prices, and does n
   f.advance(4 * 3600000);
   assert.equal(await restored.processFacebookSchedule(), true, '22:00 Facebook slot is independent of Telegram quiet hours');
   assert.equal(env.counts.facebook, 2); assert.equal(env.counts.telegram, 0);
+});
+
+test('Facebook bulletin compares with the last successful bulletin and keeps missing comparisons honest', async () => {
+  const f = fixture(), posts = [];
+  const env = scheduledFixture(f, { onFacebook: post => posts.push(post.message) });
+  Object.assign(f.rates.parallel, { USD: 10.2, USD_CHECKS: 10.5, EUR: 11.3 });
+  f.advance(2 * 3600000);
+  f.rates.lastUpdated = new f.Clock().toISOString();
+  assert.equal(await env.social.processFacebookSchedule(), true);
+  assert(posts[0].startsWith('تحديث 02:00 ظهرًا | سوق المشير'));
+  assert(!posts[0].includes('آخر لقطة محفوظة'));
+  assert(!posts[0].includes('↑') && !posts[0].includes('↓') && !posts[0].includes('━'), 'First bulletin has no invented movement');
+  assert(posts[0].endsWith('تابع كل التحديثات لحظة بلحظة؛ روابط الموقع وتيليجرام في أول تعليق.'));
+  assert(!posts[0].includes('http'));
+  const restored = env.restore();
+  f.advance(4 * 3600000);
+  Object.assign(f.rates.parallel, { USD: 10.3, EUR: 11.2, GOLD_SCRAP_18: 800 });
+  f.rates.lastUpdated = new f.Clock().toISOString();
+  assert.equal(await restored.processFacebookSchedule(), true);
+  assert(posts[1].startsWith('تحديث 06:00 مساءً | سوق المشير'));
+  assert(posts[1].includes('دولار كاش: 10.300 د.ل ↑'));
+  assert(posts[1].includes('يورو: 11.200 د.ل ↓'));
+  assert(posts[1].includes('دولار صكوك: 10.500 د.ل ━'));
+  assert(posts[1].includes('ذهب كسر 18: 800.000 د.ل\n'), 'A newly available item does not get a stability arrow');
+  assert(posts[1].includes('مقارنة بآخر نشرة فيسبوك'));
+  assert.equal(env.counts.telegram, 0);
 });
 
 test('Automatic price changes still reach Telegram but never immediately publish on Facebook', async () => {
