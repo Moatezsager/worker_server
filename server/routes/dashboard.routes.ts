@@ -193,6 +193,7 @@ dashboardRouter.get(["/", "/dashboard", "/admin"], (req: Request, res: Response)
       facebookAutoPost: !!appConfig.facebookAutoPost
     },
     broadcastConfig: {
+      facebookPostTimes: appConfig.facebookPostTimes || ['14:00', '18:00', '22:00'],
       minBroadcastIntervalMinutes: appConfig.minBroadcastIntervalMinutes ?? 20,
       minPriceChangeThreshold: appConfig.minPriceChangeThreshold ?? 0.015,
       aggregationWindowSeconds: appConfig.aggregationWindowSeconds ?? 45,
@@ -268,6 +269,7 @@ dashboardRouter.get("/api/dashboard/stats", (req: Request, res: Response) => {
       facebookAutoPost: !!appConfig.facebookAutoPost
     },
     broadcastConfig: {
+      facebookPostTimes: appConfig.facebookPostTimes || ['14:00', '18:00', '22:00'],
       minBroadcastIntervalMinutes: appConfig.minBroadcastIntervalMinutes ?? 20,
       minPriceChangeThreshold: appConfig.minPriceChangeThreshold ?? 0.015,
       aggregationWindowSeconds: appConfig.aggregationWindowSeconds ?? 45,
@@ -664,13 +666,24 @@ dashboardRouter.post("/api/dashboard/broadcast/settings/save", async (req: Reque
     facebookAutoPost,
     quietHoursEnabled,
     quietHoursStart,
-    quietHoursEnd
+    quietHoursEnd,
+    facebookPostTimes
   } = req.body || {};
 
   const numericSettings = { minBroadcastIntervalMinutes, minPriceChangeThreshold, aggregationWindowSeconds, hourlyPostLimit };
   const bounds = { minBroadcastIntervalMinutes: [1, 180], minPriceChangeThreshold: [0.001, 10000],
     aggregationWindowSeconds: [10, 300], hourlyPostLimit: [1, 20] };
   const candidate = { ...appConfig };
+  if (facebookPostTimes !== undefined) {
+    if (!Array.isArray(facebookPostTimes) || facebookPostTimes.length !== 3 || facebookPostTimes.some(time => typeof time !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time))) {
+      return res.status(400).json({ success: false, error: 'حدد ثلاثة مواعيد صحيحة لنشرات فيسبوك.' });
+    }
+    const minutes = facebookPostTimes.map(time => Number(time.slice(0, 2)) * 60 + Number(time.slice(3))).sort((a, b) => a - b);
+    if (minutes.some((minute, i) => minutes[(i + 1) % 3] + (i === 2 ? 1440 : 0) - minute < 120)) {
+      return res.status(400).json({ success: false, error: 'اترك ساعتين على الأقل بين نشرات فيسبوك.' });
+    }
+    candidate.facebookPostTimes = [...facebookPostTimes].sort();
+  }
   for (const [key, value] of Object.entries(numericSettings)) {
     if (value === undefined) continue;
     const [min, max] = bounds[key];
@@ -703,6 +716,7 @@ dashboardRouter.post("/api/dashboard/broadcast/settings/save", async (req: Reque
     success: true,
     message: "تم حفظ إعدادات وشروط النشر التلقائي بنجاح",
     config: {
+      facebookPostTimes: appConfig.facebookPostTimes,
       minBroadcastIntervalMinutes: appConfig.minBroadcastIntervalMinutes,
       minPriceChangeThreshold: appConfig.minPriceChangeThreshold,
       aggregationWindowSeconds: appConfig.aggregationWindowSeconds,

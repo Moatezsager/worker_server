@@ -5,6 +5,7 @@ import { HistoryPoint, PriceChangeLog, RateMap, AppConfig } from '../types';
 import { isSignificantChange, METAL_IDS, getPriceHistoryCutoff } from '../utils/helpers';
 import { updateStats } from './reporting.service';
 import { addLog, sanitizeErrorMessage } from '../utils/logger';
+import { archiveOldRateHistory } from './rate-history-archive.service';
 
 export let lastRatesFetchTime = 0;
 export const RATES_CACHE_TTL = 30 * 1000; // 30 seconds
@@ -603,12 +604,16 @@ export function cleanupOldData(onUserLogsCleanup?: () => void): Promise<Record<s
   if (!cleanupRun) cleanupRun = (async () => {
     const cutoff30 = getPriceHistoryCutoff();
     const cutoff1 = new Date(Date.now() - 86400000).toISOString();
-    const signal = AbortSignal.timeout(10000);
     const removed: Record<string, number> = {};
     const tables = ['exchange_rates', 'parallel_rates', 'official_rates', 'metal_rates', 'error_logs', 'price_changes_log'];
     const failures: string[] = [];
+    let archive: Awaited<ReturnType<typeof archiveOldRateHistory>> | null = null;
+    try { archive = await archiveOldRateHistory(supabase); Object.assign(removed, archive.removed); }
+    catch (error: any) { failures.push('rate_history_daily'); console.error('[Cleanup] Daily history archive failed; price rows retained:', sanitizeErrorMessage(error)); }
+    const signal = AbortSignal.timeout(10000);
     for (const table of tables) {
       const priceTable = table.endsWith('_rates');
+      if (['parallel_rates', 'official_rates', 'metal_rates'].includes(table)) continue;
       let cutoff = priceTable ? cutoff30 : cutoff1;
       try {
         if (priceTable) {
@@ -644,6 +649,7 @@ export function cleanupOldData(onUserLogsCleanup?: () => void): Promise<Record<s
       removed_exchange_rates: removed.exchange_rates, removed_parallel_rates: removed.parallel_rates,
       removed_official_rates: removed.official_rates, removed_metal_rates: removed.metal_rates,
       total_removed_rates: removed.exchange_rates + removed.parallel_rates + removed.official_rates + removed.metal_rates,
+      summarized_days: archive?.summarized_days || 0,
       removed_logs: removed.error_logs, removed_changes: removed.price_changes_log,
       cutoff_rates_date: cutoff30, cutoff_logs_date: cutoff1
     };

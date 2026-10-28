@@ -32,7 +32,8 @@ function socialFixture(f, options = {}) {
   const mocks = {
     './accountLease.service': options.lease || { ensureAccountLease: async () => true, ownsAccountLease: () => true, getAccountLeaseGeneration: () => 1 },
     '../../telegramClient': { getTelegramManager: () => ({
-      sendMessage: async (...args) => { options.onTelegram?.(...args); counts.telegram++; return delayed ? await delayed : !failTG; }, lastError: 'Fixture TG failure'
+      sendMessage: async (...args) => { options.onTelegram?.(...args); counts.telegram++; return delayed ? await delayed : !failTG; },
+      sendFile: async (...args) => { options.onTelegramFile?.(...args); counts.telegram++; return !failTG; }, lastError: 'Fixture TG failure'
     }) },
     './telegramSession.service': { getTelegramCredentials: () => ({ apiId: 1, apiHash: 'fixture', sessionString: 'fixture' }) },
     './db.service': options.dbService || { ensureWebRatesReady: async () => webReady, getWebRatesSyncError: () => 'Fixture Web sync failure' },
@@ -45,10 +46,15 @@ function socialFixture(f, options = {}) {
     assert.ok(url.startsWith('https://graph.facebook.com/'));
     if (url.endsWith('/v20.0/')) return { ok: !failFB, json: async () => failFB
       ? { error: { code: 190 } } : { og_object: { title: `دولار: ${f.rates.parallel.USD.toFixed(2)} | يورو: ${f.rates.parallel.EUR.toFixed(2)}` } } };
-    if (url.endsWith('/comments')) return { json: async () => ({ id: 'fixture-comment' }) };
-    options.onFacebook?.(JSON.parse(request.body));
+    if (url.endsWith('/comments')) {
+      options.onComment?.(JSON.parse(request.body));
+      return { ok: !options.failComment, status: options.failComment ? 403 : 200,
+        json: async () => options.failComment ? { error: { message: 'Fixture comment rejected' } } : { id: 'fixture-comment' } };
+    }
+    if (String(url).includes('/photos') && request.body instanceof FormData) options.onFacebookPhoto?.(request.body);
+    else options.onFacebook?.(JSON.parse(request.body));
     counts.facebook++;
-    return { json: async () => failFB ? { error: { code: 190, message: 'Fixture FB failure' } } : { id: 'fixture-post' } };
+    return { ok: !failFB, status: failFB ? 500 : 200, json: async () => failFB ? { error: { code: 190, message: 'Fixture FB failure' } } : { id: 'fixture-post' } };
   } };
   return { social: f.load('server/services/social.service.ts', mocks, extra), counts, checkpoints,
     restore: () => f.load('server/services/social.service.ts', mocks, extra),
@@ -499,8 +505,8 @@ test('Official bulletin is concise, grouped and uses genuine prior daily reading
   assert(!sparse.includes('دول الخليج'));assert(!sparse.includes('عملات أخرى'));assert(!sparse.includes('NaN'));
 });
 
-test('Official sends use saved bulletin dates, bounded prior-row reads, short visible Telegram links and unchanged Facebook attachment', async () => {
-  const f=fixture(); f.rates.official={USD:6.4228,EUR:7.2243};f.rates.previousOfficial={USD:1,EUR:1};
+test('Official sends preserve Telegram preview and put Facebook links only in its comment', async () => {
+  const f=fixture(); f.advance(-3600000); f.rates.official={USD:6.4228,EUR:7.2243};f.rates.previousOfficial={USD:1,EUR:1};
   const queries=[], messages=[], posts=[];
   const latest={usd:6.4228,rates:{USD:6.4228,EUR:7.2243},recorded_at:'2026-10-11T08:00:00Z'};
   const prior={usd:6.4228,rates:{USD:6.4228,EUR:7.2242},recorded_at:'2026-10-10T08:00:00Z'};
@@ -521,8 +527,8 @@ test('Official sends use saved bulletin dates, bounded prior-row reads, short vi
   assert(visible.includes('tinyurl.com/2j7667u2'));assert(!visible.includes('onrender.com'));
   assert(entities.some(entity=>entity.className==='MessageEntityTextUrl' && /^https:\/\/dollar-price-qp14\.onrender\.com\/\?r=\d{6,32}$/.test(entity.url)),
     'The real account parser makes the short caption clickable without losing the cache-busted preview destination');
-  const post=posts.find(payload=>payload.link);
-  assert.equal(post.link,'https://tinyurl.com/2j7667u2');assert(!post.message.includes('?r='));
+  const post=posts[0];
+  assert.equal(post.link,undefined);assert(!post.message.includes('http'));assert(post.message.includes('أول تعليق'));
   const broken=fixture(), fails=socialFixture(broken,{supabase:fakeSupabase(q=>q.table==='official_rates'
     ? {data:null,error:{message:'Fixture unavailable'}}:{data:null,error:null}),onTelegram:(_channel,text)=>messages.push({text})});
   broken.config.facebookAutoPost=false;
@@ -534,11 +540,12 @@ test('Official sends use saved bulletin dates, bounded prior-row reads, short vi
 
 test('Official bulletin only completes when all enabled platforms deliver; Facebook-only works', async () => {
   const f = fixture(), env = socialFixture(f), s = env.social;
+  f.advance(-3600000);
   assert.equal(await s.broadcastOfficialRates(false), false); assert.equal(s.lastOfficialBroadcastDate, '');
   env.failFB(false); f.advance(60001);
   assert.equal(await s.broadcastOfficialRates(false), true); assert.equal(env.counts.telegram, 1);
   assert.equal(s.lastOfficialBroadcastDate, '2026-10-12');
-  const another = fixture(); another.config.telegramAutoPost = false;
+  const another = fixture(); another.advance(-3600000); another.config.telegramAutoPost = false;
   const fb = socialFixture(another); fb.failFB(false);
   assert.equal(await fb.social.broadcastOfficialRates(false), true); assert.equal(fb.counts.telegram, 0);
 });
@@ -665,7 +672,7 @@ test('SQLite ingestion stores real observations without synthetic startup prices
     assert.equal(sqlite.prepare('SELECT count(*) n FROM ingested_messages').get().n, 1);
   } finally { sqlite.close(); }
 });
-test('Paired cleanup retains the complete Tripoli month, extrema, boundary and only/latest quotes', async () => {
+test('Paired cleanup delegates archival and cannot prune source rows when archival fails', async () => {
   const path = require('node:path');
   for (const root of [process.cwd(), ...(process.env.WEB_PROJECT_PATH ? [process.env.WEB_PROJECT_PATH] : [])]) {
     const f = fixture();
@@ -673,6 +680,8 @@ test('Paired cleanup retains the complete Tripoli month, extrema, boundary and o
     assert.equal(f.helper.getPriceHistoryCutoff(new f.Clock('2026-10-12T22:00:00Z')), '2026-09-12T22:00:00.000Z');
     assert.equal(f.helper.getPriceHistoryCutoff(new f.Clock('2027-01-01T01:00:00Z')), '2026-12-01T22:00:00.000Z');
     assert.equal(f.helper.getPriceHistoryCutoff(new f.Clock('2028-03-01T01:00:00Z')), '2028-01-30T22:00:00.000Z');
+    assert.equal(f.helper.getPriceHistoryCutoff(new f.Clock('2026-10-28T12:00:00Z'), 'six-months'), '2026-04-27T22:00:00.000Z');
+    assert.equal(f.helper.getPriceHistoryCutoff(new f.Clock('2028-08-31T12:00:00Z'), 'six-months'), '2028-02-28T22:00:00.000Z');
     const daily = Array.from({ length: 10 }, (_, i) => ({ id: i, usd: i === 2 ? 12 : i === 4 ? 8 : 10,
       recorded_at: `2026-10-01T${String(i).padStart(2, '0')}:00:00Z`, rates: { EUR: i === 3 ? 13 : 11 } }));
     const before = [{ id: 'oldest', recorded_at: '2026-08-01T00:00:00Z' },
@@ -680,7 +689,7 @@ test('Paired cleanup retains the complete Tripoli month, extrema, boundary and o
     const tables = { parallel_rates: [...before, ...daily, { id: 'cutoff', recorded_at: '2026-09-11T22:00:00Z' }],
       official_rates: [{ id: 'only', recorded_at: '2026-08-01T00:00:00Z', usd: 6.4444, rates: { USD: 6.4444 } }],
       metal_rates: [...before, ...daily], exchange_rates: [], error_logs: [], price_changes_log: [] };
-    let reads = 0, broken = false, optionalMissing = false;
+    let reads = 0, archiveRuns = 0, broken = false, optionalMissing = false;
     const supabase = fakeSupabase(q => {
       if (broken && q.table === 'official_rates') return { error: { message: 'Fixture read failed' } };
       if (optionalMissing && q.table === 'exchange_rates') return { error: { code: 'PGRST205' } };
@@ -696,17 +705,22 @@ test('Paired cleanup retains the complete Tripoli month, extrema, boundary and o
       '../db': { db: noopDb, supabase, supabaseKey: 'fixture', supabaseAnonKey: 'fixture' },
       '../state': { rates: f.rates, history: [] }, '../config': { appConfig: f.config },
       '../utils/helpers': f.helper, '../utils/logger': f.logger,
-      './reporting.service': { updateStats() {} }, './alert.service': { checkAndAlertIfCritical: async () => {} }
+      './reporting.service': { updateStats() {} }, './alert.service': { checkAndAlertIfCritical: async () => {} },
+      './rate-history-archive.service': { archiveOldRateHistory: async () => {
+        archiveRuns++; if (broken) throw Error('Fixture archive failure');
+        return { summarized_days: 21, removed: { parallel_rates: 2, official_rates: 0, metal_rates: 0 } };
+      } }
     });
     const [result, duplicate] = await Promise.all([db.cleanupOldData(), db.cleanupOldData()]);
-    assert.equal(result, duplicate); assert.equal(reads, 4, 'Overlapping cleanup calls coalesce');
+    assert.equal(result, duplicate); assert.equal(archiveRuns, 1, 'Overlapping cleanup calls coalesce');
     assert.equal(result.total_removed_rates, 2);
-    assert.equal(tables.parallel_rates.length, 12); assert.equal(tables.metal_rates.length, 11);
-    for (const row of daily) assert(tables.parallel_rates.includes(row), 'Every monthly observation survives, not only extrema');
+    assert.equal(result.summarized_days, 21);
+    assert.equal(tables.parallel_rates.length, 13); assert.equal(tables.metal_rates.length, 12);
+    for (const row of daily) assert(tables.parallel_rates.includes(row), 'Source history is delegated to the archiver, not generic cleanup');
     assert.equal(tables.official_rates[0].usd, 6.4444, 'Stale last available official quote is never deleted or averaged');
-    assert.equal((await db.cleanupOldData()).total_removed_rates, 0, 'Repeated cleanup is idempotent');
-    broken = true; await assert.rejects(db.cleanupOldData(), /Cleanup incomplete: official_rates/);
-    assert.equal(tables.official_rates.length, 1, 'Failed boundary reads prohibit deletion');
+    assert.equal((await db.cleanupOldData()).total_removed_rates, 2, 'Repeated cleanup is idempotent');
+    broken = true; await assert.rejects(db.cleanupOldData(), /Cleanup incomplete: rate_history_daily/);
+    assert.equal(tables.official_rates.length, 1, 'Failed archive prevents generic cleanup from deleting source history');
     broken = false; optionalMissing = true; await db.cleanupOldData();
   }
 });
@@ -1302,18 +1316,33 @@ test('Recent post recovery uses ISO for Supabase and milliseconds for SQLite', a
   assert.equal(filter[0], 'created_at'); assert.equal(filter[1], new f.Clock(f.now() - 3600000).toISOString());
   assert.equal(env.social.getBroadcastQueueStatus().recentPostsThisHour, 1);
 });
-test('Weekly report reads beyond the first 1000 rows and refuses partial data', async () => {
-  const f = fixture(); let queued = 0, message = '', fail = false, pages = [];
-  const rows = Array.from({ length: 1001 }, (_, i) => ({ id: i, recorded_at: new f.Clock().toISOString(), rates: { USD: i === 1000 ? 10.2 : 9.7 } }));
+test('Weekly scheduling waits until the complete Friday closes in Tripoli', async () => {
+  const f = fixture(), scheduled = [];
+  const cron = f.load('server/schedulers/cron.scheduler.ts', {
+    'node-cron': { schedule: (expression, work, options) => { scheduled.push({ expression, options }); return { stop() {}, destroy() {} }; } },
+    '../services/reporting.service': { broadcastWeeklyReport: async () => {} },
+    '../services/maintenance.service': { cleanupLocalDatabase() {} }
+  });
+  cron.initCronSchedulers(); cron.initCronSchedulers();
+  assert.equal(scheduled.length, 2); assert.equal(scheduled[0].expression, '5 0 * * 6');
+  assert.equal(scheduled[0].options.timezone, 'Africa/Tripoli'); cron.stopCronSchedulers();
+});
+test('Weekly report requests one canonical Web image/caption and keeps failures out of the queue', async () => {
+  const f = fixture(); let queued = 0, saved = [], fail = false, request;
   const report = f.load('server/services/reporting.service.ts', {
     '../state': { rates: f.rates }, '../config': { appConfig: f.config }, '../utils/helpers': f.helper,
-    '../db': { supabaseKey: 'fixture', supabase: fakeSupabase(q => {
-      const [from, to] = q.args.range; pages.push([from, to]);
-      return { data: rows.slice(from, to + 1), error: fail && from === 1000 ? { message: 'fixture failure' } : null };
-    }) }, './social.service': { queueWeeklyReport: async text => { queued++; message = text; } }
+    '../db': { supabaseKey: 'fixture', supabase: fakeSupabase(() => ({ data: [], error: null })) },
+    './social.service': { queueWeeklyReport: async (...args) => { queued++; saved = args; } }
+  }, { process: { env: { WEB_SERVER_URL: 'https://web.fixture', WORKER_INTERNAL_SECRET: 'fixture-secret' } },
+    fetch: async (url, options) => { request = { url, options }; return { ok: !fail, status: fail ? 503 : 200,
+      json: async () => fail ? { success: false } : { success: true, week: '2026-10-28', caption: '📊 حصاد', imageBase64: 'data:image/png;base64,aVBORw==' } }; }
   });
   await report.broadcastWeeklyReport();
-  assert.equal(queued, 1); assert(message.includes('إغلاق: 10.200')); assert.equal(pages.length, 3);
+  assert.equal(queued, 1); assert.deepEqual(saved, ['📊 حصاد', '2026-10-28', 'data:image/png;base64,aVBORw==']);
+  assert.equal(request.url, 'https://web.fixture/api/internal/weekly-harvest');
+  assert.equal(request.options.headers['User-Agent'], 'Dollar-Price-Worker/1.0');
+  assert.equal(request.options.headers['X-Worker-Secret'], 'fixture-secret');
+  await report.broadcastWeeklyReport(true); assert.equal(queued, 1, 'A test reads the same canonical report without sending or queuing');
   fail = true; await assert.rejects(report.broadcastWeeklyReport()); assert.equal(queued, 1);
 });
 test('Weekly platform progress survives restart and never replays the successful target', async () => {
@@ -1321,10 +1350,117 @@ test('Weekly platform progress survives restart and never replays the successful
   await env.social.queueWeeklyReport('Weekly fixture https://tinyurl.com/2j7667u2', '2026-10-12');
   assert.equal(env.counts.telegram, 1); assert.equal(env.social.getBroadcastQueueStatus().weekly.delivered.telegram, true);
   const restored = env.restore(); await restored.loadBroadcastQueueState();
-  env.failFB(false); f.advance(600000);
-  assert.equal(await restored.processWeeklyBroadcastQueue(), true);
+  env.failFB(false); f.advance(1200000);
+  assert.equal(await restored.processWeeklyBroadcastQueue(true), true);
   assert.equal(env.counts.telegram, 1); assert.equal(restored.getBroadcastQueueStatus().weekly.delivered.facebook, true);
 });
+test('Weekly image and caption use the durable per-platform queue without replaying successful uploads', async () => {
+  const f = fixture(); let telegramFile, facebookPhoto;
+  const env = socialFixture(f, { onTelegramFile: (...args) => { telegramFile = args; }, onFacebookPhoto: form => { facebookPhoto = form; } });
+  const image = Buffer.alloc(256); Buffer.from([137,80,78,71,13,10,26,10]).copy(image);
+  const base64 = `data:image/png;base64,${image.toString('base64')}`;
+  assert.equal(await env.social.queueWeeklyReport('📊 أسبوع ثابت https://web.fixture/report', '2026-10-28', base64), false);
+  assert.equal(telegramFile[0], 'fixture'); assert(telegramFile[1] instanceof Buffer); assert.equal(telegramFile[2].parseMode, 'html');
+  assert.equal(facebookPhoto, undefined, 'Facebook waits for a fixed bulletin slot; Telegram goes immediately');
+  await env.social.processWeeklyBroadcastQueue(true);
+  assert.equal(facebookPhoto.get('caption'), '📊 أسبوع ثابت\n\nرابط الموقع والمتابعة في أول تعليق.');
+  assert(!facebookPhoto.get('alt_text_custom').includes('https'));
+  assert.equal((await facebookPhoto.get('source').arrayBuffer()).byteLength, 256);
+  env.failFB(false); f.advance(600000);
+  assert.equal(await env.social.processWeeklyBroadcastQueue(true), true);
+  assert.equal(env.counts.telegram, 1); assert.equal(env.counts.facebook, 2);
+});
+test('Facebook schedule defaults and validation survive full config reloads', async () => {
+  const f = fixture(), config = f.load('server/config.ts', { '../telegramClient': {}, './db': { db: noopDb, supabase: null, supabaseKey: '' } });
+  for (const value of [undefined, ['99:00', '18:00', '22:00'], ['14:00', '14:00', '22:00'], ['14:00', '14:30', '22:00']]) {
+    config.updateAppConfig({ terms: [], facebookPostTimes: value });
+    assert.deepEqual(Array.from(config.appConfig.facebookPostTimes), ['14:00', '18:00', '22:00']);
+  }
+  config.updateAppConfig({ terms: [], facebookPostTimes: ['21:00', '13:00', '17:00'] });
+  assert.deepEqual(Array.from(config.appConfig.facebookPostTimes), ['13:00', '17:00', '21:00']);
+  assert(!f.helper.facebookPostText('سعر الدولار 10.24\n🌐 https://tinyurl.com/2j7667u2\nhttps://t.me/example').includes('http'));
+});
+
+test('Facebook comment failure never repeats the successful post; Telegram payload stays intact', async () => {
+  const f = fixture(), posts = [], comments = [], telegram = [];
+  const env = socialFixture(f, { failComment: true, onFacebook: value => posts.push(value), onComment: value => comments.push(value), onTelegram: (_channel, text) => telegram.push(text) });
+  env.failFB(false);
+  await env.social.broadcastToSocialMedia('دولار كاش 10.24\nhttps://tinyurl.com/2j7667u2', false, 'all', true);
+  assert.equal(posts.length, 1); assert.equal(comments.length, 1);
+  assert(!posts[0].link && !posts[0].message.includes('http'));
+  assert(comments[0].message.includes('https://tinyurl.com/2j7667u2'));
+  assert(telegram[0].includes('https://dollar-price-qp14.onrender.com/?r='));
+  assert(f.logger.getRecentLogs().some(log => log.category === 'نشر فيسبوك' && log.level === 'warn'));
+});
+
+function scheduledFixture(f) {
+  let writesFail = false, reads = 0;
+  const env = socialFixture(f, { supabase: fakeSupabase(q => {
+    if (q.table === 'server_config') return { data: null, error: writesFail && q.op === 'upsert' ? { message: 'Fixture checkpoint unavailable' } : null };
+    if (q.table === 'parallel_rates') { reads++; return { data: [{ rates: { ...f.rates.parallel }, recorded_at: f.rates.lastUpdated }], error: null }; }
+    return { data: [], error: null };
+  }) });
+  env.failFB(false);
+  return { ...env, reads: () => reads, failCheckpoint: value => { writesFail = value; } };
+}
+
+test('Facebook uses only fixed Tripoli slots, skips unchanged prices, and does not touch Telegram cooldown', async () => {
+  const f = fixture(), env = scheduledFixture(f);
+  assert.equal(await env.social.processFacebookSchedule(), false); assert.equal(env.reads(), 0);
+  f.advance(2 * 3600000);
+  assert.equal(await env.social.processFacebookSchedule(), true);
+  assert.equal(env.counts.facebook, 1); assert.equal(env.counts.telegram, 0);
+  assert.equal(env.social.lastSocialBroadcastTime, 0);
+  assert.equal(await env.social.processFacebookSchedule(), false); assert.equal(env.reads(), 1);
+  const restored = env.restore();
+  assert.equal(await restored.processFacebookSchedule(), false); assert.equal(env.counts.facebook, 1);
+  f.advance(4 * 3600000);
+  assert.equal(await restored.processFacebookSchedule(), false);
+  assert.equal(restored.getBroadcastQueueStatus().facebookSchedule.slots['18:00'], 'skipped');
+  f.rates.parallel.USD = 9.8; f.rates.lastUpdated = new f.Clock().toISOString();
+  f.config.quietHoursEnabled = true; f.config.quietHoursStart = '21:00'; f.config.quietHoursEnd = '08:00';
+  f.advance(4 * 3600000);
+  assert.equal(await restored.processFacebookSchedule(), true, '22:00 Facebook slot is independent of Telegram quiet hours');
+  assert.equal(env.counts.facebook, 2); assert.equal(env.counts.telegram, 0);
+});
+
+test('Automatic price changes still reach Telegram but never immediately publish on Facebook', async () => {
+  const f = fixture(), env = socialFixture(f); env.failFB(false);
+  await env.social.broadcastRateChanges([update]);
+  await env.social.processSmartBroadcastQueue();
+  assert.equal(env.counts.telegram, 1); assert.equal(env.counts.facebook, 0);
+  assert.equal(env.social.smartBroadcastQueue.size, 0);
+});
+
+test('Facebook schedule rejects stale data, Web failure and failed cloud checkpoint before sending', async () => {
+  for (const failure of ['stale', 'web', 'checkpoint']) {
+    const f = fixture(), env = scheduledFixture(f); f.advance(2 * 3600000);
+    if (failure === 'stale') f.rates.lastUpdated = new f.Clock(f.now() - 13 * 3600000).toISOString();
+    if (failure === 'web') env.webReady(false);
+    if (failure === 'checkpoint') env.failCheckpoint(true);
+    assert.equal(await env.social.processFacebookSchedule(), false); assert.equal(env.counts.facebook, 0);
+    assert(env.social.getBroadcastQueueStatus().facebookSchedule.lastError);
+  }
+});
+
+test('Facebook never catches up missed slots or blindly retries an ambiguous publication after restart', async () => {
+  const f = fixture(), env = scheduledFixture(f); f.advance(2 * 3600000 + 31 * 60000);
+  assert.equal(await env.social.processFacebookSchedule(), false); assert.equal(env.reads(), 0);
+  f.advance(209 * 60000); env.failFB(true);
+  assert.equal(await env.social.processFacebookSchedule(), false);
+  assert.equal(env.counts.facebook, 1, 'Scheduled delivery has one provider attempt');
+  assert.equal(env.social.getBroadcastQueueStatus().facebookSchedule.slots['18:00'], 'uncertain');
+  env.failFB(false); const restored = env.restore(); f.advance(5 * 60000);
+  assert.equal(await restored.processFacebookSchedule(), false); assert.equal(env.counts.facebook, 1);
+});
+
+test('Official Facebook morning bulletin respects Sunday-Thursday; Telegram keeps its existing policy', async () => {
+  const f = fixture(), env = socialFixture(f); env.failFB(false);
+  f.advance(4 * 86400000 - 2 * 3600000);
+  assert.equal(await env.social.broadcastOfficialRates(), true);
+  assert.equal(env.counts.telegram, 1); assert.equal(env.counts.facebook, 0);
+});
+
 (async () => {
   let failures = 0;
   for (const { name, run } of tests) {

@@ -9,7 +9,8 @@ async function main() {
   f.rates.parallel[quoted] = 9.8;
   const queue = { queueSize: 1, items: [{ id: 'USD', name: 'Dollar ' + attack, newVal: 9.8, oldVal: 9.7, diff: .1, ageSeconds: 60,
     targets: ['telegram', 'facebook'], delivered: { telegram: true }, attempts: { facebook: 4 }, lastError: 'Fixture failed ' + attack }],
-    weekly: { date: '2026-10-12', delivered: { telegram: true }, attempts: { facebook: 4 } } };
+    weekly: { date: '2026-10-12', delivered: { telegram: true }, attempts: { facebook: 4 } },
+    facebookSchedule: { date: '2026-10-12', slots: { '14:00': 'posted', '18:00': 'uncertain' }, times: ['14:00', '18:00', '22:00'], enabled: true, lastError: attack } };
   const state = { rates: f.rates, terms: f.config.terms, activeJobs: [], broadcastQueue: queue,
     pipeline: { sources: { telegram: { lastReadAt: f.now(), lastValidAt: f.now() }, whatsapp: {} }, lastSavedAt: f.now(),
       lastWebSyncAt: f.now(), lastWebSyncError: attack, telegram: {}, facebook: {} },
@@ -25,7 +26,7 @@ async function main() {
   try {
     for (const width of [390, 768, 1440]) {
       const page = await browser.newPage({ viewport: { width, height: 900 } }), errors = [];
-      let clearFails = true;
+      let clearFails = true, savedTimes;
       page.on('pageerror', error => errors.push(error.message));
       page.on('dialog', dialog => dialog.accept());
       await page.route('**/*', route => {
@@ -35,6 +36,10 @@ async function main() {
         if (url.pathname.endsWith('/ingested-messages')) return route.fulfill({ json: { success: true, messages: [{
           source: attack, timestamp: new f.Clock().toISOString(), rawText: attack, status: 'ignored' }] } });
         if (url.pathname.endsWith('/stats')) return route.fulfill({ json: state });
+        if (url.pathname.endsWith('/broadcast/settings/save')) {
+          savedTimes = route.request().postDataJSON().facebookPostTimes;
+          return route.fulfill({ json: { success: true } });
+        }
         if (url.pathname.endsWith('/clear-logs')) return route.fulfill({ status: clearFails ? 503 : 200, json: { success: !clearFails } });
         if (url.pathname.endsWith('/sources')) return route.fulfill({ json: { success: true, whatsappSources: [
           { jid: 'dealer@g.us', name: 'Dealer ' + attack, enabled: false, type: 'group' },
@@ -77,6 +82,19 @@ async function main() {
       assert.equal(await page.locator('#modal-code').inputValue(), quoted);
       await page.evaluate(() => closeRateModal());
       await page.evaluate(queue => { switchTab('broadcast'); renderQueueUI(queue); }, queue);
+      assert.equal(await page.locator('#setting-facebook-time-0').inputValue(), '14:00');
+      assert.equal(await page.locator('#setting-facebook-time-2').inputValue(), '22:00');
+      assert((await page.locator('#facebook-schedule-status').innerText()).includes('تحتاج مراجعة'));
+      assert.equal(await page.locator('#facebook-schedule-status img').count(), 0);
+      await page.locator('#setting-facebook-time-0').fill('13:00');
+      await page.evaluate(state => renderUI(state), state);
+      assert.equal(await page.locator('#setting-facebook-time-0').inputValue(), '13:00', 'Live dashboard refresh preserves unsaved times');
+      await page.evaluate(() => saveBroadcastSettings());
+      assert.deepEqual(savedTimes, ['13:00', '18:00', '22:00']);
+      const scheduleSize = await page.locator('#setting-facebook-time-0').evaluate(el => ({ width: el.clientWidth, scroll: el.scrollWidth }));
+      assert(scheduleSize.scroll <= scheduleSize.width + 1);
+      if (process.env.UI_ARTIFACT_DIR) await page.locator('#facebook-schedule-heading').evaluate(el => el.closest('section').scrollIntoView());
+      if (process.env.UI_ARTIFACT_DIR) await page.screenshot({ path: path.join(process.env.UI_ARTIFACT_DIR, 'facebook-schedule-' + width + '.png') });
       const text = await page.locator('#queue-items-container').innerText();
       assert.ok(text.includes('Telegram: تم الإرسال')); assert.ok(text.includes('يتطلب إعادة محاولة يدوية'));
       assert.ok((await page.locator('#queue-status-badge').innerText()).includes('يتطلب مراجعة'));

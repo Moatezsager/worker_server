@@ -1,9 +1,7 @@
 import { CurrencyStat } from '../types';
 import { rates } from '../state';
 import { appConfig } from '../config';
-import { supabase, supabaseKey } from '../db';
 import { broadcastToSocialMedia, getOrInitTelegramManager, queueWeeklyReport } from './social.service';
-import { getPublicAppUrl } from '../utils/helpers';
 
 export const dailyStats: Record<string, CurrencyStat> = {};
 export const weeklyStats: Record<string, CurrencyStat> = {};
@@ -97,157 +95,17 @@ export async function broadcastDailyReport() {
 
 export async function broadcastWeeklyReport(isTest: boolean = false) {
   if (!isTest && !appConfig.telegramAutoPost && !appConfig.facebookAutoPost) return;
-  if (!supabase || !supabaseKey || supabaseKey.includes('dummy')) {
-    console.warn("Supabase not configured, cannot generate accurate weekly report.");
-    if (isTest) throw new Error("Supabase is required for accurate weekly report.");
-    return;
+  const webUrl = (process.env.WEB_SERVER_URL || '').trim(), secret = (process.env.WORKER_INTERNAL_SECRET || '').trim();
+  if (!webUrl || !secret) throw new Error('تعذر إعداد الحصاد: WEB_SERVER_URL أو WORKER_INTERNAL_SECRET غير مضبوط.');
+  const response = await fetch(`${webUrl.replace(/\/$/, '')}/api/internal/weekly-harvest`, {
+    headers: { 'X-Worker-Secret': secret, 'User-Agent': 'Dollar-Price-Worker/1.0', 'Cache-Control': 'no-cache' }, signal: AbortSignal.timeout(25000)
+  });
+  const result: any = await response.json();
+  if (!response.ok || !result?.success || typeof result.week !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(result.week) ||
+      typeof result.caption !== 'string' || !result.caption || result.caption.length > 1024 ||
+      typeof result.imageBase64 !== 'string' || !result.imageBase64.startsWith('data:image/png;base64,') || result.imageBase64.length > 7 * 1024 * 1024) {
+    throw new Error(result?.error || `تعذر استلام تقرير الحصاد من Web (${response.status}).`);
   }
-
-  const now = new Date();
-  const pastWeekDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-  
-  const dateStr = now.toLocaleDateString('ar-LY', { timeZone: 'Africa/Tripoli' });
-  const pastWeek = pastWeekDate.toLocaleDateString('ar-LY', { timeZone: 'Africa/Tripoli' });
-  
-  const data: { rates: Record<string, number>; recorded_at: string }[] = [];
-  const pageSize = 500, maxRows = 20000;
-  for (let offset = 0; offset < maxRows; offset += pageSize) {
-    const result = await supabase.from('parallel_rates').select('id, rates, recorded_at')
-      .gte('recorded_at', pastWeekDate.toISOString()).lte('recorded_at', now.toISOString())
-      .order('recorded_at', { ascending: true }).order('id', { ascending: true })
-      .range(offset, offset + pageSize - 1);
-    if (result.error || !result.data) throw new Error('تعذر تحميل بيانات الأسبوع كاملة؛ لم يُجهّز التقرير للنشر.');
-    data.push(...result.data);
-    if (result.data.length < pageSize) break;
-    if (offset + pageSize === maxRows) throw new Error('تجاوزت بيانات الأسبوع الحد الآمن؛ يلزم تجميع البيانات قبل نشر التقرير.');
-  }
-  if (!data.length) {
-    if (isTest) throw new Error('No data found in Supabase for the past week.');
-    return;
-  }
-
-  const stats: Record<string, { high: number, low: number, start: number, end: number, sum: number, count: number }> = {};
-  
-  for (const row of data) {
-    const rowRates = row.rates || {};
-    for (const cid in rowRates) {
-       const val = rowRates[cid];
-       if (!Number.isFinite(val) || val <= 0) continue;
-       
-       if (!stats[cid]) {
-         stats[cid] = { high: val, low: val, start: val, end: val, sum: 0, count: 0 };
-       }
-       
-       if (val > stats[cid].high) stats[cid].high = val;
-       if (val < stats[cid].low) stats[cid].low = val;
-       stats[cid].end = val;
-       stats[cid].sum += val;
-       stats[cid].count++;
-    }
-  }
-
-  // ─── Calculate Summary Line ───
-  const checkedCurrencies = ['USD', 'USD_CHECKS', 'EUR', 'GBP', 'USD_TR'];
-  let usdTrend: 'up' | 'down' | 'stable' = 'stable';
-  let hasUp = false;
-  let hasDown = false;
-  let allStable = true;
-
-  for (const cid of checkedCurrencies) {
-    const s = stats[cid];
-    if (!s || s.count === 0) continue;
-    const d = s.end - s.start;
-    const isUp = d > 0.005;
-    const isDown = d < -0.005;
-
-    if (cid === 'USD') {
-      if (isUp) usdTrend = 'up';
-      else if (isDown) usdTrend = 'down';
-    }
-
-    if (isUp) {
-      hasUp = true;
-      allStable = false;
-    } else if (isDown) {
-      hasDown = true;
-      allStable = false;
-    }
-  }
-
-  let summaryText = "استقرار نسبي في السوق الموازي";
-  if (hasUp && hasDown) {
-    summaryText = "تباين في حركة السوق الأسبوع الماضي";
-  } else if (usdTrend === 'up' && !hasDown) {
-    summaryText = "ارتفاع عام في السوق";
-  } else if (usdTrend === 'down' && !hasUp) {
-    summaryText = "انخفاض طفيف بالسوق الموازي";
-  } else if (allStable) {
-    summaryText = "استقرار نسبي في السوق الموازي";
-  } else if (hasUp) {
-    summaryText = "ارتفاع عام في السوق";
-  } else if (hasDown) {
-    summaryText = "انخفاض طفيف بالسوق الموازي";
-  }
-
-  let message = `📊 *مؤشر الدينار | الحصاد الأسبوعي*\n`;
-  message += `🗓 ${pastWeek} — ${dateStr}\n`;
-  message += `━━━━━━━━━━━━━━━━━━━\n\n`;
-  message += `📌 *ملخص الأسبوع:* ${summaryText}\n\n`;
-  message += `━━━━━━━━━━━━━━━━━━━\n`;
-  
-  const mainCurrencies = [
-    { id: 'USD', name: 'دولار أمريكي (كاش)', flag: '🇺🇸' },
-    { id: 'USD_CHECKS', name: 'دولار أمريكي (صكوك)', flag: '🇺🇸' },
-    { id: 'EUR', name: 'يورو', flag: '🇪🇺' },
-    { id: 'GBP', name: 'جنيه إسترليني', flag: '🇬🇧' },
-    { id: 'USD_TR', name: 'حوالات تركيا', flag: '🇹🇷' }
-  ];
-  
-  for (const curr of mainCurrencies) {
-    const stat = stats[curr.id];
-    if (!stat || stat.count === 0) continue;
-
-    const diff = stat.end - stat.start;
-    let trend = '➖';
-    if (diff > 0.005) {
-      trend = '📈';
-    } else if (diff < -0.005) {
-      trend = '📉';
-    }
-
-    const diffRounded = Number(diff.toFixed(3));
-    const diffFormatted = diffRounded > 0 ? `+${diff.toFixed(3)}` : (diffRounded < 0 ? `${diff.toFixed(3)}` : `+0.000`);
-
-    message += `${curr.flag} *${curr.name}*\n`;
-    message += `└ أعلى: ${stat.high.toFixed(3)} | أدنى: ${stat.low.toFixed(3)} | إغلاق: ${stat.end.toFixed(3)} ${trend} ${diffFormatted}\n\n`;
-  }
-  
-  const goldStat = stats['GOLD_CAST_24'];
-  if (goldStat && goldStat.count > 0) {
-    message += `━━━━━━━━━━━━━━━━━━━\n`;
-    const diff = goldStat.end - goldStat.start;
-    let trend = '➖';
-    if (diff > 0.005) {
-      trend = '📈';
-    } else if (diff < -0.005) {
-      trend = '📉';
-    }
-
-    const formatGold = (val: number) => Math.round(val).toLocaleString('en-US');
-
-    message += `💎 *ذهب مسبوك عيار 24*\n`;
-    message += `└ أعلى: ${formatGold(goldStat.high)} | أدنى: ${formatGold(goldStat.low)} | إغلاق: ${formatGold(goldStat.end)} ${trend}\n\n`;
-  }
-  
-  message += `━━━━━━━━━━━━━━━━━━━\n`;
-  message += `🌐 التفاصيل والرسوم البيانية:\n`;
-  message += `👉 https://tinyurl.com/2j7667u2`;
-  
-  if (isTest) {
-    await broadcastToSocialMedia(message, true, 'all');
-  } else {
-    await queueWeeklyReport(message, now.toLocaleDateString('en-CA', { timeZone: 'Africa/Tripoli' }));
-  }
-
-  return message;
+  if (!isTest) await queueWeeklyReport(result.caption, result.week, result.imageBase64);
+  return result.caption;
 }

@@ -1,11 +1,13 @@
 import { AppConfig } from './types';
 import { TelegramManager } from '../telegramClient';
 import { db, supabase, supabaseKey } from './db';
+import { getFacebookPostTimes } from './utils/helpers';
 
 export let appConfig: AppConfig = {
   channels: ["dollarr_ly", "musheermarket", "lydollar", "suqalmushir"],
   telegramPostChannel: "lydollar",
   telegramAutoPost: false,
+  facebookPostTimes: ['14:00', '18:00', '22:00'],
   telegramTemplateStyle: "classic",
   enableHttpScraper: true,
   enableUserTracking: true,
@@ -71,6 +73,7 @@ export function updateAppConfig(newConfig: Partial<AppConfig>) {
     delete (appConfig as any)[key];
   }
   Object.assign(appConfig, newConfig);
+  appConfig.facebookPostTimes = getFacebookPostTimes(newConfig.facebookPostTimes);
 
   // Preserve critical authentication credentials
   if (!appConfig.telegramSessionString && preservedTelegram) appConfig.telegramSessionString = preservedTelegram;

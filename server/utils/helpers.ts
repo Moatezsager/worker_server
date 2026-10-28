@@ -153,9 +153,15 @@ export function getLibyaDateString(now: Date = new Date()): string {
   return getLibyaTimeInfo(now).dateStr;
 }
 
-export function getPriceHistoryCutoff(now: Date = new Date()): string {
-  // Keep 30 complete Tripoli days plus today, including the start of a rolling month.
-  return new Date(Date.parse(`${getLibyaDateString(now)}T00:00:00+02:00`) - 30 * 86400000).toISOString();
+export function getPriceHistoryCutoff(now: Date = new Date(), days: number | 'six-months' = 30): string {
+  const [year, month, day] = getLibyaDateString(now).split('-').map(Number);
+  if (days === 'six-months') {
+    const monthStart = new Date(Date.UTC(year, month - 7, 1));
+    const lastDay = new Date(Date.UTC(monthStart.getUTCFullYear(), monthStart.getUTCMonth() + 1, 0)).getUTCDate();
+    monthStart.setUTCDate(Math.min(day, lastDay));
+    return new Date(Date.UTC(monthStart.getUTCFullYear(), monthStart.getUTCMonth(), monthStart.getUTCDate(), -2)).toISOString();
+  }
+  return new Date(Date.parse(`${getLibyaDateString(now)}T00:00:00+02:00`) - days * 86400000).toISOString();
 }
 
 /**
@@ -215,4 +221,19 @@ export function isLineExecutionOrNonPrice(line: string): boolean {
   const hasExecution = /تم\s*التنفيذ|وصل\s*التنفي[دذ]|تم\s*تنفيذ|✅|اختيار\s*شركات|البطاقات\s*وحساب\s*العملة/i.test(line);
   const hasDateSlash = /\d{1,2}\s*[/:\-]\s*\d{1,2}/.test(line);
   return hasExecution && hasDateSlash;
+}
+
+export function getFacebookPostTimes(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length !== 3 || value.some(time => typeof time !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time))) return ['14:00', '18:00', '22:00'];
+  const times = [...new Set(value)].sort();
+  const minutes = times.map(time => Number(time.slice(0, 2)) * 60 + Number(time.slice(3)));
+  return times.length === 3 && minutes.every((time, i) => (minutes[(i + 1) % 3] + (i === 2 ? 1440 : 0)) - time >= 120)
+    ? times : ['14:00', '18:00', '22:00'];
+}
+
+export function facebookPostText(message: string): string {
+  const lines = message.replace(/<a\b[^>]*>(.*?)<\/a>/gi, '$1').replace(/[*_`]/g, '').split('\n')
+    .map(line => line.replace(/(?:https?:\/\/|www\.)[^\s<>]+|\b(?:tinyurl\.com|t\.me|facebook\.com|dollar-price-qp14\.onrender\.com)\/[^\s<>]*/gi, '').trim())
+    .filter(line => !/^[\s🌐📱📢👉🔗:|─━-]*$/u.test(line) && !/^(?:الموقع|رابط الموقع|تابعنا|للمتابعة|التفاصيل|لمتابعة التحديثات)[\s:]*$/.test(line));
+  return lines.join('\n').trim() + '\n\nرابط الموقع والمتابعة في أول تعليق.';
 }

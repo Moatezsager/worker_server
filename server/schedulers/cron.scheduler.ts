@@ -17,8 +17,8 @@ export function initCronSchedulers() {
 
   console.log("[Cron] Registering scheduled recurring tasks...");
 
-  // 1. Weekly Harvest & Market Summary Report (Every Friday 23:55 Libya Time)
-  const weeklyTask = cron.schedule('55 23 * * 5', async () => {
+  // Prepare only after Friday closes; the existing queue respects publishing quiet hours.
+  const weeklyTask = cron.schedule('5 0 * * 6', async () => {
     try {
       console.log("[Cron] Triggering Weekly Harvest Report broadcast...");
       await broadcastWeeklyReport();

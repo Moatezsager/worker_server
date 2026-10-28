@@ -81,6 +81,7 @@ async function main() {
     let cleanups = 0, fails = false;
     const cron = f.load(path.join(root, 'server/routes/cron.routes.ts'), {
       express, '../middleware/security': security, '../state': { rates: f.rates }, '../services/scraper.service': source,
+      '../services/worker-maintenance.service': { requestWorkerMaintenance: async () => { cleanups++; if (fails) throw Error('Fixture Worker dispatch failed'); } },
       '../services/db.service': { cleanupOldData: async () => { cleanups++; if (fails) throw Error('Fixture boundary read failed'); return { total_removed_rates: 2 }; } }
     }).default;
     const app = express(); app.use('/api', cron);
@@ -89,7 +90,8 @@ async function main() {
       assert.equal((await fetch(http.url + '/api/cleanup-db')).status, 403); assert.equal(cleanups, 0);
       const options = { headers: { 'x-cron-secret': 'fixture-cleanup-only-secret' } };
       const response = await fetch(http.url + '/api/cleanup-db?key=fixture-cleanup-only-secret', options);
-      assert.equal(response.status, 200); assert.equal((await response.json()).details.total_removed_rates, 2);
+      if (root === process.env.WEB_PROJECT_PATH) { assert.equal(response.status, 202); assert.equal((await response.json()).success, true); }
+      else { assert.equal(response.status, 200); assert.equal((await response.json()).details.total_removed_rates, 2); }
       fails = true;
       assert.equal((await fetch(http.url + '/api/cleanup-db?key=fixture-cleanup-only-secret', options)).status, 500);
       assert.equal(cleanups, 2);
@@ -226,12 +228,16 @@ async function main() {
     const originalInterval = f.config.minBroadcastIntervalMinutes;
     assert.equal((await adminPost('broadcast/settings/save', { minBroadcastIntervalMinutes: 30 }, false)).status, 401);
     for (const body of [{ telegramAutoPost: 'false' }, { aggregationWindowSeconds: 'Infinity' },
-      { hourlyPostLimit: 1.5 }, { quietHoursStart: '25:00' }, { aggregationWindowSeconds: 301 }]) {
+      { hourlyPostLimit: 1.5 }, { quietHoursStart: '25:00' }, { aggregationWindowSeconds: 301 },
+      { facebookPostTimes: ['14:00', '14:00', '22:00'] }, { facebookPostTimes: ['14:00', '14:30', '22:00'] },
+      { facebookPostTimes: ['14:00', '18:00', '99:00'] }, { facebookPostTimes: ['14:00'] }]) {
       assert.equal((await adminPost('broadcast/settings/save', body)).status, 400);
     }
     configSaveFails = true;
-    const failedSettings = await adminPost('broadcast/settings/save', { minBroadcastIntervalMinutes: 30 });
+    const originalFacebookTimes = f.config.facebookPostTimes;
+    const failedSettings = await adminPost('broadcast/settings/save', { minBroadcastIntervalMinutes: 30, facebookPostTimes: ['13:00', '17:00', '21:00'] });
     assert.equal(failedSettings.status, 503); assert.equal(f.config.minBroadcastIntervalMinutes, originalInterval);
+    assert.equal(f.config.facebookPostTimes, originalFacebookTimes);
     for (const [route, body] of [
       ['accounts/facebook/save', { pageId: 'fixture' }],
       ['sources/telegram/add', { channel: 'fixture-channel' }]
@@ -240,7 +246,8 @@ async function main() {
       assert.equal(failed.status, 503, 'Never announce successful remote persistence on ' + route);
     }
     configSaveFails = false;
-    assert.equal((await adminPost('broadcast/settings/save', { minBroadcastIntervalMinutes: 30, telegramAutoPost: false })).status, 200);
+    assert.equal((await adminPost('broadcast/settings/save', { minBroadcastIntervalMinutes: 30, telegramAutoPost: false, facebookPostTimes: ['13:00', '17:00', '21:00'] })).status, 200);
+    assert.deepEqual(Array.from(f.config.facebookPostTimes), ['13:00', '17:00', '21:00']);
     assert.equal(f.config.minBroadcastIntervalMinutes, 30); assert.equal(f.config.telegramAutoPost, false);
     const response = await adminPost('update-rate', { code: 'USD', rate: 9.8 });
     assert.equal(response.status, 200); assert.equal((await response.json()).success, true);
@@ -325,6 +332,8 @@ async function main() {
       './routes/tracking.routes': { __esModule: true, default: empty(), handleTelegramPageRoute() {}, handleTelegramBannerRoute() {} },
       './routes/system.routes': empty(), './routes/admin.routes': { createAdminRouter: empty },
       './state': { rates: w.rates }, './services/maintenance.service': {},
+      './services/weekly-harvest.service': {}, './services/weekly-harvest-image.service': {},
+      '../shared/weeklyHarvest': {}, './utils/helpers': w.helper,
       './services/db.service': { loadLatestRatesFromSupabase: async () => {
         calls++; active++; maxActive = Math.max(maxActive, active);
         try {

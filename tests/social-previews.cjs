@@ -49,35 +49,29 @@ async function main() {
     f.advance(1); await social.broadcastToSocialMedia(message, false, 'telegram', true);
     assert.notEqual(messages.at(-1), messages[0], 'A new publication uses a new preview URL');
     await social.broadcastToSocialMedia(message, false, 'facebook', true);
-    assert(payloads.some(value => value.link === 'https://tinyurl.com/2j7667u2'));
+    if (root !== roots[0]) assert(payloads.some(value => value.link === 'https://tinyurl.com/2j7667u2'));
     assert(payloads.filter(value => value.message).every(value => !value.message.includes('?r=')));
     if (root === roots[0]) {
-      assert.deepEqual(payloads.filter(value => value.scrape).map(value => value.id), [
-        'https://dollar-price-qp14.onrender.com/', 'https://tinyurl.com/2j7667u2'
-      ]);
+      assert.equal(payloads.filter(value => value.scrape).length, 0, 'No unnecessary Meta preview requests when links are comments');
       assert(events.indexOf('Web ready') < events.indexOf('telegram'));
-      assert(events.indexOf('scrape https://tinyurl.com/2j7667u2') < events.indexOf('facebook'));
+      const facebookPosts = () => payloads.filter(value => value.message && !value.message.includes('https://'));
+      assert(facebookPosts().every(value => !value.link && value.message.includes('أول تعليق')));
+      assert(payloads.some(value => value.message?.includes('https://tinyurl.com/2j7667u2')), 'Links remain in first comment');
       await social.broadcastToSocialMedia(message, false, 'facebook', true);
-      assert.equal(payloads.filter(value => value.scrape).length, 2, 'Unchanged USD/EUR reuse confirmed Meta preview');
+      assert.equal(payloads.filter(value => value.scrape).length, 0);
       f.rates.parallel.EUR = 10.7;
       await social.broadcastToSocialMedia(message, false, 'facebook', true);
-      assert.equal(payloads.filter(value => value.scrape).length, 4, 'EUR alone refreshes the preview');
-      const posted = payloads.filter(value => value.link).length;
+      const posted = facebookPosts().length;
       stalePreview = true; f.rates.parallel.EUR = 10.8;
-      await assert.rejects(social.broadcastToSocialMedia(message, false, 'facebook', true));
-      assert.equal(payloads.filter(value => value.link).length, posted, 'Never post with a stale Meta preview');
-      const previewFailure = f.logger.getRecentLogs().find(log => log.level === 'error' && log.category === 'معاينة Facebook');
-      const previewDetail = JSON.parse(previewFailure.details);
-      assert.equal(previewDetail.stage, 'facebook-preview');
-      assert.equal(previewDetail.expectedPrices[1].value, 10.8);
-      assert(previewDetail.receivedTitle.includes('10.70'));
+      await social.broadcastToSocialMedia(message, false, 'facebook', true);
+      assert.equal(facebookPosts().length, posted + 1, 'A comment preview cannot block the actual prices');
       assert(!JSON.stringify(f.logger.getRecentLogs()).includes('fake-only'));
       stalePreview = false; f.advance(60001);
       await social.broadcastToSocialMedia(message, false, 'facebook', true);
-      assert.equal(payloads.filter(value => value.link).length, posted + 1);
+      assert.equal(facebookPosts().length, posted + 2);
       previewAckOnly = true; f.rates.parallel.EUR = 10.9;
       await social.broadcastToSocialMedia(message, false, 'facebook', true);
-      assert.equal(events.filter(event => event === 'read preview').length, 2, 'An incomplete scrape response still requires reading the real cached title');
+      assert.equal(events.filter(event => event === 'read preview').length, 0);
       webReady = false;
       const sent = messages.length, requests = payloads.length;
       await assert.rejects(social.broadcastToSocialMedia(message, false, 'all', true));
@@ -85,7 +79,7 @@ async function main() {
       assert.equal(messages.length, sent); assert.equal(payloads.length, requests);
     }
   }
-  console.log('PASS: Web readiness before delivery, USD/EUR Meta re-scrape before short-link posts, stale-preview blocking, cache-busting and stable retries');
+  console.log('PASS: Web readiness, unchanged Telegram cache-busted previews, Facebook body without links and first-comment links');
 
   if (!process.env.WEB_PROJECT_PATH) return;
   const root = path.resolve(process.env.WEB_PROJECT_PATH), f = fixture();
@@ -113,6 +107,9 @@ async function main() {
       ? new RegExp(route.source, route.flags) : route, ...handlers);
     return app;
   } });
+  const weekly = f.load(path.join(root, 'shared/weeklyHarvest.ts'));
+  const weeklyData = weekly.buildWeeklyHarvest(Array.from({ length: 7 }, (_, index) => ({ recorded_at: `2026-10-0${3 + index}T10:00:00Z`, rates: { USD: 10, USD_CHECKS: 10.2, EUR: 11 } })), [], [], new f.Clock());
+  let weeklyReads = 0;
   const appModule = f.load(path.join(root, 'server/app.ts'), {
     express: previewExpress, compression: require('compression'), fs: { readFileSync: () => { htmlReads++; return fs.readFileSync(path.join(root, 'index.html'), 'utf8'); } },
     vite: {}, './middleware/security': { ...security, apiStats: {} }, './routes/rates.routes': empty(),
@@ -120,12 +117,28 @@ async function main() {
     './routes/tracking.routes': { __esModule: true, default: empty(), handleTelegramPageRoute() {}, handleTelegramBannerRoute() {} },
     './routes/system.routes': empty(), './routes/admin.routes': { createAdminRouter: empty },
     './state': { rates: f.rates }, './services/maintenance.service': {}, './services/db.service': webDb,
+    './services/weekly-harvest.service': { readWeeklyHarvest: async () => { weeklyReads++; return weeklyData; } },
+    './services/weekly-harvest-image.service': { renderWeeklyHarvestImage: async () => Buffer.from('full PNG fixture'), renderWeeklyHarvestPreview: async () => Buffer.from('OG PNG fixture') },
+    '../shared/weeklyHarvest': weekly, './utils/helpers': f.helper,
     './socket/socket.service': { broadcastRatesUpdate: () => { sequence.push('Web socket'); } }
   }, { process: { env: { NODE_ENV: 'production', WORKER_INTERNAL_SECRET: 'fixture-only' }, cwd: () => root } });
   const app = await appModule.createApp({});
   const server = await new Promise(resolve => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
   const base = 'http://127.0.0.1:' + server.address().port;
   try {
+    assert.equal((await fetch(base + '/api/internal/weekly-harvest')).status, 401);
+    assert.equal((await fetch(base + '/api/internal/weekly-harvest', { headers: { 'X-Worker-Secret': 'wrong-fixture' } })).status, 403);
+    const reportResponse = await fetch(base + '/api/internal/weekly-harvest', { headers: { 'X-Worker-Secret': 'fixture-only' } });
+    const report = await reportResponse.json();
+    assert.equal(reportResponse.status, 200); assert.equal(report.week, '2026-10-09');
+    assert(report.caption.includes('/weekly-report/2026-10-09'));
+    const reportHtml = await (await fetch(base + '/weekly-report/2026-10-09')).text();
+    assert(reportHtml.includes('property="og:image:height" content="630"'));
+    assert(reportHtml.includes('.png?preview=1'));
+    assert.equal(await (await fetch(base + '/weekly-report/2026-10-09.png')).text(), 'full PNG fixture');
+    assert.equal(await (await fetch(base + '/weekly-report/2026-10-09.png?preview=1')).text(), 'OG PNG fixture');
+    assert.equal(weeklyReads, 1, 'Public previews and Worker reuse one canonical cached report');
+    for (const date of ['2026-10-12', '2026-02-30', '2027-01-01']) assert.equal((await fetch(base + '/weekly-report/' + date)).status, 404);
     const initial = await fetch(base), firstEtag = initial.headers.get('etag');
     assert((await initial.text()).includes('يورو: 10.50'));
     f.rates.parallel.EUR = 10.97;
@@ -188,9 +201,9 @@ async function main() {
     } });
     await sender.broadcastRateChanges(updates); sequence.push('queued');
     assert.equal((await sender.flushBroadcastQueueImmediately('all', true)).success, true);
-    assert.deepEqual(sequence, ['saved', 'Web socket', 'queued', 'telegram', 'canonical scrape', 'short scrape', 'facebook', 'comment']);
+    assert.deepEqual(sequence, ['saved', 'Web socket', 'queued', 'telegram', 'facebook', 'comment']);
     assert.equal(databaseReads, 2, 'Immediate delivery reuses the completed synchronization, without duplicate database reads');
   } finally { await new Promise(resolve => server.close(resolve)); }
-  console.log('PASS: real save -> HTTP Web sync -> Socket.IO/HTML cache -> queue -> fresh Telegram/Meta previews -> Facebook, without production access');
+  console.log('PASS: real save -> HTTP Web sync -> Socket.IO/HTML -> queue -> Telegram preview / Facebook post + link comment, without production access');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

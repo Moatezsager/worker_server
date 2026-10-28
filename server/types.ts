@@ -57,6 +57,7 @@ export interface AppConfig {
   facebookPageId?: string;
   facebookAccessToken?: string;
   facebookAutoPost?: boolean;
+  facebookPostTimes?: string[];
   adminPassword?: string;
   whatsappAuth?: Record<string, string>;
   minBroadcastIntervalMinutes?: number;

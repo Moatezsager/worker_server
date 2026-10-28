@@ -30,10 +30,12 @@ function fixture() {
     const mod = { exports: {} };
     const context = vm.createContext({
       module: mod, exports: mod.exports, console: silent, Date: Clock, structuredClone, URL,
-      process: { env: {}, cwd: () => root }, global: {}, Buffer, AbortController, AbortSignal,
+      process: { env: {}, cwd: () => root }, global: {}, Buffer, Blob, FormData, AbortController, AbortSignal,
       setTimeout: () => ({ unref() {} }), setInterval: () => ({ unref() {} }), clearTimeout() {}, clearInterval() {},
       require(name) {
         if (Object.hasOwn(mocks, name)) return mocks[name];
+        if (name === './utils/helpers') return load('server/utils/helpers.ts');
+        if (name === './rate-history-archive.service') return { archiveOldRateHistory: async () => ({ summarized_days: 0, removed: {} }) };
         if (['crypto', 'path'].includes(name)) return require(name);
         throw new Error('Unmocked dependency: ' + name);
       },

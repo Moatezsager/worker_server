@@ -1754,7 +1754,18 @@ export function renderDashboardHtml(initialState?: any): string {
 
         <!-- SETTINGS FORM -->
         <div style="border-top:1px solid #334155; padding-top:10px; margin-top:10px;">
-          <div style="font-size:12px; font-weight:700; color:#cbd5e1; margin-bottom:8px;">⚙️ إعدادات شروط وفواصل النشر التلقائي:</div>
+          <div style="font-size:12px; font-weight:700; color:#cbd5e1; margin-bottom:8px;">سياسة النشر لكل منصة</div>
+          <section aria-labelledby="facebook-schedule-heading" style="border-bottom:1px solid #334155; padding-bottom:14px; margin-bottom:14px;">
+            <h3 id="facebook-schedule-heading" style="font-size:14px; margin:0 0 8px; color:#e2e8f0;">نشرات فيسبوك · توقيت طرابلس</h3>
+            <p style="font-size:12px; color:#cbd5e1; line-height:1.8;">النشرة الرسمية صباح الأحد إلى الخميس مع تيليجرام. بقية النشرات تجمع أهم العملات والمعادن في المواعيد التالية، والحصاد الأسبوعي يأخذ مكان إحدى النشرات. الروابط في أول تعليق، ولا نكرر الأسعار دون تغيير.</p>
+            <div style="display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px;">
+              <label class="form-label" style="font-size:12px;" for="setting-facebook-time-0">النشرة الأولى<input type="time" dir="ltr" id="setting-facebook-time-0" class="form-input font-num" value="14:00" oninput="this.dataset.dirty='true'"></label>
+              <label class="form-label" style="font-size:12px;" for="setting-facebook-time-1">النشرة الثانية<input type="time" dir="ltr" id="setting-facebook-time-1" class="form-input font-num" value="18:00" oninput="this.dataset.dirty='true'"></label>
+              <label class="form-label" style="font-size:12px;" for="setting-facebook-time-2">النشرة الثالثة<input type="time" dir="ltr" id="setting-facebook-time-2" class="form-input font-num" value="22:00" oninput="this.dataset.dirty='true'"></label>
+            </div>
+            <p id="facebook-schedule-status" role="status" style="font-size:12px; color:#cbd5e1; margin-bottom:0;"></p>
+          </section>
+          <h3 style="font-size:14px; color:#e2e8f0; margin:0 0 10px;">شروط طابور تيليجرام</h3>
           
           <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:10px; margin-bottom:10px;">
             <div class="form-group" style="margin-bottom:0;">
@@ -2557,7 +2568,8 @@ export function renderDashboardHtml(initialState?: any): string {
           p.lastWebSyncError, data.broadcastQueue?.checkpoint?.lastError, data.broadcastQueue?.weekly?.lastError].filter(Boolean).join(' | ');
         const weekly = data.broadcastQueue?.weekly;
         const reportState = platform => weekly?.delivered?.[platform] ? 'تم الإرسال' :
-          !data.broadcastConfig?.[platform + 'AutoPost'] ? 'غير مفعّل' : (weekly?.attempts?.[platform] || 0) > 3 ? 'يتطلب مراجعة' : 'بانتظار المحاولة';
+          !data.broadcastConfig?.[platform + 'AutoPost'] ? 'غير مفعّل' : (weekly?.attempts?.[platform] || 0) > 3 ? 'يتطلب مراجعة' :
+          platform === 'facebook' ? 'بانتظار موعد نشرة فيسبوك' : 'بانتظار المحاولة';
         document.getElementById('weekly-report-status').textContent = weekly?.date ?
           'الحصاد الأسبوعي ' + weekly.date + ' · Telegram: ' + reportState('telegram') + ' · Facebook: ' + reportState('facebook') : '';
       }
@@ -2671,6 +2683,10 @@ export function renderDashboardHtml(initialState?: any): string {
 
       // Populate Broadcast Queue and Settings
       if (data.broadcastConfig) {
+        (data.broadcastConfig.facebookPostTimes || ['14:00', '18:00', '22:00']).forEach((time, i) => {
+          const input = document.getElementById('setting-facebook-time-' + i);
+          if (input && document.activeElement !== input && !input.dataset.dirty) input.value = time;
+        });
         const intervalEl = document.getElementById('setting-broadcast-interval');
         const threshEl = document.getElementById('setting-price-threshold');
         const aggEl = document.getElementById('setting-agg-window');
@@ -2691,6 +2707,15 @@ export function renderDashboardHtml(initialState?: any): string {
       }
 
       if (data.broadcastQueue) {
+        const schedule = data.broadcastQueue.facebookSchedule;
+        const status = document.getElementById('facebook-schedule-status');
+        if (schedule && status) {
+          const labels = { sending: 'غير مؤكد بعد بدء الإرسال؛ راجع الصفحة', posted: 'نُشرت', skipped: 'لا تغير في الأسعار', uncertain: 'تحتاج مراجعة الصفحة قبل إعادة النشر' };
+          status.textContent = (schedule.enabled ? 'نشر فيسبوك مفعّل' : 'نشر فيسبوك متوقف') +
+            (schedule.date ? ' · ' + schedule.date : '') + ' · ' + (schedule.times || []).join(' / ') +
+            Object.entries(schedule.slots || {}).map(([time, state]) => ' · ' + time + ': ' + (labels[state] || state)).join('') +
+            (schedule.lastError ? ' · ' + schedule.lastError : '');
+        }
         renderQueueUI(data.broadcastQueue);
       }
     }
@@ -4075,6 +4100,7 @@ export function renderDashboardHtml(initialState?: any): string {
       const quietHoursEnabled = Boolean(document.getElementById('setting-quiet-hours-enabled')?.checked);
       const quietHoursStart = document.getElementById('setting-quiet-hours-start')?.value || '01:00';
       const quietHoursEnd = document.getElementById('setting-quiet-hours-end')?.value || '08:30';
+      const facebookPostTimes = [0, 1, 2].map(i => document.getElementById('setting-facebook-time-' + i).value);
 
       showToast('جاري حفظ شروط وإعدادات النشر التلقائي...');
       try {
@@ -4089,11 +4115,13 @@ export function renderDashboardHtml(initialState?: any): string {
             smartConsolidatedPost,
             quietHoursEnabled,
             quietHoursStart,
-            quietHoursEnd
+            quietHoursEnd,
+            facebookPostTimes
           })
         });
         const data = await res.json();
         if (data.success) {
+          [0, 1, 2].forEach(i => { delete document.getElementById('setting-facebook-time-' + i).dataset.dirty; });
           showToast(data.message || 'تم حفظ الإعدادات بنجاح');
           fetchDashboardData();
         } else {

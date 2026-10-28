@@ -6,7 +6,7 @@ import { db, supabase, supabaseKey } from '../db';
 import { addBroadcastLog } from './broadcastLog.service';
 import { ensureWebRatesReady, getWebRatesSyncError } from './db.service';
 import { addLog, sanitizeErrorMessage } from '../utils/logger';
-import { delay, getPublicAppUrl, getLibyaTimeInfo, getTelegramShareUrl } from '../utils/helpers';
+import { delay, getPublicAppUrl, getLibyaTimeInfo, getTelegramShareUrl, getFacebookPostTimes, facebookPostText } from '../utils/helpers';
 import { ensureAccountLease, ownsAccountLease, getAccountLeaseGeneration } from './accountLease.service';
 
 interface FacebookApiResponse {
@@ -51,7 +51,7 @@ export async function loadRecentBroadcastTimestamps(): Promise<void> {
       const { data, error } = await supabase
         .from('broadcast_log')
         .select('created_at')
-        .eq('status', 'success')
+        .eq('status', 'success').eq('platform', 'telegram')
         .gte('created_at', new Date(oneHourAgo).toISOString())
         .order('created_at', { ascending: true });
 
@@ -77,7 +77,7 @@ export async function loadRecentBroadcastTimestamps(): Promise<void> {
       const rows = db
         .prepare(
           `SELECT created_at FROM broadcast_log
-           WHERE status = 'success' AND created_at >= ?`
+           WHERE status = 'success' AND platform = 'telegram' AND created_at >= ?`
         )
         .all(oneHourAgo) as { created_at: string | number }[];
 
@@ -295,66 +295,13 @@ function recordBroadcast(updates: { id?: string; name: string; newVal?: number; 
   );
 }
 
-let facebookPreviewRevision = '';
-let facebookPreviewRequest: Promise<void> | null = null;
-let facebookPreviewFailure = { revision: '', at: 0 };
-async function refreshFacebookPricePreview() {
-  const canonical = new URL('/', process.env.WEB_SERVER_URL || 'https://dollar-price-qp14.onrender.com/').toString();
-  const prices = [
-    { value: rates.parallel.USD, label: 'دولار' }, { value: rates.parallel.EUR, label: 'يورو' }
-  ].filter(price => Number.isFinite(price.value) && price.value > 0);
-  const revision = JSON.stringify([canonical, ...prices.map(price => price.value.toFixed(2))]);
-  if (facebookPreviewRevision === revision) return;
-  if (facebookPreviewFailure.revision === revision && Date.now() - facebookPreviewFailure.at < 60000) {
-    throw new Error('لم يؤكد فيسبوك تحديث معاينة الأسعار بعد؛ المنشور محفوظ لإعادة المحاولة.');
-  }
-  if (!facebookPreviewRequest) {
-    facebookPreviewRequest = (async () => {
-      if (!prices.length) throw new Error('لا توجد أسعار صالحة لمعاينة فيسبوك.');
-      for (const link of [canonical, 'https://tinyurl.com/2j7667u2']) {
-        let response = await fetch('https://graph.facebook.com/v20.0/', {
-          method: 'POST', signal: AbortSignal.timeout(10000),
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${appConfig.facebookAccessToken}` },
-          body: JSON.stringify({ id: link, scrape: true, fields: 'og_object{title}' })
-        });
-        let result: any = await response.json();
-        if (response.ok && !result?.error && typeof result?.og_object?.title !== 'string') {
-          const lookup = new URL('https://graph.facebook.com/v20.0/');
-          lookup.searchParams.set('id', link);
-          lookup.searchParams.set('fields', 'og_object{title}');
-          response = await fetch(lookup.toString(), {
-            signal: AbortSignal.timeout(10000), headers: { Authorization: `Bearer ${appConfig.facebookAccessToken}` }
-          });
-          result = await response.json();
-        }
-        if (!response.ok || result?.error || typeof result?.og_object?.title !== 'string' ||
-            !prices.every(price => result.og_object.title.includes(`${price.label}: ${price.value.toFixed(2)}`))) {
-          addLog('error', 'معاينة Facebook', 'لم تؤكد Meta معاينة الأسعار؛ لم يبدأ نشر المنشور', {
-            stage: 'facebook-preview', link, httpStatus: response.status, apiCode: result?.error?.code,
-            apiSubcode: result?.error?.error_subcode, apiMessage: sanitizeErrorMessage(result?.error?.message),
-            expectedPrices: prices, receivedTitle: sanitizeErrorMessage(result?.og_object?.title, 2000)
-          });
-          throw new Error(`تعذر تأكيد معاينة فيسبوك المحدثة${Number.isFinite(result?.error?.code) ? ' (API ' + result.error.code + ')' : ''}. تحقق من صلاحية التوكن وإعادة قراءة الرابط.`);
-        }
-      }
-      facebookPreviewRevision = revision;
-      facebookPreviewFailure = { revision: '', at: 0 };
-      addLog('success', 'معاينة Facebook', 'أكدت Meta معاينة الرابط الأصلي والمختصر', { stage: 'facebook-preview', prices });
-    })().catch(error => {
-      facebookPreviewFailure = { revision, at: Date.now() };
-      throw error;
-    }).finally(() => { facebookPreviewRequest = null; });
-  }
-  await facebookPreviewRequest;
-  if (facebookPreviewRevision !== revision) throw new Error('تغيرت الأسعار أثناء تحديث معاينة فيسبوك؛ أعد المحاولة.');
-}
-
 export async function broadcastToSocialMedia(
   message: string,
   isTest: boolean = false,
   target: 'all' | 'telegram' | 'facebook' = 'all',
   isManual: boolean = false,
-  market?: 'parallel' | 'official' | 'both'
+  market?: 'parallel' | 'official' | 'both',
+  scheduledFacebook = false
 ) {
   const sentTargets: ('telegram' | 'facebook')[] = [];
   if (!await ensurePublishingOwnership()) throw new Error('النشر متوقف في هذه النسخة بانتظار استلام ملكية Worker أو استعادة حالة الطابور.');
@@ -368,7 +315,7 @@ export async function broadcastToSocialMedia(
     throw new Error(getWebRatesSyncError(targetMarket));
   }
 
-  const manager = getOrInitTelegramManager();
+  const manager = target !== 'facebook' ? getOrInitTelegramManager() : null;
 
   // Telegram
   const shouldPostTg = (target === 'telegram' || target === 'all') && (isManual || (!isTest && appConfig.telegramAutoPost) || isTest);
@@ -468,7 +415,10 @@ export async function broadcastToSocialMedia(
   }
 
   // Facebook
-  const shouldPostFb = (target === 'facebook' || target === 'all') && (isManual || (!isTest && appConfig.facebookAutoPost) || isTest);
+  const localPublicationTime = getLibyaTimeInfo();
+  const officialMorning = isOfficial && localPublicationTime.dayIndex < 5 && localPublicationTime.hour >= 9 && localPublicationTime.hour < 12;
+  const shouldPostFb = (target === 'facebook' || target === 'all') &&
+    (isManual || isTest || appConfig.facebookAutoPost && (scheduledFacebook || officialMorning));
   if (shouldPostFb) {
     if (!appConfig.facebookPageId || !appConfig.facebookAccessToken) {
       console.warn("[Facebook Broadcast] Skipping Facebook post: Page ID or Access Token missing");
@@ -480,35 +430,20 @@ export async function broadcastToSocialMedia(
       };
       if (isTest && target === 'facebook') throw new Error("بيانات فيسبوك غير مكتملة. يرجى إدخال معرف الصفحة ورمز وصول الصفحة أولاً.");
     } else {
-      let fbMessage = message.replace(/[*_`]/g, '');
+      const fbMessage = facebookPostText(message);
       
-      // استخدام الروابط المختصرة دائماً في منشورات فيسبوك
-      fbMessage = fbMessage.replace(/https:\/\/dollar-price-qp14\.onrender\.com[^\s]*/g, 'https://tinyurl.com/2j7667u2');
-      fbMessage = fbMessage.replace(/https:\/\/t\.me\/[^\s]*/g, 'https://tinyurl.com/m3m4jrd2');
-      
-      const maxRetries = isTest ? 1 : 2;
-      let postedSuccessfully = false;
+      const maxRetries = isTest || scheduledFacebook ? 1 : 2;
       let lastFbError = "";
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
           if (publishingStopped || !ownsAccountLease()) throw new Error('توقفت ملكية النشر أثناء الإرسال.');
-          if (!isTest && fbMessage.includes('https://tinyurl.com/2j7667u2')) await refreshFacebookPricePreview();
           const targetId = appConfig.facebookPageId.trim() || 'me';
-          let url = `https://graph.facebook.com/v20.0/${targetId}/feed`;
-          
-          let linkToAttach = null;
-          const urlMatch = fbMessage.match(/https?:\/\/[^\s]+/);
-          if (urlMatch) {
-            linkToAttach = urlMatch[0];
-          }
+          const url = `https://graph.facebook.com/v20.0/${encodeURIComponent(targetId)}/feed`;
           
           const payload: any = { message: fbMessage, access_token: appConfig.facebookAccessToken };
-          if (linkToAttach) {
-            payload.link = linkToAttach;
-          }
 
-let fbRes = await fetch(url, {
+          let fbRes = await fetch(url, {
             signal: AbortSignal.timeout(15000),
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -516,27 +451,10 @@ let fbRes = await fetch(url, {
           });
           let fbData = (await fbRes.json()) as FacebookApiResponse;
 
-          // Fallback 1: If link parameter error, retry cleanly without link
-          if (fbData.error && payload.link) {
-            console.log("[Facebook Broadcast] Retrying without link parameter...");
-            delete payload.link;
-const retryRes = await fetch(url, {
-              signal: AbortSignal.timeout(15000),
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(payload)
-            });
-            const retryData = (await retryRes.json()) as FacebookApiResponse;
-            if (!retryData.error) {
-              fbData = retryData;
-            }
-          }
-
-          // Fallback 2: If global ID error or invalid ID, attempt posting to /me/feed directly
-          if (fbData.error && (fbData.error.code === 100 || fbData.error.message?.includes('global id'))) {
+          if (!scheduledFacebook && fbData.error && (fbData.error.code === 100 || fbData.error.message?.includes('global id'))) {
             console.log("[Facebook Broadcast] Trying fallback to /me/feed...");
             const fallbackUrl = `https://graph.facebook.com/v20.0/me/feed`;
-const fallbackRes = await fetch(fallbackUrl, {
+            const fallbackRes = await fetch(fallbackUrl, {
               signal: AbortSignal.timeout(15000),
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -545,10 +463,12 @@ const fallbackRes = await fetch(fallbackUrl, {
             const fallbackData = (await fallbackRes.json()) as FacebookApiResponse;
             if (!fallbackData.error) {
               fbData = fallbackData;
+              fbRes = fallbackRes;
             }
           }
 
-          if (fbData.error) {
+          if (fbData.error || !fbRes.ok || !fbData.id) {
+            if (!fbData.error) throw new Error(`Facebook acknowledgement missing (HTTP ${fbRes.status})`);
             lastFbError = fbData.error.message || "خطأ غير معروف في واجهة فيسبوك";
             if (attempt < maxRetries) {
               console.warn(`[Facebook Broadcast] Attempt ${attempt} failed: ${lastFbError}. Retrying in 2s...`);
@@ -564,31 +484,13 @@ const fallbackRes = await fetch(fallbackUrl, {
               throw new Error(lastFbError);
             }
           } else {
-            postedSuccessfully = true;
             sentTargets.push('facebook');
             console.log("[Facebook Broadcast] Successfully posted, ID:", fbData.id);
             facebookBroadcastStatus = { status: 'ok', lastError: '', lastErrorTime: facebookBroadcastStatus.lastErrorTime, lastSuccessTime: new Date().toISOString() };
-            lastSocialBroadcastTime = Date.now();
+            // Facebook slots must not postpone Telegram's independent queue.
             
             // Add comment safely without breaking the main post status
-            try {
-              const commentMessage = `📢 لمتابعة التحديثات لحظة بلحظة على تيليجرام:\n👉 https://tinyurl.com/m3m4jrd2\n\n🌐 والرسوم البيانية والتفاصيل الكاملة من هنا:\n👉 https://tinyurl.com/2j7667u2`;
-              const commentUrl = `https://graph.facebook.com/v20.0/${fbData.id}/comments`;
-const commentRes = await fetch(commentUrl, {
-                signal: AbortSignal.timeout(15000),
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ message: commentMessage, access_token: appConfig.facebookAccessToken })
-              });
-              const commentData = (await commentRes.json()) as FacebookApiResponse;
-              if (commentData.error) {
-                console.warn("[Facebook Broadcast] Note: Comment skipped or failed (non-fatal):", commentData.error.message);
-              } else {
-                console.log("[Facebook Broadcast] Successfully added comment, ID:", commentData.id);
-              }
-            } catch (commentErr: any) {
-              console.warn("[Facebook Broadcast] Non-fatal comment error:", commentErr.message);
-            }
+            await addFacebookLinksComment(fbData.id!);
             break; // Done successfully
           }
         } catch(e: any) {
@@ -615,6 +517,18 @@ const commentRes = await fetch(commentUrl, {
   return { sentTargets };
 }
 
+async function addFacebookLinksComment(postId: string) {
+  try {
+    const response = await fetch(`https://graph.facebook.com/v20.0/${encodeURIComponent(postId)}/comments`, {
+      signal: AbortSignal.timeout(15000), method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: '📢 لمتابعة التحديثات لحظة بلحظة على تيليجرام:\n👉 https://tinyurl.com/m3m4jrd2\n\n🌐 الرسوم البيانية والتفاصيل الكاملة:\n👉 https://tinyurl.com/2j7667u2', access_token: appConfig.facebookAccessToken })
+    });
+    const result = await response.json() as FacebookApiResponse;
+    if (response.ok === false || result.error || !result.id) throw new Error(result.error?.message || `HTTP ${response.status}`);
+  } catch (error) {
+    addLog('warn', 'نشر فيسبوك', 'نُشر المحتوى، لكن تعذر إضافة تعليق الروابط؛ لن يُكرر المنشور.', { stage: 'facebook-comment', postId, error: sanitizeErrorMessage(error) });
+  }
+}
 
 export let lastOfficialBroadcastDate = "";
 let officialSending = false;
@@ -776,7 +690,7 @@ export async function broadcastOfficialRates(
   try {
     const required: ('telegram' | 'facebook')[] = ['telegram', 'facebook'].filter(platform =>
       (target === 'all' || target === platform) && (isTest || isManual ||
-       (platform === 'telegram' ? appConfig.telegramAutoPost : appConfig.facebookAutoPost))) as ('telegram' | 'facebook')[];
+       (platform === 'telegram' ? appConfig.telegramAutoPost : appConfig.facebookAutoPost && libyaDateObj.getDay() < 5 && libyaDateObj.getHours() >= 9 && libyaDateObj.getHours() < 12))) as ('telegram' | 'facebook')[];
     if (!required.length) {
       console.log("[Official Broadcast] No target platforms enabled for broadcast (telegramAutoPost/facebookAutoPost are off). Holding broadcast until enabled or manually triggered.");
       return false;
@@ -897,6 +811,7 @@ export function sanitizeBroadcastUpdates(
 
 // ─── Smart Broadcast Queue State & Interface ─────────────────────────────────
 export interface QueuedRateUpdate {
+  manual?: boolean;
   id: string;
   name: string;
   oldVal: number;
@@ -914,7 +829,7 @@ export interface QueuedRateUpdate {
 }
 
 function canDeliverQueuedItem(item: QueuedRateUpdate, platform: 'telegram' | 'facebook', isManual = false) {
-  return (!item.targets || item.targets.includes(platform)) && !item.delivered?.[platform] &&
+  return (isManual || platform === 'telegram') && (!item.targets || item.targets.includes(platform)) && !item.delivered?.[platform] &&
     (isManual || (item.attempts?.[platform] || 0) <= MAX_RETRY_ATTEMPTS && (item.retryAt?.[platform] || 0) <= Date.now());
 }
 
@@ -1077,6 +992,7 @@ export function getBroadcastQueueStatus() {
     checkpoint: { ...queueCheckpointStatus },
     weekly: { date: weeklyDelivery.date, delivered: weeklyDelivery.delivered, attempts: weeklyDelivery.attempts,
       retryAt: weeklyDelivery.retryAt, lastError: weeklyDelivery.lastError || '' },
+    facebookSchedule: { ...facebookSchedule, times: getFacebookPostTimes(appConfig.facebookPostTimes), enabled: !!appConfig.facebookAutoPost },
     items,
     lastSocialBroadcastTime,
     isCooldownActive,
@@ -1145,6 +1061,7 @@ let publishingRestore: Promise<boolean> | null = null;
 export const queueCheckpointStatus = { lastSavedAt: 0, lastError: '' };
 let weeklyDelivery: {
   date: string; message: string;
+  imageBase64?: string;
   delivered: Partial<Record<'telegram' | 'facebook', boolean>>;
   attempts: Partial<Record<'telegram' | 'facebook', number>>;
   retryAt: Partial<Record<'telegram' | 'facebook', number>>;
@@ -1152,22 +1069,106 @@ let weeklyDelivery: {
 } = { date: '', message: '', delivered: {}, attempts: {}, retryAt: {} };
 let weeklySending = false;
 
-export async function queueWeeklyReport(message: string, date: string) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !message || message.length > 10000) throw new Error('Invalid weekly bulletin');
+let facebookSchedule: { date: string; slots: Record<string, 'sending' | 'posted' | 'skipped' | 'uncertain'>; revision: string; lastError: string } =
+  { date: '', slots: {}, revision: '', lastError: '' };
+let facebookScheduleSending = false;
+let facebookScheduleRetryAt = 0;
+
+export async function processFacebookSchedule(): Promise<boolean> {
+  if (!appConfig.facebookAutoPost || publishingStopped || facebookScheduleSending || Date.now() < facebookScheduleRetryAt) return false;
+  const now = new Date(), local = getLibyaTimeInfo(now);
+  const minute = local.hour * 60 + local.minute;
+  const times = getFacebookPostTimes(appConfig.facebookPostTimes);
+  const slot = times.find(time => { const start = Number(time.slice(0, 2)) * 60 + Number(time.slice(3)); return minute >= start && minute < start + 30; });
+  if (!slot || facebookSchedule.date === local.dateStr && facebookSchedule.slots[slot]) return false;
+  facebookScheduleSending = true;
+  let sending = false;
+  try {
+    if (!await ensurePublishingOwnership()) return false;
+    if (facebookSchedule.date !== local.dateStr) facebookSchedule = { date: local.dateStr, slots: {}, revision: facebookSchedule.revision, lastError: '' };
+    if (facebookSchedule.slots[slot] || Object.values(facebookSchedule.slots).filter(status => status !== 'skipped').length >= 3) return false;
+    if (!appConfig.facebookPageId || !appConfig.facebookAccessToken || !supabase) throw new Error('إعدادات صفحة فيسبوك أو قاعدة البيانات غير مكتملة.');
+    const weeklyAge = now.getTime() - Date.parse(weeklyDelivery.date + 'T23:59:59+02:00');
+    const weeklyPending = weeklyDelivery.message && !weeklyDelivery.delivered.facebook && weeklyAge >= 0 && weeklyAge < 7 * 86400000;
+    if (weeklyPending && weeklySending) return false;
+    let message = '', revision = facebookSchedule.revision;
+    if (!weeklyPending) {
+      const result = await supabase.from('parallel_rates').select('usd,rates,recorded_at')
+        .order('recorded_at', { ascending: false }).limit(1).abortSignal(AbortSignal.timeout(5000));
+      if (result.error) throw result.error;
+      const row = result.data?.[0], timestamp = Date.parse(row?.recorded_at || '');
+      const prices: Record<string, number> = { ...row?.rates, USD: row?.rates?.USD ?? row?.usd };
+      if (!Number.isFinite(timestamp) || timestamp > now.getTime() || now.getTime() - timestamp > 12 * 3600000 ||
+          !Number.isFinite(prices.USD) || prices.USD <= 0 || !Number.isFinite(prices.EUR) || prices.EUR <= 0) throw new Error('الأسعار المحفوظة غير مكتملة أو أقدم من 12 ساعة؛ لن تنشر نشرة قديمة.');
+      if (!await ensureWebRatesReady('parallel')) throw new Error(getWebRatesSyncError('parallel'));
+      if (prices.USD !== rates.parallel.USD || prices.EUR !== rates.parallel.EUR) throw new Error('تغيرت الأسعار أثناء تجهيز النشرة؛ إعادة التحقق في المحاولة القادمة.');
+      const currencies = [['USD', 'دولار كاش'], ['USD_CHECKS', 'دولار صكوك'], ['EUR', 'يورو'], ['GBP', 'جنيه إسترليني'], ['TND', 'دينار تونسي'], ['EGP', 'جنيه مصري']];
+      const metals = [['GOLD_SCRAP_18', 'ذهب كسر 18'], ['GOLD_SCRAP_21', 'ذهب كسر 21'], ['GOLD_CAST_24', 'ذهب مسبوك 24'], ['SILVER_CAST_1000', 'مسبوك فضة']];
+      const available = (items: string[][]) => items.filter(([id]) => Number.isFinite(prices[id]) && prices[id] > 0);
+      const shownCurrencies = available(currencies), shownMetals = available(metals);
+      revision = JSON.stringify([...shownCurrencies, ...shownMetals].map(([id]) => [id, prices[id]]));
+      if (revision === facebookSchedule.revision) {
+        facebookSchedule.slots[slot] = 'skipped';
+        addLog('info', 'نشرات فيسبوك', `تجاوز نشرة ${slot}: لا تغير في الأسعار منذ آخر نشرة.`, { stage: 'facebook-schedule', date: local.dateStr, slot });
+        persistBroadcastQueue(); await flushBroadcastQueueState(); return false;
+      }
+      const title = ['السوق في لقطة | مؤشر الدينار', 'متابعة السوق | العملات والمعادن', 'آخر رصد للسوق | مؤشر الدينار'][times.indexOf(slot)];
+      const observed = new Date(timestamp).toLocaleString('ar-LY', { timeZone: 'Africa/Tripoli', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' });
+      const lines = (items: string[][]) => items.map(([id, name]) => `${name}: ${prices[id].toFixed(id === 'EGP' ? 4 : 3)} د.ل`).join('\n');
+      const difference = prices.USD_CHECKS - prices.USD;
+      const gap = prices.USD_CHECKS > 0 ? Math.abs(difference) < 0.0005 ? '\nسعر الدولار بالكاش والصكوك متقارب؛ الفارق أقل من 0.001 د.ل.' :
+        `\nالدولار بالصكوك ${difference > 0 ? 'أعلى من' : 'أقل من'} الكاش بـ ${Math.abs(difference).toFixed(3)} د.ل لكل دولار.` : '';
+      message = `${title}\nآخر لقطة محفوظة: ${observed}\n\nالسوق الموازي — لكل وحدة عملة\n${lines(shownCurrencies)}${shownMetals.length ? '\n\nالمعادن — سعر الجرام\n' + lines(shownMetals) : ''}\n${gap}\n\nالأسعار للاسترشاد وليست عروض تنفيذ ملزمة.`;
+    }
+    if (Date.now() >= Date.parse(`${local.dateStr}T${slot}:00+02:00`) + 30 * 60000) return false;
+    // A crash after provider acceptance is ambiguous: never blindly replay this slot.
+    facebookSchedule.slots[slot] = 'sending'; facebookSchedule.lastError = '';
+    persistBroadcastQueue(); await flushBroadcastQueueState();
+    if (queueCheckpointStatus.lastError || !ownsAccountLease() || publishingStopped) {
+      delete facebookSchedule.slots[slot]; throw new Error(queueCheckpointStatus.lastError || 'توقفت ملكية النشر.');
+    }
+    sending = true;
+    if (weeklyPending) {
+      await processWeeklyBroadcastQueue(true);
+      if (!weeklyDelivery.delivered.facebook) throw new Error(weeklyDelivery.lastError || 'تعذر نشر صورة الحصاد.');
+    } else {
+      const result = await broadcastToSocialMedia(message, false, 'facebook', false, 'parallel', true);
+      if (!result.sentTargets.includes('facebook')) throw new Error('لم تؤكد صفحة فيسبوك إرسال النشرة.');
+    }
+    facebookSchedule.slots[slot] = 'posted'; facebookSchedule.revision = revision;
+    addBroadcastLog({ platform: 'facebook', currency_ids: weeklyPending ? ['WEEKLY'] : ['MARKET_SNAPSHOT'], status: 'success', attempts: 1 });
+    addLog('info', 'نشرات فيسبوك', `نُشرت نشرة ${slot}؛ الروابط في أول تعليق.`, { stage: 'facebook-schedule', date: local.dateStr, slot });
+    persistBroadcastQueue(); await flushBroadcastQueueState();
+    return true;
+  } catch (error) {
+    facebookSchedule.lastError = sanitizeErrorMessage(error) || 'تعذر تجهيز نشرة فيسبوك.';
+    if (sending && slot) facebookSchedule.slots[slot] = 'uncertain';
+    facebookScheduleRetryAt = Date.now() + 5 * 60000;
+    addLog('error', 'نشرات فيسبوك', sending ? 'تعذر تأكيد النشر؛ راجع الصفحة قبل أي إعادة إرسال يدوية.' : 'تعذر تجهيز النشرة؛ ستُعاد المحاولة ضمن نافذة الموعد فقط.', {
+      stage: 'facebook-schedule', date: local.dateStr, slot, error: facebookSchedule.lastError, requiresManualReview: sending
+    });
+    persistBroadcastQueue(); await flushBroadcastQueueState();
+    return false;
+  } finally { facebookScheduleSending = false; }
+}
+
+export async function queueWeeklyReport(message: string, date: string, imageBase64?: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !message || message.length > 10000 ||
+      imageBase64 !== undefined && (!/^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/.test(imageBase64) || imageBase64.length > 7 * 1024 * 1024)) throw new Error('Invalid weekly bulletin');
   if (!await ensurePublishingOwnership()) throw new Error('بانتظار ملكية Worker لتجهيز النشرة الأسبوعية.');
-  if (weeklyDelivery.date !== date) weeklyDelivery = { date, message, delivered: {}, attempts: {}, retryAt: {} };
+  if (weeklyDelivery.date !== date) weeklyDelivery = { date, message, imageBase64, delivered: {}, attempts: {}, retryAt: {} };
   persistBroadcastQueue();
   await flushBroadcastQueueState();
   return processWeeklyBroadcastQueue();
 }
 
-export async function processWeeklyBroadcastQueue(): Promise<boolean> {
+export async function processWeeklyBroadcastQueue(facebookSlot = false): Promise<boolean> {
   if (weeklySending || !weeklyDelivery.message || publishingStopped) return false;
   const required = (['telegram', 'facebook'] as const).filter(platform =>
     platform === 'telegram' ? appConfig.telegramAutoPost : appConfig.facebookAutoPost);
-  const pending = required.filter(platform => !weeklyDelivery.delivered[platform] &&
+  const pending = required.filter(platform => (facebookSlot ? platform === 'facebook' : platform === 'telegram') && !weeklyDelivery.delivered[platform] &&
     (weeklyDelivery.attempts[platform] || 0) <= MAX_RETRY_ATTEMPTS && (weeklyDelivery.retryAt[platform] || 0) <= Date.now());
-  if (!pending.length || isQuietHoursActive().isActive || !canBroadcastNow()) return false;
+  if (!pending.length || !facebookSlot && (isQuietHoursActive().isActive || !canBroadcastNow())) return false;
   weeklySending = true;
   try {
     if (!await ensurePublishingOwnership()) return false;
@@ -1175,10 +1176,33 @@ export async function processWeeklyBroadcastQueue(): Promise<boolean> {
       if (weeklyDelivery.delivered[platform]) continue;
       await flushBroadcastQueueState();
       if (queueCheckpointStatus.lastError) return false;
+      if (publishingStopped || !ownsAccountLease()) return false;
       try {
-        await broadcastToSocialMedia(weeklyDelivery.message, false, platform);
+        if (weeklyDelivery.imageBase64) {
+          const image = Buffer.from(weeklyDelivery.imageBase64.slice('data:image/png;base64,'.length), 'base64');
+          if (image.length < 24 || image.length > 5 * 1024 * 1024 || !image.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) throw new Error('صورة الحصاد المحفوظة غير صالحة.');
+          if (platform === 'telegram') {
+            const manager = getOrInitTelegramManager(), channel = (appConfig.telegramPostChannel || '').trim();
+            if (!manager || !channel) throw new Error('إعدادات نشر صورة الحصاد في تيليجرام غير مكتملة.');
+            const caption = weeklyDelivery.message.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            if (!await manager.sendFile(channel, image, { caption, filename: `weekly-harvest-${weeklyDelivery.date}.png`, parseMode: 'html' })) throw new Error(manager.lastError || 'تعذر إرسال صورة الحصاد إلى تيليجرام.');
+          } else {
+            if (!appConfig.facebookPageId || !appConfig.facebookAccessToken) throw new Error('إعدادات صفحة فيسبوك غير مكتملة.');
+            const form = new FormData();
+            form.set('source', new Blob([image], { type: 'image/png' }), `weekly-harvest-${weeklyDelivery.date}.png`);
+            form.set('caption', facebookPostText(weeklyDelivery.message));
+            form.set('alt_text_custom', facebookPostText(weeklyDelivery.message).split('\n').slice(0, 6).join(' '));
+            const response = await fetch(`https://graph.facebook.com/v20.0/${encodeURIComponent(appConfig.facebookPageId)}/photos`, {
+              method: 'POST', headers: { Authorization: `Bearer ${appConfig.facebookAccessToken}` }, body: form, signal: AbortSignal.timeout(20000)
+            });
+            const result: any = await response.json();
+            if (!response.ok || result?.error || !result?.id) throw new Error(result?.error?.message || `Facebook photo upload failed (${response.status}).`);
+            weeklyDelivery.delivered.facebook = true;
+            await addFacebookLinksComment(result.post_id || result.id);
+          }
+        } else await broadcastToSocialMedia(weeklyDelivery.message, false, platform, false, undefined, facebookSlot);
         weeklyDelivery.delivered[platform] = true;
-        recentBroadcastTimestamps.push(Date.now());
+        if (platform === 'telegram') recentBroadcastTimestamps.push(Date.now());
         addBroadcastLog({ platform, currency_ids: ['WEEKLY'], status: 'success', attempts: (weeklyDelivery.attempts[platform] || 0) + 1 });
       } catch (err) {
         const attempt = (weeklyDelivery.attempts[platform] || 0) + 1;
@@ -1226,7 +1250,7 @@ export function stopSocialPublishing() {
 let queueBackupTimer: NodeJS.Timeout | null = null;
 let queueBackupWrite: Promise<unknown> = Promise.resolve();
 function queueSnapshot() {
-  return JSON.stringify({ items: [...smartBroadcastQueue.entries()], official: officialDelivery, weekly: weeklyDelivery,
+  return JSON.stringify({ items: [...smartBroadcastQueue.entries()], official: officialDelivery, weekly: weeklyDelivery, facebookSchedule,
     lastSocialBroadcastTime, savedAt: Date.now() });
 }
 function persistBroadcastQueue() {
@@ -1309,14 +1333,27 @@ export async function loadBroadcastQueueState(mergePending = false): Promise<boo
       }
     }
     if (Number.isFinite(saved?.lastSocialBroadcastTime)) lastSocialBroadcastTime = saved.lastSocialBroadcastTime;
+    if (saved?.facebookSchedule && /^\d{4}-\d{2}-\d{2}$/.test(saved.facebookSchedule.date) &&
+        saved.facebookSchedule.slots && typeof saved.facebookSchedule.slots === 'object' && !Array.isArray(saved.facebookSchedule.slots) &&
+        Object.entries(saved.facebookSchedule.slots).length <= 1440 && Object.entries(saved.facebookSchedule.slots).every(([time, status]) =>
+          /^([01]\d|2[0-3]):[0-5]\d$/.test(time) && ['sending', 'posted', 'skipped', 'uncertain'].includes(String(status))) &&
+        typeof saved.facebookSchedule.revision === 'string' && saved.facebookSchedule.revision.length < 4000 &&
+        typeof saved.facebookSchedule.lastError === 'string') facebookSchedule = saved.facebookSchedule;
     if (typeof saved?.official?.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(saved.official.date) &&
         saved.official.delivered && saved.official.attempts && saved.official.retryAt && validDeliveryProgress(saved.official)) {
       officialDelivery = saved.official;
     }
     if (typeof saved?.weekly?.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(saved.weekly.date) &&
         typeof saved.weekly.message === 'string' && saved.weekly.message.length <= 10000 && validDeliveryProgress(saved.weekly) &&
-        saved.weekly.delivered && saved.weekly.attempts && saved.weekly.retryAt) weeklyDelivery = saved.weekly;
+        saved.weekly.delivered && saved.weekly.attempts && saved.weekly.retryAt &&
+        (saved.weekly.imageBase64 === undefined || /^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/.test(saved.weekly.imageBase64) && saved.weekly.imageBase64.length <= 7 * 1024 * 1024)) weeklyDelivery = saved.weekly;
 
+    // Old automatic Facebook price items are replaced by authoritative scheduled snapshots.
+    for (const [key, item] of smartBroadcastQueue) {
+      if (item.manual === true) continue;
+      item.targets = (item.targets || ['telegram', 'facebook']).filter(platform => platform === 'telegram');
+      if (!item.targets.length || item.delivered?.telegram) smartBroadcastQueue.delete(key);
+    }
     return true;
   } catch (err) {
     queueCheckpointStatus.lastError = sanitizeErrorMessage(err) || 'تعذر استعادة الطابور';
@@ -1396,6 +1433,7 @@ export async function flushBroadcastQueueImmediately(target?: 'all' | 'telegram'
   if (isManual) {
     const selected: ('telegram' | 'facebook')[] = resolved === 'all' ? ['telegram', 'facebook'] : [resolved];
     for (const item of smartBroadcastQueue.values()) item.targets = [...new Set([...(item.targets || []), ...selected])];
+    for (const item of smartBroadcastQueue.values()) item.manual = true;
     persistBroadcastQueue();
   }
   return deliverQueuedUpdates([...smartBroadcastQueue.values()], resolved, isManual);
@@ -1470,6 +1508,7 @@ export async function processSmartBroadcastQueue(): Promise<boolean> {
 // Queue watchdog timer running every 30 seconds
 if (!smartBroadcastWatchdogInterval) {
   smartBroadcastWatchdogInterval = setInterval(() => {
+    processFacebookSchedule().catch(e => console.error('[Facebook Schedule]', sanitizeErrorMessage(e)));
     processWeeklyBroadcastQueue().catch(e => console.error('[Weekly Queue] Retry failed:', sanitizeErrorMessage(e)));
     if (smartBroadcastQueue.size > 0 && !smartBroadcastAggregationTimer) {
       processSmartBroadcastQueue().catch(e => console.error("[SmartBroadcastQueue] Watchdog cycle error:", e));
@@ -1499,9 +1538,11 @@ export async function broadcastRateChanges(
   }
 
   updates = sanitizeBroadcastUpdates(updates, isManual);
-  const targets: ('telegram' | 'facebook')[] = target !== 'all' ? [target] :
+  let targets: ('telegram' | 'facebook')[] = target !== 'all' ? [target] :
     (['telegram', 'facebook'] as const).filter(platform => isManual ||
       (platform === 'telegram' ? appConfig.telegramAutoPost : appConfig.facebookAutoPost));
+  if (!isManual) targets = targets.filter(platform => platform === 'telegram' && appConfig.telegramAutoPost);
+  if (!targets.length) return;
   const now = Date.now();
   for (const u of updates) {
     const key = (u.id || u.name).toUpperCase();
@@ -1515,6 +1556,7 @@ export async function broadcastRateChanges(
     if (existing) {
       smartBroadcastQueue.set(key, {
         ...existing,
+        manual: isManual,
         targets,
         headerTitle: customHeaderTitle,
         delivered: u.newVal === existing.newVal ? existing.delivered : {},
@@ -1529,6 +1571,7 @@ export async function broadcastRateChanges(
       });
     } else {
       smartBroadcastQueue.set(key, {
+        manual: isManual,
         id: u.id || key,
         targets,
         headerTitle: customHeaderTitle,

@@ -133,14 +133,15 @@ router.get("/cleanup-db", cronCleanupLimiter, async (req: express.Request, res: 
 
   try {
     const details = await cleanupOldData();
+    if (res.headersSent || res.destroyed) return;
     res.json({
       success: true,
-      message: "تم تنظيف البيانات الأقدم مع الحفاظ على قراءات 30 يومًا كاملة واليوم الحالي وآخر سعر سابق",
+      message: "اكتمل التنظيف مع الاحتفاظ بقراءات 30 يومًا وملخصات يومية حتى ستة أشهر وآخر سعر متاح",
       details
     });
   } catch (err) {
     console.error("[Maintenance] Cleanup failed:", err);
-    if (!res.headersSent) {
+    if (!res.headersSent && !res.destroyed) {
       res.status(500).json({ success: false, error: "Internal server error during cleanup" });
     }
   }
